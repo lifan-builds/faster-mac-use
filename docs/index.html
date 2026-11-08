@@ -45,7 +45,13 @@
             <div class="install-bar">
               <span class="prompt-char" aria-hidden="true">$</span>
               <code id="hero-cmd">uvx faster-mac-use mcp</code>
-              <button type="button" class="copy-btn" data-copy-target="hero-cmd">Copy</button>
+              <button type="button" class="copy-btn" data-copy-target="hero-cmd">
+                <svg class="copy-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                  <path class="icon-clip" fill="currentColor" d="M5.75 1a.75.75 0 0 0-.75.75v3c0 .414.336.75.75.75h4.5a.75.75 0 0 0 .75-.75v-3a.75.75 0 0 0-.75-.75h-4.5Zm.75 3V2.5h3V4h-3Zm-2.874-.467a.75.75 0 0 0-.752-1.298A1.75 1.75 0 0 0 2 3.75v9.5c0 .966.784 1.75 1.75 1.75h8.5A1.75 1.75 0 0 0 14 13.25v-9.5a1.75 1.75 0 0 0-.874-1.515.75.75 0 1 0-.752 1.298.25.25 0 0 1 .126.217v9.5a.25.25 0 0 1-.25.25h-8.5a.25.25 0 0 1-.25-.25v-9.5a.25.25 0 0 1 .126-.217Z"/>
+                  <path class="icon-check" fill="currentColor" d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/>
+                </svg>
+                <span class="copy-label">Copy</span>
+              </button>
             </div>
             <div class="install-meta">
               <div class="install-switch" role="tablist" aria-label="Install method">
@@ -53,7 +59,7 @@
                 <button type="button" class="install-tab" id="tab-install-brew" role="tab" aria-selected="false" aria-controls="hero-cmd" tabindex="-1" data-cmd="brew install --Formula ./Formula/faster-mac-use.rb">brew install</button>
                 <button type="button" class="install-tab" id="tab-install-pip" role="tab" aria-selected="false" aria-controls="hero-cmd" tabindex="-1" data-cmd="pip install git+https://github.com/lifan-builds/faster-mac-use">pip install</button>
               </div>
-              <span class="guard-inline">50Hz CoreGraphics guard: 0.0 px drift · 0 focus switches</span>
+              <code class="guard-inline">50Hz CoreGraphics guard: 0.0 px drift · 0 focus switches</code>
             </div>
           </div>
 
@@ -76,10 +82,15 @@
             </div>
           </div>
 
+          <div class="bench-win-strip">
+            <span class="win-dot" aria-hidden="true"></span>
+            <code class="bench-win-badge" id="bench-win-badge">114× fewer tokens · 13.9× faster vs @playwright/mcp</code>
+          </div>
+
           <div class="bar-chart" id="bench-bars" role="tabpanel" aria-labelledby="tab-workload-a" aria-live="polite"></div>
 
           <div class="bench-foot">
-            <span>OpenAI <code>o200k_base</code> tokenizer · 268-token schema</span>
+            <span><code>√</code>-scaled bars · OpenAI <code>o200k_base</code> tokenizer · 268-token schema</span>
             <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/results/latest_benchmark.md">Full 15-system benchmark data ↗</a>
           </div>
         </aside>
@@ -104,7 +115,13 @@
           <div class="workbench-code-col">
             <div class="code-toolbar">
               <span id="trace-label">Stateful multi-cursor execution</span>
-              <button type="button" class="copy-btn" data-copy-target="trace-code">Copy trace</button>
+              <button type="button" class="copy-btn" data-copy-target="trace-code">
+                <svg class="copy-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                  <path class="icon-clip" fill="currentColor" d="M5.75 1a.75.75 0 0 0-.75.75v3c0 .414.336.75.75.75h4.5a.75.75 0 0 0 .75-.75v-3a.75.75 0 0 0-.75-.75h-4.5Zm.75 3V2.5h3V4h-3Zm-2.874-.467a.75.75 0 0 0-.752-1.298A1.75 1.75 0 0 0 2 3.75v9.5c0 .966.784 1.75 1.75 1.75h8.5A1.75 1.75 0 0 0 14 13.25v-9.5a1.75 1.75 0 0 0-.874-1.515.75.75 0 1 0-.752 1.298.25.25 0 0 1 .126.217v9.5a.25.25 0 0 1-.25.25h-8.5a.25.25 0 0 1-.25-.25v-9.5a.25.25 0 0 1 .126-.217Z"/>
+                  <path class="icon-check" fill="currentColor" d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/>
+                </svg>
+                <span class="copy-label">Copy trace</span>
+              </button>
             </div>
             <pre class="trace-code" id="trace-code"></pre>
           </div>
@@ -112,8 +129,113 @@
           <div class="workbench-telemetry-col">
             <div class="telemetry-header">
               <span>Isolated Virtual Cursors &amp; Diff Output</span>
-              <span class="guard-badge" id="trace-guard">0.0 px physical drift</span>
+              <code class="guard-badge" id="trace-guard">0.0 px physical drift</code>
             </div>
+
+            <div class="mission-stage" aria-hidden="true">
+              <svg id="mission-svg" class="mission-svg" viewBox="0 0 460 186" aria-hidden="true">
+                <!-- Background Workspace Grid -->
+                <rect x="0" y="0" width="460" height="186" rx="8" fill="#eaf0f4"/>
+                <line x1="0" y1="154" x2="460" y2="154" stroke="#c4d1dc" stroke-width="1"/>
+
+                <!-- Left Window: Unfocused Chrome "🤖 Agent" Tab Group -->
+                <g class="stage-window stage-chrome">
+                  <rect x="8" y="8" width="274" height="138" rx="6" fill="#ffffff" stroke="#9fb2c2" stroke-width="1"/>
+                  <rect x="8" y="8" width="274" height="24" rx="6" fill="#f7fafc"/>
+                  <line x1="8" y1="32" x2="282" y2="32" stroke="#c4d1dc" stroke-width="1"/>
+                  <circle cx="18" cy="20" r="3" fill="#c4d1dc"/>
+                  <circle cx="27" cy="20" r="3" fill="#c4d1dc"/>
+                  <circle cx="36" cy="20" r="3" fill="#c4d1dc"/>
+                  <rect x="46" y="13" width="64" height="14" rx="4" fill="#095c49"/>
+                  <text x="52" y="23" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#ffffff">🤖 Agent</text>
+                  <rect x="114" y="13" width="76" height="14" rx="3" fill="#d7efe8"/>
+                  <text x="119" y="23" font-family="JetBrains Mono, monospace" font-size="8" font-weight="600" fill="#095c49">Tab 1 · @u14</text>
+                  <rect x="194" y="13" width="80" height="14" rx="3" fill="#e3effa"/>
+                  <text x="199" y="23" font-family="JetBrains Mono, monospace" font-size="8" font-weight="600" fill="#0b6bcb">Tab 2 · @u19</text>
+
+                  <!-- Simulated Web Console Rows -->
+                  <rect x="16" y="40" width="258" height="44" rx="4" fill="#f7fafc" stroke="#c4d1dc" stroke-width="1"/>
+                  <text x="23" y="54" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="600" fill="#344b5c">#ORD-403 · Enterprise Payout</text>
+                  <rect x="23" y="60" width="82" height="18" rx="3" fill="#d7efe8" stroke="#095c49" stroke-width="1"/>
+                  <text x="28" y="72" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#095c49">@u14 Approve</text>
+                  <text x="112" y="72" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="700" fill="#095c49" id="svg-u14-diff">~ "Approved"</text>
+
+                  <rect x="16" y="92" width="258" height="46" rx="4" fill="#f7fafc" stroke="#c4d1dc" stroke-width="1"/>
+                  <text x="23" y="106" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="600" fill="#344b5c">#ORD-412 · Regional Filter (24 rows folded)</text>
+                  <rect x="23" y="113" width="82" height="18" rx="3" fill="#e3effa" stroke="#0b6bcb" stroke-width="1"/>
+                  <text x="28" y="125" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#0b6bcb">@u19 Region</text>
+                  <text x="112" y="125" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="700" fill="#0b6bcb" id="svg-u19-diff">~ "EU Region"</text>
+                </g>
+
+                <!-- Right Window: Background macOS Calculator.app -->
+                <g class="stage-window stage-calc">
+                  <rect x="290" y="8" width="162" height="138" rx="6" fill="#ffffff" stroke="#9fb2c2" stroke-width="1"/>
+                  <rect x="290" y="8" width="162" height="24" rx="6" fill="#f7fafc"/>
+                  <line x1="290" y1="32" x2="452" y2="32" stroke="#c4d1dc" stroke-width="1"/>
+                  <circle cx="300" cy="20" r="3" fill="#c4d1dc"/>
+                  <circle cx="309" cy="20" r="3" fill="#c4d1dc"/>
+                  <text x="320" y="23" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#0c1720">Calculator · PID 48120</text>
+
+                  <!-- Calculator LCD Screen -->
+                  <rect x="298" y="38" width="146" height="32" rx="4" fill="#101c26"/>
+                  <text x="305" y="51" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="600" fill="#6bc2ad">AXObserver &lt;1ms · @a4</text>
+                  <text x="436" y="64" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="14" font-weight="700" fill="#ffffff" id="svg-calc-val">81</text>
+
+                  <!-- Calculator Keypad Grid -->
+                  <rect x="298" y="76" width="33" height="20" rx="3" fill="#eaf0f4"/>
+                  <text x="314" y="89" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#0c1720">7</text>
+                  <rect x="335" y="76" width="33" height="20" rx="3" fill="#eaf0f4"/>
+                  <text x="351" y="89" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#0c1720">8</text>
+                  <rect x="372" y="76" width="33" height="20" rx="3" fill="#fae6de" stroke="#b53f15" stroke-width="1"/>
+                  <text x="388" y="89" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#b53f15">9</text>
+                  <rect x="410" y="76" width="34" height="20" rx="3" fill="#fae6de" stroke="#b53f15" stroke-width="1"/>
+                  <text x="427" y="89" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#b53f15">×</text>
+
+                  <rect x="298" y="100" width="33" height="20" rx="3" fill="#eaf0f4"/>
+                  <text x="314" y="113" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#0c1720">4</text>
+                  <rect x="335" y="100" width="33" height="20" rx="3" fill="#eaf0f4"/>
+                  <text x="351" y="113" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#0c1720">5</text>
+                  <rect x="372" y="100" width="33" height="20" rx="3" fill="#eaf0f4"/>
+                  <text x="388" y="113" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#0c1720">6</text>
+                  <rect x="410" y="100" width="34" height="20" rx="3" fill="#b53f15"/>
+                  <text x="427" y="113" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="#ffffff">=</text>
+                </g>
+
+                <!-- Virtual Cursor 1: agent-1 (Emerald) -->
+                <g class="stage-cursor is-active" data-stage-agent="0">
+                  <circle class="cursor-ring" cx="98" cy="69" r="10" fill="none" stroke="#095c49" stroke-width="1.5" stroke-dasharray="3 2"/>
+                  <path d="M98 67 L102 80 L105 75 L111 75 Z" fill="#095c49" stroke="#ffffff" stroke-width="1"/>
+                  <rect x="168" y="61" width="100" height="16" rx="4" fill="#095c49"/>
+                  <text x="218" y="72" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="700" fill="#ffffff" id="svg-c1-label">agent-1 (368,224)</text>
+                </g>
+
+                <!-- Virtual Cursor 2: agent-2 (Ocean Blue) -->
+                <g class="stage-cursor" data-stage-agent="1">
+                  <circle class="cursor-ring" cx="98" cy="122" r="10" fill="none" stroke="#0b6bcb" stroke-width="1.5" stroke-dasharray="3 2"/>
+                  <path d="M98 120 L102 133 L105 128 L111 128 Z" fill="#0b6bcb" stroke="#ffffff" stroke-width="1"/>
+                  <rect x="168" y="114" width="100" height="16" rx="4" fill="#0b6bcb"/>
+                  <text x="218" y="125" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="700" fill="#ffffff" id="svg-c2-label">agent-2 (512,310)</text>
+                </g>
+
+                <!-- Virtual Cursor 3: agent-3 (Copper Signal) -->
+                <g class="stage-cursor" data-stage-agent="2">
+                  <circle class="cursor-ring" cx="418" cy="112" r="11" fill="none" stroke="#b53f15" stroke-width="1.5" stroke-dasharray="3 2"/>
+                  <path d="M418 110 L414 124 L411 119 L405 119 Z" fill="#b53f15" stroke="#ffffff" stroke-width="1"/>
+                  <rect x="336" y="123" width="108" height="16" rx="4" fill="#b53f15"/>
+                  <text x="341" y="134" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#ffffff" id="svg-c3-label">agent-3 (184,260)</text>
+                </g>
+
+                <!-- Bottom Bar: Physical OS Cursor Hardware Lock -->
+                <g class="stage-cursor stage-guard-bar" data-stage-agent="3">
+                  <rect x="8" y="159" width="444" height="21" rx="4" fill="#f7fafc"/>
+                  <circle cx="20" cy="169.5" r="4" fill="#095c49"/>
+                  <path d="M18 169.5 L22 169.5 M20 167.5 L20 171.5" stroke="#ffffff" stroke-width="1.2"/>
+                  <text x="30" y="173" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#0c1720">Physical OS Cursor Locked:</text>
+                  <text x="172" y="173" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#095c49">Δ 0.0 px drift · 0 focus switches (50Hz Guard)</text>
+                </g>
+              </svg>
+            </div>
+
             <div class="cursor-list" id="trace-cursors" aria-live="polite"></div>
             <div class="telemetry-summary">
               <span id="trace-metrics"></span>
@@ -131,6 +253,20 @@
 
         <div class="arch-grid">
           <article class="arch-col">
+            <svg class="arch-schematic" viewBox="0 0 320 76" aria-hidden="true">
+              <rect x="0" y="0" width="320" height="76" rx="6" fill="#eaf0f4"/>
+              <rect x="10" y="16" width="84" height="44" rx="5" fill="#101c26"/>
+              <text x="52" y="35" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#6bc2ad">MV3 Bridge</text>
+              <text x="52" y="49" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#e6f0f7">:19222/ext</text>
+              <line x1="94" y1="38" x2="132" y2="38" stroke="#095c49" stroke-width="1.5" stroke-dasharray="3 2"/>
+              <polygon points="132,34 139,38 132,42" fill="#095c49"/>
+              <rect x="140" y="12" width="170" height="52" rx="5" fill="#ffffff" stroke="#9fb2c2" stroke-width="1"/>
+              <rect x="148" y="19" width="58" height="14" rx="3" fill="#095c49"/>
+              <text x="177" y="29" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#ffffff">🤖 Agent</text>
+              <text x="212" y="29" font-family="JetBrains Mono, monospace" font-size="8" font-weight="600" fill="#344b5c">active:false</text>
+              <text x="148" y="46" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#095c49">@u1..@uN WeakMap</text>
+              <text x="148" y="57" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#344b5c">+ WebMCP &amp; Table Fold</text>
+            </svg>
             <h3>Chrome "🤖 Agent" Tab Groups</h3>
             <p class="arch-lead">Drive logged-in Chrome sessions or headless workers without stealing window focus.</p>
             <ul>
@@ -142,6 +278,20 @@
           </article>
 
           <article class="arch-col">
+            <svg class="arch-schematic" viewBox="0 0 320 76" aria-hidden="true">
+              <rect x="0" y="0" width="320" height="76" rx="6" fill="#eaf0f4"/>
+              <rect x="10" y="16" width="90" height="44" rx="5" fill="#101c26"/>
+              <text x="55" y="35" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#6bc2ad">fmu-ax.sock</text>
+              <text x="55" y="49" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#e6f0f7">4k LRU Cache</text>
+              <line x1="100" y1="28" x2="136" y2="28" stroke="#095c49" stroke-width="1.5"/>
+              <polygon points="136,24 143,28 136,32" fill="#095c49"/>
+              <line x1="100" y1="48" x2="136" y2="48" stroke="#b53f15" stroke-width="1.5"/>
+              <polygon points="136,44 143,48 136,52" fill="#b53f15"/>
+              <rect x="144" y="12" width="166" height="24" rx="4" fill="#ffffff" stroke="#9fb2c2" stroke-width="1"/>
+              <text x="152" y="27" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#095c49">AXObserver · &lt;1ms ~@a4</text>
+              <rect x="144" y="40" width="166" height="24" rx="4" fill="#ffffff" stroke="#9fb2c2" stroke-width="1"/>
+              <text x="152" y="55" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#b53f15">Vision OCR · 0 vision tok</text>
+            </svg>
             <h3>Native Swift AXObserver &amp; OCR</h3>
             <p class="arch-lead">Persistent universal2 Swift daemon (<code>/tmp/fmu-ax.sock</code>) with a 4,000-node LRU cache.</p>
             <ul>
@@ -153,6 +303,24 @@
           </article>
 
           <article class="arch-col">
+            <svg class="arch-schematic" viewBox="0 0 320 76" aria-hidden="true">
+              <rect x="0" y="0" width="320" height="76" rx="6" fill="#eaf0f4"/>
+              <rect x="10" y="16" width="78" height="44" rx="5" fill="#101c26"/>
+              <text x="49" y="35" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#ff9e7d">parallel</text>
+              <text x="49" y="49" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="7.5" fill="#e6f0f7">268-tok REPL</text>
+              <line x1="88" y1="22" x2="122" y2="22" stroke="#095c49" stroke-width="1.5"/>
+              <line x1="88" y1="38" x2="122" y2="38" stroke="#0b6bcb" stroke-width="1.5"/>
+              <line x1="88" y1="54" x2="122" y2="54" stroke="#b53f15" stroke-width="1.5"/>
+              <rect x="122" y="12" width="104" height="16" rx="3" fill="#d7efe8"/>
+              <text x="128" y="23" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="700" fill="#095c49">vCursor-1 · Tab 1</text>
+              <rect x="122" y="30" width="104" height="16" rx="3" fill="#e3effa"/>
+              <text x="128" y="41" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="700" fill="#0b6bcb">vCursor-2 · Tab 2</text>
+              <rect x="122" y="48" width="104" height="16" rx="3" fill="#fae6de"/>
+              <text x="128" y="59" font-family="JetBrains Mono, monospace" font-size="7.5" font-weight="700" fill="#b53f15">vCursor-3 · macOS</text>
+              <rect x="232" y="12" width="78" height="52" rx="5" fill="#ffffff" stroke="#095c49" stroke-width="1"/>
+              <text x="271" y="34" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="700" fill="#095c49">50Hz Guard</text>
+              <text x="271" y="48" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="700" fill="#0c1720">0.0 px</text>
+            </svg>
             <h3>3-Cursor Parallel Swarms</h3>
             <p class="arch-lead">Run concurrent agents inside one runtime with isolated virtual cursors.</p>
             <ul>
@@ -198,7 +366,13 @@
         <div class="config-box" id="config-panel" role="tabpanel" aria-labelledby="tab-config-mcp">
           <div class="code-toolbar">
             <span id="config-label">mcp_config.json / .cursor/mcp.json</span>
-            <button type="button" class="copy-btn" data-copy-target="config-code">Copy snippet</button>
+            <button type="button" class="copy-btn" data-copy-target="config-code">
+              <svg class="copy-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                <path class="icon-clip" fill="currentColor" d="M5.75 1a.75.75 0 0 0-.75.75v3c0 .414.336.75.75.75h4.5a.75.75 0 0 0 .75-.75v-3a.75.75 0 0 0-.75-.75h-4.5Zm.75 3V2.5h3V4h-3Zm-2.874-.467a.75.75 0 0 0-.752-1.298A1.75 1.75 0 0 0 2 3.75v9.5c0 .966.784 1.75 1.75 1.75h8.5A1.75 1.75 0 0 0 14 13.25v-9.5a1.75 1.75 0 0 0-.874-1.515.75.75 0 1 0-.752 1.298.25.25 0 0 1 .126.217v9.5a.25.25 0 0 1-.25.25h-8.5a.25.25 0 0 1-.25-.25v-9.5a.25.25 0 0 1 .126-.217Z"/>
+                <path class="icon-check" fill="currentColor" d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/>
+              </svg>
+              <span class="copy-label">Copy snippet</span>
+            </button>
           </div>
           <pre class="trace-code" id="config-code"></pre>
         </div>
@@ -222,6 +396,7 @@
     const WORKLOADS = {
       A: {
         subtitle: "Workload A · 10-op enterprise SaaS console (lower is better)",
+        winBadge: "114× fewer tokens · 13.9× faster vs @playwright/mcp",
         rows: [
           { name: "faster-mac-use", note: "REPL + UID diff (1,290 w/ WebMCP)", ours: true, tok: 2024, ms: "133 ms" },
           { name: "OpenAI Codex CUA", note: "cua_repl reference", ours: false, tok: 5732, ms: "359 ms" },
@@ -231,6 +406,7 @@
       },
       D: {
         subtitle: "Workload D · 25-op 3-agent parallel swarm across Web + macOS",
+        winBadge: "195× fewer tokens · 14.9× faster vs stacked MCPs",
         rows: [
           { name: "faster-mac-use", note: "3 virtual cursors in parallel", ours: true, tok: 1510, ms: "326 ms" },
           { name: "OpenAI Codex CUA", note: "3 agents serialized (1 session)", ours: false, tok: 15923, ms: "1,122 ms" },
@@ -240,6 +416,7 @@
       },
       B: {
         subtitle: "Workload B · 11-op native macOS Calculator control in background",
+        winBadge: "38× fewer tokens · 32.2× faster vs open-computer-use",
         rows: [
           { name: "faster-mac-use", note: "Swift AXObserver (<1ms diff)", ours: true, tok: 1264, ms: "395 ms" },
           { name: "OpenAI Codex CUA", note: "cua_repl reference", ours: false, tok: 1502, ms: "554 ms" },
@@ -253,11 +430,12 @@
       swarm: {
         label: "1-turn parallel swarm: 2 Chrome tabs + macOS Calculator",
         guard: "0.0 px drift · 3 virtual cursors",
+        stage: { u14: '~ "Approved"', u19: '~ "EU Region"', calc: "81", c1: "agent-1 (368,224)", c2: "agent-2 (512,310)", c3: "agent-3 (184,260)" },
         cursors: [
-          { agent: "agent-1 · Chrome Tab 1", pos: "Virtual (368, 224) · 🤖 Agent [blue] · ~ @u14 'Approved'" },
-          { agent: "agent-2 · Chrome Tab 2", pos: "Virtual (512, 310) · 🤖 Agent [cyan] · ~ @u19 'EU Region'" },
-          { agent: "agent-3 · Calculator.app", pos: "Virtual (184, 260) · PID 48120 (BG) · ~ @a4 '81'" },
-          { agent: "macOS Physical Cursor", pos: "Δ 0.0 px displacement · 0 foreground focus switches" }
+          { agent: "agent-1 · Chrome Tab 1", pos: "Virtual (368, 224) · 🤖 Agent [blue] · ~ @u14 'Approved'", lines: [3, 7] },
+          { agent: "agent-2 · Chrome Tab 2", pos: "Virtual (512, 310) · 🤖 Agent [cyan] · ~ @u19 'EU Region'", lines: [8, 12] },
+          { agent: "agent-3 · Calculator.app", pos: "Virtual (184, 260) · PID 48120 (BG) · ~ @a4 '81'", lines: [13, 16] },
+          { agent: "macOS Physical Cursor", pos: "Δ 0.0 px displacement · 0 foreground focus switches", lines: [1, 2] }
         ],
         code: `await fmu({
   parallel: [
@@ -283,11 +461,12 @@
       saas: {
         label: "Table folding + 1-call Virtual WebMCP macro replay",
         guard: "0.0 px drift · Focus Emulation",
+        stage: { u14: '+ "ORD-415 OK"', u19: '24 rows folded', calc: "idle", c1: "default (442,196)", c2: "@u2..@u109 fold", c3: "WebMCP macro" },
         cursors: [
-          { agent: "default · Chrome Tab", pos: "Virtual (442, 196) · 🤖 Agent Tab Group (active: false)" },
-          { agent: "Table Folding Index", pos: "24 dense rows folded · @u2..@u109 clickable by UID" },
-          { agent: "WebMCP + Virtual Macro", pos: "navigator.modelContext + ~/.fmu/macros/ ready" },
-          { agent: "Zero-Dialog Upload", pos: "CDP DOM.setFileInputFiles · 0 NSOpenPanel popups" }
+          { agent: "default · Chrome Tab", pos: "Virtual (442, 196) · 🤖 Agent Tab Group (active: false)", lines: [1, 4] },
+          { agent: "Table Folding Index", pos: "24 dense rows folded · @u2..@u109 clickable by UID", lines: [14, 15] },
+          { agent: "WebMCP + Virtual Macro", pos: "navigator.modelContext + ~/.fmu/macros/ ready", lines: [6, 9] },
+          { agent: "Zero-Dialog Upload", pos: "CDP DOM.setFileInputFiles · 0 NSOpenPanel popups", lines: [11, 13] }
         ],
         code: `let tab = await cua.createBrowserTab(
   "chrome", url, {sessionName: "🤖 Agent"}
@@ -310,11 +489,12 @@ await tab.click("Approve Payout");`,
       macos: {
         label: "Background Swift AXObserver daemon + 0-token Vision OCR",
         guard: "0.0 px drift · <1 ms AX diff",
+        stage: { u14: "BG idle", u19: "BG idle", calc: "640", c1: "AX (192,248)", c2: "AXObserver <1ms", c3: "Vision 0-tok" },
         cursors: [
-          { agent: "default · Calculator.app", pos: "Virtual (192, 248) · /tmp/fmu-ax.sock warm" },
-          { agent: "Dirty Subtree Tracker", pos: "kAXValueChangedNotification · <1 ms delta" },
-          { agent: "Clipboard & Focus Guard", pos: "NSPasteboard untouched · AXPress background dispatch" },
-          { agent: "Vision.framework OCR", pos: "VNRecognizeTextRequest in <70 ms · 0 vision tokens" }
+          { agent: "default · Calculator.app", pos: "Virtual (192, 248) · /tmp/fmu-ax.sock warm", lines: [1, 2] },
+          { agent: "Dirty Subtree Tracker", pos: "kAXValueChangedNotification · <1 ms delta", lines: [10, 10] },
+          { agent: "Clipboard & Focus Guard", pos: "NSPasteboard untouched · AXPress background dispatch", lines: [4, 9] },
+          { agent: "Vision.framework OCR", pos: "VNRecognizeTextRequest in <70 ms · 0 vision tokens", lines: [12, 13] }
         ],
         code: `let app = await cua.getApp("Calculator");
 await app.pressKey("escape");
@@ -368,17 +548,78 @@ fmu '{"surface":"app","app":"Calculator","steps":[
       }
     };
 
+    const TOKEN_REGEX = /(\/\/[^\n]*|#[^\n]*)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`|\b(?:await|let|const|for|of|pip|install|fmu)\b|\b(?:createBrowserTab|fill|click|select|callTool|upload|getApp|pressKey|ocr|parallel|cua|mcpServers|command|args|surface|app|steps|op|name)\b|@[ua]\d+|\b\d+(?:,\d+)*\b)/g;
+
+    function highlightLine(lineText) {
+      const escaped = lineText
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+      return escaped.replace(TOKEN_REGEX, (match, comment, tok) => {
+        if (comment) return `<span class="tok-comment">${comment}</span>`;
+        if (!tok) return match;
+        if (tok.startsWith('"') || tok.startsWith("'") || tok === "`") {
+          return `<span class="tok-str">${tok}</span>`;
+        }
+        if (/^(await|let|const|for|of|pip|install|fmu)$/.test(tok)) {
+          return `<span class="tok-kw">${tok}</span>`;
+        }
+        if (tok.startsWith("@") || /^\d/.test(tok)) {
+          return `<span class="tok-num">${tok}</span>`;
+        }
+        return `<span class="tok-fn">${tok}</span>`;
+      });
+    }
+
+    function renderCodeBlock(el, rawCode, cursors) {
+      el.dataset.rawCode = rawCode;
+      const lines = rawCode.split("\n");
+      const htmlLines = lines.map((lineText, idx) => {
+        const lineNum = idx + 1;
+        let agentAttr = "";
+        if (cursors) {
+          const cIdx = cursors.findIndex((c) => c.lines && lineNum >= c.lines[0] && lineNum <= c.lines[1]);
+          if (cIdx !== -1) {
+            agentAttr = ` data-agent-idx="${cIdx}"`;
+          }
+        }
+        return `<span class="code-line" data-line="${lineNum}"${agentAttr}>${highlightLine(lineText) || " "}</span>`;
+      });
+      el.innerHTML = htmlLines.join("\n");
+    }
+
+    function setActiveAgent(agentIdx) {
+      const rows = document.querySelectorAll("#trace-cursors .cursor-row");
+      rows.forEach((r, idx) => {
+        r.classList.toggle("is-active", idx === agentIdx);
+      });
+
+      const stageGroups = document.querySelectorAll("#mission-svg .stage-cursor");
+      stageGroups.forEach((g) => {
+        const idx = Number(g.dataset.stageAgent);
+        g.classList.toggle("is-active", idx === agentIdx);
+      });
+
+      const codeLines = document.querySelectorAll("#trace-code .code-line");
+      codeLines.forEach((line) => {
+        const lineAgent = line.dataset.agentIdx !== undefined ? Number(line.dataset.agentIdx) : -1;
+        line.classList.toggle("is-highlighted", lineAgent === agentIdx);
+      });
+    }
+
     function renderBenchmarks(key) {
       const wl = WORKLOADS[key];
       if (!wl) return;
       document.getElementById("bench-subtitle").textContent = wl.subtitle;
+      document.getElementById("bench-win-badge").textContent = wl.winBadge;
 
       const maxVal = Math.max(...wl.rows.map((r) => r.tok));
       const barsEl = document.getElementById("bench-bars");
       barsEl.replaceChildren();
 
       for (const row of wl.rows) {
-        const pct = (row.tok / maxVal) * 100;
+        const pct = Math.sqrt(row.tok / maxVal) * 100;
         const item = document.createElement("div");
         item.className = row.ours ? "bar-item is-ours" : "bar-item";
 
@@ -395,7 +636,7 @@ fmu '{"surface":"app","app":"Calculator","steps":[
         noteEl.textContent = row.note;
         titleWrap.append(nameEl, noteEl);
 
-        const statsEl = document.createElement("div");
+        const statsEl = document.createElement("code");
         statsEl.className = "bar-stats";
         const tokEl = document.createElement("strong");
         tokEl.className = "bar-tok";
@@ -424,23 +665,55 @@ fmu '{"surface":"app","app":"Calculator","steps":[
       if (!trace) return;
       document.getElementById("trace-label").textContent = trace.label;
       document.getElementById("trace-guard").textContent = trace.guard;
-      document.getElementById("trace-code").textContent = trace.code;
+      renderCodeBlock(document.getElementById("trace-code"), trace.code, trace.cursors);
       document.getElementById("trace-metrics").textContent = trace.metrics;
       document.getElementById("trace-saving").textContent = trace.saving;
 
+      if (trace.stage) {
+        document.getElementById("svg-u14-diff").textContent = trace.stage.u14;
+        document.getElementById("svg-u19-diff").textContent = trace.stage.u19;
+        document.getElementById("svg-calc-val").textContent = trace.stage.calc;
+        document.getElementById("svg-c1-label").textContent = trace.stage.c1;
+        document.getElementById("svg-c2-label").textContent = trace.stage.c2;
+        document.getElementById("svg-c3-label").textContent = trace.stage.c3;
+      }
+
       const cursorBox = document.getElementById("trace-cursors");
       cursorBox.replaceChildren();
-      for (const item of trace.cursors) {
+      trace.cursors.forEach((item, idx) => {
         const row = document.createElement("div");
         row.className = "cursor-row";
+        row.dataset.agentIdx = String(idx);
+        row.tabIndex = 0;
+
+        const head = document.createElement("div");
+        head.className = "cursor-row-head";
+        const dot = document.createElement("span");
+        dot.className = `cursor-dot dot-${idx}`;
+        dot.setAttribute("aria-hidden", "true");
         const strong = document.createElement("strong");
         strong.textContent = item.agent;
-        const span = document.createElement("span");
-        span.textContent = item.pos;
-        row.append(strong, span);
+        head.append(dot, strong);
+
+        const posEl = document.createElement("code");
+        posEl.className = "cursor-pos";
+        posEl.textContent = item.pos;
+        row.append(head, posEl);
+
+        row.addEventListener("mouseenter", () => setActiveAgent(idx));
+        row.addEventListener("focus", () => setActiveAgent(idx));
+        row.addEventListener("click", () => setActiveAgent(idx));
         cursorBox.append(row);
-      }
+      });
+
+      setActiveAgent(0);
     }
+
+    document.querySelectorAll("#mission-svg .stage-cursor").forEach((g) => {
+      g.addEventListener("mouseenter", () => {
+        setActiveAgent(Number(g.dataset.stageAgent));
+      });
+    });
 
     function bindTablist(selector, panelId, onSelect) {
       const tabs = Array.from(document.querySelectorAll(selector));
@@ -498,7 +771,7 @@ fmu '{"surface":"app","app":"Calculator","steps":[
       const entry = CONFIG_SNIPPETS[btn.dataset.config];
       if (entry) {
         document.getElementById("config-label").textContent = entry.label;
-        document.getElementById("config-code").textContent = entry.code;
+        renderCodeBlock(document.getElementById("config-code"), entry.code, null);
       }
     });
 
@@ -529,22 +802,34 @@ fmu '{"surface":"app","app":"Calculator","steps":[
     }
 
     for (const copyBtn of document.querySelectorAll("[data-copy-target]")) {
-      const defaultLabel = copyBtn.textContent;
+      const labelSpan = copyBtn.querySelector(".copy-label");
+      const defaultLabel = labelSpan ? labelSpan.textContent : copyBtn.textContent;
       copyBtn.addEventListener("click", async () => {
         const target = document.getElementById(copyBtn.dataset.copyTarget);
         if (!target) return;
-        await writeClipboardText(target.textContent || "");
-        copyBtn.textContent = "Copied";
+        const rawText = target.dataset.rawCode || target.textContent || "";
+        copyBtn.classList.add("is-copied");
+        if (labelSpan) {
+          labelSpan.textContent = "Copied";
+        } else {
+          copyBtn.textContent = "Copied";
+        }
         clearTimeout(copyBtn._resetTimer);
         copyBtn._resetTimer = setTimeout(() => {
-          copyBtn.textContent = defaultLabel;
+          copyBtn.classList.remove("is-copied");
+          if (labelSpan) {
+            labelSpan.textContent = defaultLabel;
+          } else {
+            copyBtn.textContent = defaultLabel;
+          }
         }, 1500);
+        await writeClipboardText(rawText);
       });
     }
 
     renderBenchmarks("A");
     renderTrace("swarm");
-    document.getElementById("config-code").textContent = CONFIG_SNIPPETS.mcp.code;
+    renderCodeBlock(document.getElementById("config-code"), CONFIG_SNIPPETS.mcp.code, null);
   </script>
 </body>
 </html>

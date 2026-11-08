@@ -7,6 +7,10 @@ colors:
   accent-soft: "#d7efe8"
   signal: "#b53f15"
   signal-soft: "#fae6de"
+  ocean: "#0b6bcb"
+  ocean-soft: "#e3effa"
+  tok-fn: "#7cc4fa"
+  tok-num: "#f7c873"
   ground: "#eaf0f4"
   surface: "#f7fafc"
   surface-strong: "#ffffff"
@@ -87,7 +91,7 @@ components:
     backgroundColor: "{colors.accent}"
     textColor: "{colors.surface-strong}"
     rounded: "{rounded.sm}"
-    padding: "0.42rem 0.78rem"
+    padding: "0.38rem 0.74rem"
 ---
 
 # Design System: Faster Mac Use (`fmu`)
@@ -96,32 +100,33 @@ components:
 
 **Creative North Star: "The Anodized Systems Workbench"**
 
-`faster-mac-use` is a precision systems engine for macOS and Chrome. Its web presence rejects dark-neon AI tropes and floating SaaS feature cards in favor of a bright, high-contrast anodized-aluminum specification sheet paired with a deep-slate telemetry workbench. Every visual element encodes verifiable measurement: 50Hz hardware intrusion guard badges, multi-cursor virtual coordinates, and interactive `o200k_base` benchmark comparisons.
+`faster-mac-use` is a precision systems engine for macOS and Chrome. Its web presence rejects dark-neon AI tropes and floating SaaS feature cards in favor of a bright, high-contrast anodized-aluminum specification sheet paired with a deep-slate telemetry workbench. Every visual element encodes verifiable measurement: 50Hz hardware intrusion guard badges, an interactive SVG multi-cursor Mission Control stage, syntax-highlighted `cua_repl` traces, and `√`-scaled `o200k_base` benchmark comparisons.
 
 **Key Characteristics:**
 - Cool anodized-aluminum ground (`#eaf0f4`) with crisp white specification ledgers (`#ffffff`) and structural 1px rules (`#9fb2c2`, `#c4d1dc`).
-- Deep slate code/trace chambers (`#101c26`) reserved strictly for live `cua_repl` traces, CLI commands, and MCP configuration snippets.
+- Deep slate two-tier terminal and code chambers (`#101c26`, `#0c1720`) with semantic syntax highlighting (`#6bc2ad`, `#f0a68b`, `#7cc4fa`, `#f7c873`) and line numbers.
 - `Chivo` geometric grotesque for assertive headings and readable prose paired with `JetBrains Mono` (`tabular-nums`) for token counts, latencies, and virtual cursor coordinates.
 
 ## Colors
 
-The palette pairs cool machined-metal neutrals with phosphor-emerald verification accents and copper-vermilion delta highlights.
+The palette pairs cool machined-metal neutrals with phosphor-emerald verification accents, ocean-blue secondary cursor channels, and copper-vermilion delta highlights.
 
 ### Primary
-- **Phosphor Emerald** (`#095c49`, hover `#064436`, soft tint `#d7efe8`): Primary actions, active workload/trace/config tabs, verified `0.0 px` hardware-guard badges, and `faster-mac-use` benchmark bars.
+- **Phosphor Emerald** (`#095c49`, hover `#064436`, soft tint `#d7efe8`): Primary actions, active workload/trace/config pill tabs, `agent-1` virtual cursor, verified `0.0 px` hardware-guard badges, and `faster-mac-use` benchmark bars.
 
 ### Secondary
-- **Copper Signal** (`#b53f15`, soft tint `#fae6de`): Keyboard focus rings and token-reduction multiplier readouts.
+- **Copper Signal** (`#b53f15`, soft tint `#fae6de`): Keyboard focus rings, `agent-3` macOS virtual cursor, and token-reduction multiplier readouts.
+- **Ocean Telemetry** (`#0b6bcb`, soft tint `#e3effa`, syntax sky `#7cc4fa`, syntax amber `#f7c873`): `agent-2` browser virtual cursor and high-contrast syntax tokens inside `#101c26` code chambers.
 
 ### Neutral
-- **Anodized Ground** (`#eaf0f4`): Page canvas and bar-chart track background.
+- **Anodized Ground** (`#eaf0f4`): Page canvas, recessed segmented control tracks, and bar-chart track background.
 - **Ledger Surface** (`#f7fafc`) & **Pure Sheet** (`#ffffff`): Specification strips, benchmark explorer panels, and architecture ledgers.
 - **Deep Slate Ink** (`#0c1720`) & **Tempered Slate** (`#344b5c`): High-contrast primary copy and secondary technical prose (both exceeding WCAG AA/AAA contrast on light surfaces).
 - **Competitor Bar Slate** (`#7c93a6`) & **Hairline Rules** (`#c4d1dc`, `#9fb2c2`): Structural borders and baseline bars.
-- **Terminal Chamber** (`#101c26`), **Terminal Ink** (`#e6f0f7`), & **Control Slate** (`#203444`, hover `#2b4559`, border `#38556b`): High-contrast code and trace blocks.
+- **Terminal Chamber** (`#101c26`), **TerminalInk** (`#e6f0f7`), & **Control Slate** (`#203444`, hover `#2b4559`, border `#38556b`): Two-tier install widget and syntax-highlighted trace blocks.
 
 ### Named Rules
-**The Structural Hairline Rule.** Divide related specification cells and architectural tiers with 1px structural rules inside a unified ledger rather than chopping content into disconnected floating cards.
+**The Structural Hairline Rule.** Divide related specification cells, interactive SVG stages, and architectural schematics with 1px structural rules inside a unified ledger rather than chopping content into nested bordered cards.
 
 ## Typography
 
@@ -137,7 +142,7 @@ The palette pairs cool machined-metal neutrals with phosphor-emerald verificatio
 - **Title** (`700`, `1.1875rem`, line-height `1.32`): Panel and architectural tier titles.
 - **Body** (`400`, `1.0625rem`, line-height `1.62`): Technical explanations constrained to `66ch` max measure (`text-wrap: pretty`).
 - **Subhead** (`600`, `0.9375rem`, line-height `1.5`): Navigation links, primary CTAs, and architecture list items.
-- **Label** (`600`, `0.875rem`, line-height `1.35`): Interactive workload/trace/config tab controls and bar chart labels.
+- **Label** (`600`, `0.875rem`, line-height `1.35`): Interactive workload/trace/config segmented pill controls and bar chart labels.
 - **Code / Telemetry** (`600`, `0.8125rem`, line-height `1.5`, `tabular-nums`): Live trace inspector, benchmark bar readouts, and status pills.
 
 ### Named Rules
@@ -145,7 +150,7 @@ The palette pairs cool machined-metal neutrals with phosphor-emerald verificatio
 
 ## Layout
 
-Centered `1140px` maximum container (`calc(100% - 3.5rem)` on desktop, `calc(100% - 2.25rem)` under `600px`) structured into 4 breathable sections with generous vertical rhythm (`4.5rem` between sections). The opening viewport splits `1.02fr / 0.98fr` between the thesis + 1-click install bar on the left and the interactive 4-bar horizontal benchmark ledger on the right, collapsing cleanly to a single column below `960px` with `min-width: 0` on all grid children to prevent horizontal overflow.
+Centered `1140px` maximum container (`calc(100% - 3.5rem)` on desktop, `calc(100% - 2.25rem)` under `600px`) structured into 4 breathable sections with generous vertical rhythm (`4.5rem` between sections). The opening viewport splits `1.02fr / 0.98fr` between the thesis + two-tier install chamber on the left and the interactive `√`-scaled 4-bar horizontal benchmark ledger on the right, collapsing cleanly to a single column below `960px` with `min-width: 0` on all grid children to prevent horizontal overflow.
 
 ## Elevation & Depth
 
@@ -158,8 +163,8 @@ This system is flat and structural by default. Depth is conveyed through tonal l
 
 - **Outer Ledgers & Workbenches:** `14px` radius (`--rounded-xl`) with `overflow: hidden` so internal hairlines meet the frame cleanly.
 - **Inner Code Chambers & Panels:** `12px` radius (`--rounded-lg`).
-- **Primary & Secondary Action Buttons:** `8px` radius (`--rounded-md`).
-- **Filter Tabs, Copy Controls, & Status Badges:** `6px` radius (`--rounded-sm`).
+- **Primary & Secondary Action Buttons & Segmented Pill Wells:** `8px` radius (`--rounded-md`).
+- **Segmented Pill Tabs, Copy Controls, & Status Badges:** `6px` radius (`--rounded-sm`).
 
 ## Components
 
@@ -168,14 +173,14 @@ This system is flat and structural by default. Depth is conveyed through tonal l
 - **Primary:** Phosphor Emerald (`#095c49`) fill with `#ffffff` text and `0.7rem 1.15rem` padding; darkens to `#064436` on hover.
 - **Secondary:** Pure white (`#ffffff`) fill with `#0c1720` text and `1px solid #9fb2c2` border; shifts to `#f7fafc` on hover.
 
-### Chips
-- **Style:** Compact `6px`-radius interactive tabs (`0.42rem 0.78rem`, `0.875rem` font size) for switching benchmark workloads (`A`, `D`, `B`), recorded execution traces, and MCP client configs.
-- **State:** Unselected tabs use `#ffffff` background with `#344b5c` text and `1px solid #c4d1dc`; selected tabs (`aria-selected="true"`) invert to `#095c49` with `#ffffff` text.
+### Chips / Segmented Controls
+- **Style:** Recessed `8px`-radius segmented pill track (`#eaf0f4`, `1px solid #c4d1dc`, `0.22rem` padding) containing `6px`-radius interactive pill buttons (`0.38rem 0.74rem`, `0.875rem` font size) for switching benchmark workloads (`A`, `D`, `B`), recorded execution traces, and MCP client configs.
+- **State:** Unselected tabs sit transparently inside the recessed track with `#344b5c` text; selected tabs (`aria-selected="true"`) elevate as a `#095c49` pill with `#ffffff` text.
 
 ### Cards / Containers
 - **Corner Style:** `12px`–`14px` radius with `1px solid #9fb2c2` border and zero drop shadow.
 - **Background:** `#ffffff` for primary panels, `#f7fafc` for header strips, and `#101c26` for code blocks.
-- **Internal Padding:** `1.35rem 1.5rem` on workbench ledgers and `1.5rem` on hairlined architecture columns.
+- **Internal Padding:** `1.35rem 1.5rem` on workbench ledgers and `1.4rem 1.5rem 1.5rem` on hairlined architecture columns.
 
 ### Navigation
 - **Style:** Top horizontal bar with breadcrumb identity (`Lifan Chen / faster-mac-use`) and `v0.1.0 · MIT` badge on the left, and section anchor links (`0.9375rem`, weight `600`, `#344b5c` → `#0c1720` on hover) on the right.

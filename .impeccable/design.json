@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-08T19:37:00Z",
+  "generatedAt": "2026-11-08T20:16:00Z",
   "title": "Design System: Faster Mac Use (fmu)",
   "extensions": {
     "colorMeta": {
@@ -16,11 +16,17 @@
         "canonical": "#b53f15",
         "tonalRamp": ["#4a1806", "#7a290c", "#b53f15", "#d4562a", "#e47b55", "#f0a68b", "#f7cbbd", "#fae6de"]
       },
+      "ocean": {
+        "role": "secondary",
+        "displayName": "Ocean Telemetry",
+        "canonical": "#0b6bcb",
+        "tonalRamp": ["#063b70", "#0b6bcb", "#3b82f6", "#7cc4fa", "#e3effa", "#f7c873"]
+      },
       "ground": {
         "role": "neutral",
         "displayName": "Anodized Ground",
         "canonical": "#eaf0f4",
-        "tonalRamp": ["#0c1720", "#101c26", "#203444", "#344b5c", "#7c93a6", "#9fb2c2", "#c4d1dc", "#eaf0f4"]
+        "tonalRamp": ["#0c1720", "#101c26", "#203444", "#2b4559", "#38556b", "#344b5c", "#7c93a6", "#9fb2c2", "#c4d1dc", "#eaf0f4", "#f7fafc", "#ffffff"]
       }
     },
     "typographyMeta": {
@@ -63,12 +69,12 @@
       "css": ".ds-btn-secondary { display: inline-flex; align-items: center; padding: 0.7rem 1.15rem; border-radius: 8px; background: var(--surface-strong, #ffffff); color: var(--ink, #0c1720); border: 1px solid var(--rule-strong, #9fb2c2); font-size: 0.9375rem; font-weight: 600; text-decoration: none; } .ds-btn-secondary:hover { background: var(--surface, #f7fafc); } .ds-btn-secondary:focus-visible { outline: 2.5px solid var(--signal, #b53f15); outline-offset: 3px; }"
     },
     {
-      "name": "Workload / Trace Filter Tab",
+      "name": "Workload / Trace Segmented Pill Tab",
       "kind": "chip",
       "refersTo": "chip-active",
-      "description": "Interactive tab selector for switching benchmark workloads, traces, and configs.",
+      "description": "Recessed segmented pill selector for switching benchmark workloads, traces, and configs.",
       "html": "<button type=\"button\" class=\"ds-chip\" role=\"tab\" aria-selected=\"true\">Web SaaS</button>",
-      "css": ".ds-chip { background: var(--surface-strong, #ffffff); color: var(--muted, #344b5c); border: 1px solid var(--rule, #c4d1dc); border-radius: 6px; padding: 0.42rem 0.78rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; } .ds-chip[aria-selected=\"true\"] { background: var(--accent, #095c49); color: var(--surface-strong, #ffffff); border-color: var(--accent, #095c49); } .ds-chip:focus-visible { outline: 2.5px solid var(--signal, #b53f15); outline-offset: 3px; }"
+      "css": ".ds-chip { background: transparent; color: var(--muted, #344b5c); border: none; border-radius: 6px; padding: 0.38rem 0.74rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; } .ds-chip[aria-selected=\"true\"] { background: var(--accent, #095c49); color: var(--surface-strong, #ffffff); } .ds-chip:focus-visible { outline: 2.5px solid var(--signal, #b53f15); outline-offset: 3px; }"
     },
     {
       "name": "Top Navigation Bar",
@@ -89,16 +95,16 @@
   ],
   "narrative": {
     "northStar": "The Anodized Systems Workbench",
-    "overview": "faster-mac-use is a precision systems engine for macOS and Chrome. Its web presence rejects dark-neon AI tropes and floating SaaS feature cards in favor of a bright, high-contrast anodized-aluminum specification sheet paired with a deep-slate telemetry workbench. Every visual element encodes verifiable measurement: 50Hz hardware intrusion guard badges, multi-cursor virtual coordinates, and interactive o200k_base benchmark comparisons.",
+    "overview": "faster-mac-use is a precision systems engine for macOS and Chrome. Its web presence rejects dark-neon AI tropes and floating SaaS feature cards in favor of a bright, high-contrast anodized-aluminum specification sheet paired with a deep-slate telemetry workbench. Every visual element encodes verifiable measurement: 50Hz hardware intrusion guard badges, an interactive SVG multi-cursor Mission Control stage, syntax-highlighted cua_repl traces, and √-scaled o200k_base benchmark comparisons.",
     "keyCharacteristics": [
       "Cool anodized-aluminum ground (#eaf0f4) with crisp white specification ledgers (#ffffff) and structural 1px rules (#9fb2c2, #c4d1dc).",
-      "Deep slate code/trace chambers (#101c26) reserved strictly for live cua_repl traces, CLI commands, and MCP configuration snippets.",
+      "Deep slate two-tier terminal and code chambers (#101c26, #0c1720) with semantic syntax highlighting (#6bc2ad, #f0a68b, #7cc4fa, #f7c873) and line numbers.",
       "Chivo geometric grotesque for assertive headings and readable prose paired with JetBrains Mono (tabular-nums) for token counts, latencies, and virtual cursor coordinates."
     ],
     "rules": [
       {
         "name": "The Structural Hairline Rule",
-        "body": "Divide related specification cells and architectural tiers with 1px structural rules inside a unified ledger rather than chopping content into disconnected floating cards.",
+        "body": "Divide related specification cells, interactive SVG stages, and architectural schematics with 1px structural rules inside a unified ledger rather than chopping content into nested bordered cards.",
         "section": "colors"
       },
       {

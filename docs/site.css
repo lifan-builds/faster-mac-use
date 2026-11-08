@@ -654,7 +654,8 @@ dd {
 
 .code-line {
   display: block;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
   padding: 0.04rem 1.1rem 0.04rem 2.65rem;
   position: relative;
   border-left: 2px solid transparent;
@@ -745,17 +746,32 @@ dd {
 
 .mission-svg .stage-cursor {
   cursor: pointer;
+  opacity: 0.62;
   transition: opacity 150ms ease;
 }
 
+.mission-svg .stage-cursor.is-active {
+  opacity: 1;
+}
+
 .mission-svg .cursor-ring {
-  opacity: 0.3;
+  opacity: 0.25;
   transition: opacity 150ms ease, stroke-width 150ms ease;
 }
 
 .mission-svg .stage-cursor.is-active .cursor-ring {
   opacity: 1;
   stroke-width: 2.2px;
+}
+
+.mission-svg .stage-guard-bar .guard-bar-rect {
+  transition: fill 150ms ease, stroke 150ms ease;
+}
+
+.mission-svg .stage-guard-bar.is-active .guard-bar-rect {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 1.5px;
 }
 
 .cursor-list {
@@ -766,16 +782,21 @@ dd {
 .cursor-row {
   padding: 0.58rem 0.5rem;
   border-bottom: 1px solid var(--rule);
+  border-left: 2px solid transparent;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 0.8125rem;
   cursor: pointer;
-  transition: background-color 120ms ease;
+  transition: background-color 120ms ease, border-color 120ms ease;
 }
 
 .cursor-row:hover,
 .cursor-row.is-active {
   background: var(--surface);
+}
+
+.cursor-row.is-active {
+  border-left-color: var(--accent);
 }
 
 .cursor-row-head {
@@ -979,7 +1000,11 @@ dd {
   }
 
   .code-line {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
+    padding: 0.04rem 0.65rem 0.04rem 2.15rem;
+  }
+
+  .code-line::before {
+    left: 0.35rem;
+    width: 1.35rem;
   }
 }

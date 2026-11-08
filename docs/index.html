@@ -49,9 +49,9 @@
             </div>
             <div class="install-meta">
               <div class="install-switch" role="tablist" aria-label="Install method">
-                <button type="button" class="install-tab" role="tab" aria-selected="true" data-cmd="uvx faster-mac-use mcp">uvx (MCP)</button>
-                <button type="button" class="install-tab" role="tab" aria-selected="false" data-cmd="brew install --Formula ./Formula/faster-mac-use.rb">brew install</button>
-                <button type="button" class="install-tab" role="tab" aria-selected="false" data-cmd="pip install git+https://github.com/lifan-builds/faster-mac-use">pip install</button>
+                <button type="button" class="install-tab" id="tab-install-uvx" role="tab" aria-selected="true" aria-controls="hero-cmd" tabindex="0" data-cmd="uvx faster-mac-use mcp">uvx (MCP)</button>
+                <button type="button" class="install-tab" id="tab-install-brew" role="tab" aria-selected="false" aria-controls="hero-cmd" tabindex="-1" data-cmd="brew install --Formula ./Formula/faster-mac-use.rb">brew install</button>
+                <button type="button" class="install-tab" id="tab-install-pip" role="tab" aria-selected="false" aria-controls="hero-cmd" tabindex="-1" data-cmd="pip install git+https://github.com/lifan-builds/faster-mac-use">pip install</button>
               </div>
               <span class="guard-inline">50Hz CoreGraphics guard: 0.0 px drift · 0 focus switches</span>
             </div>
@@ -70,13 +70,13 @@
               <p class="bench-sub" id="bench-subtitle">Workload A · 10-op enterprise SaaS console (lower is better)</p>
             </div>
             <div class="tab-group" role="tablist" aria-label="Select benchmark workload">
-              <button type="button" class="workload-tab" role="tab" aria-selected="true" data-workload="A">Web SaaS</button>
-              <button type="button" class="workload-tab" role="tab" aria-selected="false" data-workload="D">3-Agent Swarm</button>
-              <button type="button" class="workload-tab" role="tab" aria-selected="false" data-workload="B">macOS Native</button>
+              <button type="button" class="workload-tab" id="tab-workload-a" role="tab" aria-selected="true" aria-controls="bench-bars" tabindex="0" data-workload="A">Web SaaS</button>
+              <button type="button" class="workload-tab" id="tab-workload-d" role="tab" aria-selected="false" aria-controls="bench-bars" tabindex="-1" data-workload="D">3-Agent Swarm</button>
+              <button type="button" class="workload-tab" id="tab-workload-b" role="tab" aria-selected="false" aria-controls="bench-bars" tabindex="-1" data-workload="B">macOS Native</button>
             </div>
           </div>
 
-          <div class="bar-chart" id="bench-bars" aria-live="polite"></div>
+          <div class="bar-chart" id="bench-bars" role="tabpanel" aria-labelledby="tab-workload-a" aria-live="polite"></div>
 
           <div class="bench-foot">
             <span>OpenAI <code>o200k_base</code> tokenizer · 268-token schema</span>
@@ -94,13 +94,13 @@
             </p>
           </div>
           <div class="tab-group" role="tablist" aria-label="Select execution trace">
-            <button type="button" class="trace-tab" role="tab" aria-selected="true" data-trace="swarm">3-Cursor Swarm</button>
-            <button type="button" class="trace-tab" role="tab" aria-selected="false" data-trace="saas">Chrome + WebMCP</button>
-            <button type="button" class="trace-tab" role="tab" aria-selected="false" data-trace="macos">Native macOS AX</button>
+            <button type="button" class="trace-tab" id="tab-trace-swarm" role="tab" aria-selected="true" aria-controls="workbench-panel" tabindex="0" data-trace="swarm">3-Cursor Swarm</button>
+            <button type="button" class="trace-tab" id="tab-trace-saas" role="tab" aria-selected="false" aria-controls="workbench-panel" tabindex="-1" data-trace="saas">Chrome + WebMCP</button>
+            <button type="button" class="trace-tab" id="tab-trace-macos" role="tab" aria-selected="false" aria-controls="workbench-panel" tabindex="-1" data-trace="macos">Native macOS AX</button>
           </div>
         </div>
 
-        <div class="workbench-ledger">
+        <div class="workbench-ledger" id="workbench-panel" role="tabpanel" aria-labelledby="tab-trace-swarm">
           <div class="workbench-code-col">
             <div class="code-toolbar">
               <span id="trace-label">Stateful multi-cursor execution</span>
@@ -189,13 +189,13 @@
             </p>
           </div>
           <div class="tab-group" role="tablist" aria-label="Select MCP client or CLI example">
-            <button type="button" class="config-tab" role="tab" aria-selected="true" data-config="mcp">MCP JSON (Claude / Cursor)</button>
-            <button type="button" class="config-tab" role="tab" aria-selected="false" data-config="codex">OpenAI Codex (config.toml)</button>
-            <button type="button" class="config-tab" role="tab" aria-selected="false" data-config="cli">Shell CLI</button>
+            <button type="button" class="config-tab" id="tab-config-mcp" role="tab" aria-selected="true" aria-controls="config-panel" tabindex="0" data-config="mcp">MCP JSON (Claude / Cursor)</button>
+            <button type="button" class="config-tab" id="tab-config-codex" role="tab" aria-selected="false" aria-controls="config-panel" tabindex="-1" data-config="codex">OpenAI Codex (config.toml)</button>
+            <button type="button" class="config-tab" id="tab-config-cli" role="tab" aria-selected="false" aria-controls="config-panel" tabindex="-1" data-config="cli">Shell CLI</button>
           </div>
         </div>
 
-        <div class="config-box">
+        <div class="config-box" id="config-panel" role="tabpanel" aria-labelledby="tab-config-mcp">
           <div class="code-toolbar">
             <span id="config-label">mcp_config.json / .cursor/mcp.json</span>
             <button type="button" class="copy-btn" data-copy-target="config-code">Copy snippet</button>
@@ -378,7 +378,7 @@ fmu '{"surface":"app","app":"Calculator","steps":[
       barsEl.replaceChildren();
 
       for (const row of wl.rows) {
-        const pct = Math.max(2.5, (row.tok / maxVal) * 100);
+        const pct = (row.tok / maxVal) * 100;
         const item = document.createElement("div");
         item.className = row.ours ? "bar-item is-ours" : "bar-item";
 
@@ -411,7 +411,7 @@ fmu '{"surface":"app","app":"Calculator","steps":[
         track.className = "bar-track";
         const fill = document.createElement("div");
         fill.className = "bar-fill";
-        fill.style.width = `${pct.toFixed(1)}%`;
+        fill.style.width = `${pct.toFixed(2)}%`;
         track.append(fill);
 
         item.append(meta, track);
@@ -442,57 +442,103 @@ fmu '{"surface":"app","app":"Calculator","steps":[
       }
     }
 
-    for (const btn of document.querySelectorAll(".install-tab")) {
-      btn.addEventListener("click", () => {
-        for (const b of document.querySelectorAll(".install-tab")) {
-          b.setAttribute("aria-selected", b === btn ? "true" : "false");
+    function bindTablist(selector, panelId, onSelect) {
+      const tabs = Array.from(document.querySelectorAll(selector));
+      const panel = panelId ? document.getElementById(panelId) : null;
+
+      function activate(btn, focusTab) {
+        for (const b of tabs) {
+          const active = b === btn;
+          b.setAttribute("aria-selected", active ? "true" : "false");
+          b.setAttribute("tabindex", active ? "0" : "-1");
         }
-        document.getElementById("hero-cmd").textContent = btn.dataset.cmd || "";
+        if (panel && btn.id) {
+          panel.setAttribute("aria-labelledby", btn.id);
+        }
+        if (focusTab) {
+          btn.focus();
+        }
+        onSelect(btn);
+      }
+
+      tabs.forEach((btn, idx) => {
+        btn.addEventListener("click", () => activate(btn, false));
+        btn.addEventListener("keydown", (e) => {
+          let nextIdx = null;
+          if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+            nextIdx = (idx + 1) % tabs.length;
+          } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+            nextIdx = (idx - 1 + tabs.length) % tabs.length;
+          } else if (e.key === "Home") {
+            nextIdx = 0;
+          } else if (e.key === "End") {
+            nextIdx = tabs.length - 1;
+          }
+          if (nextIdx !== null) {
+            e.preventDefault();
+            activate(tabs[nextIdx], true);
+          }
+        });
       });
     }
 
-    for (const btn of document.querySelectorAll(".workload-tab")) {
-      btn.addEventListener("click", () => {
-        for (const b of document.querySelectorAll(".workload-tab")) {
-          b.setAttribute("aria-selected", b === btn ? "true" : "false");
-        }
-        renderBenchmarks(btn.dataset.workload);
-      });
-    }
+    bindTablist(".install-tab", null, (btn) => {
+      document.getElementById("hero-cmd").textContent = btn.dataset.cmd || "";
+    });
 
-    for (const btn of document.querySelectorAll(".trace-tab")) {
-      btn.addEventListener("click", () => {
-        for (const b of document.querySelectorAll(".trace-tab")) {
-          b.setAttribute("aria-selected", b === btn ? "true" : "false");
-        }
-        renderTrace(btn.dataset.trace);
-      });
-    }
+    bindTablist(".workload-tab", "bench-bars", (btn) => {
+      renderBenchmarks(btn.dataset.workload);
+    });
 
-    for (const btn of document.querySelectorAll(".config-tab")) {
-      btn.addEventListener("click", () => {
-        for (const b of document.querySelectorAll(".config-tab")) {
-          b.setAttribute("aria-selected", b === btn ? "true" : "false");
+    bindTablist(".trace-tab", "workbench-panel", (btn) => {
+      renderTrace(btn.dataset.trace);
+    });
+
+    bindTablist(".config-tab", "config-panel", (btn) => {
+      const entry = CONFIG_SNIPPETS[btn.dataset.config];
+      if (entry) {
+        document.getElementById("config-label").textContent = entry.label;
+        document.getElementById("config-code").textContent = entry.code;
+      }
+    });
+
+    async function writeClipboardText(text) {
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (_) {
+          // Fall back to execCommand below when clipboard permission is unavailable
         }
-        const entry = CONFIG_SNIPPETS[btn.dataset.config];
-        if (entry) {
-          document.getElementById("config-label").textContent = entry.label;
-          document.getElementById("config-code").textContent = entry.code;
-        }
-      });
+      }
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.append(area);
+      area.select();
+      let ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch (_) {
+        ok = false;
+      }
+      area.remove();
+      return ok;
     }
 
     for (const copyBtn of document.querySelectorAll("[data-copy-target]")) {
-      copyBtn.addEventListener("click", () => {
+      const defaultLabel = copyBtn.textContent;
+      copyBtn.addEventListener("click", async () => {
         const target = document.getElementById(copyBtn.dataset.copyTarget);
         if (!target) return;
-        const original = copyBtn.textContent;
-        navigator.clipboard?.writeText(target.textContent || "").then(() => {
-          copyBtn.textContent = "Copied";
-          setTimeout(() => {
-            copyBtn.textContent = original;
-          }, 1500);
-        });
+        await writeClipboardText(target.textContent || "");
+        copyBtn.textContent = "Copied";
+        clearTimeout(copyBtn._resetTimer);
+        copyBtn._resetTimer = setTimeout(() => {
+          copyBtn.textContent = defaultLabel;
+        }, 1500);
       });
     }
 

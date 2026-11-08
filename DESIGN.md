@@ -108,10 +108,10 @@ components:
 The palette pairs cool machined-metal neutrals with phosphor-emerald verification accents and copper-vermilion delta highlights.
 
 ### Primary
-- **Phosphor Emerald** (`#095c49`, hover `#064436`, soft tint `#d7efe8`): Primary actions, active workload/metric tabs, verified `PASS` / `YES` status badges, and `faster-mac-use` benchmark bars.
+- **Phosphor Emerald** (`#095c49`, hover `#064436`, soft tint `#d7efe8`): Primary actions, active workload/trace/config tabs, verified `0.0 px` hardware-guard badges, and `faster-mac-use` benchmark bars.
 
 ### Secondary
-- **Copper Signal** (`#b53f15`, soft tint `#fae6de`): Keyboard focus rings, token-reduction multipliers, and `NO` capability badges in competitor comparison tables.
+- **Copper Signal** (`#b53f15`, soft tint `#fae6de`): Keyboard focus rings and token-reduction multiplier readouts.
 
 ### Neutral
 - **Anodized Ground** (`#eaf0f4`): Page canvas and bar-chart track background.
@@ -132,13 +132,13 @@ The palette pairs cool machined-metal neutrals with phosphor-emerald verificatio
 **Character:** Assertive, mechanical grotesque headings paired with a disciplined tabular monospace for measurements and code.
 
 ### Hierarchy
-- **Display** (`800`, `clamp(2.125rem, 3.5vw, 2.875rem)`, line-height `1.08`, tracking `-0.03em`): Hero thesis statement (`max-width: 19ch`, `text-wrap: balance`).
-- **Headline** (`700`, `clamp(1.5rem, 2.3vw, 1.875rem)`, line-height `1.2`, tracking `-0.02em`): Section headings with generous top margin (`3.75rem` above vs `1rem` below).
+- **Display** (`800`, `clamp(2.125rem, 3.5vw, 2.875rem)`, line-height `1.08`, tracking `-0.03em`): Hero thesis statement (`max-width: 18ch`, `text-wrap: balance`).
+- **Headline** (`700`, `clamp(1.5rem, 2.3vw, 1.875rem)`, line-height `1.2`, tracking `-0.02em`): Section headings with generous top spacing (`4.5rem` section padding-top vs `0.55rem` heading margin-bottom).
 - **Title** (`700`, `1.1875rem`, line-height `1.32`): Panel and architectural tier titles.
-- **Body** (`400`, `1.0625rem`, line-height `1.62`): Technical explanations constrained to `68ch` max measure (`text-wrap: pretty`).
+- **Body** (`400`, `1.0625rem`, line-height `1.62`): Technical explanations constrained to `66ch` max measure (`text-wrap: pretty`).
 - **Subhead** (`600`, `0.9375rem`, line-height `1.5`): Navigation links, primary CTAs, and architecture list items.
-- **Label** (`600`, `0.875rem`, line-height `1.35`): Interactive workload/metric tab controls and bar chart labels.
-- **Code / Telemetry** (`600`, `0.8125rem`, line-height `1.5`, `tabular-nums`): Live trace inspector, benchmark data tables, and status pills.
+- **Label** (`600`, `0.875rem`, line-height `1.35`): Interactive workload/trace/config tab controls and bar chart labels.
+- **Code / Telemetry** (`600`, `0.8125rem`, line-height `1.5`, `tabular-nums`): Live trace inspector, benchmark bar readouts, and status pills.
 
 ### Named Rules
 **The Tabular Telemetry Rule.** Every numeric comparison, token count, latency figure, and virtual cursor coordinate must render with `font-variant-numeric: tabular-nums` so columns align vertically across switches.
@@ -169,16 +169,16 @@ This system is flat and structural by default. Depth is conveyed through tonal l
 - **Secondary:** Pure white (`#ffffff`) fill with `#0c1720` text and `1px solid #9fb2c2` border; shifts to `#f7fafc` on hover.
 
 ### Chips
-- **Style:** Compact `6px`-radius interactive tabs (`0.42rem 0.78rem`, `0.875rem` font size) for switching recorded traces, benchmark workloads (`A`–`E`), metrics, and MCP client configs.
-- **State:** Unselected tabs use `#ffffff` background with `#344b5c` text and `1px solid #c4d1dc`; selected tabs (`aria-selected="true"` / `aria-pressed="true"`) invert to `#095c49` with `#ffffff` text.
+- **Style:** Compact `6px`-radius interactive tabs (`0.42rem 0.78rem`, `0.875rem` font size) for switching benchmark workloads (`A`, `D`, `B`), recorded execution traces, and MCP client configs.
+- **State:** Unselected tabs use `#ffffff` background with `#344b5c` text and `1px solid #c4d1dc`; selected tabs (`aria-selected="true"`) invert to `#095c49` with `#ffffff` text.
 
 ### Cards / Containers
 - **Corner Style:** `12px`–`14px` radius with `1px solid #9fb2c2` border and zero drop shadow.
 - **Background:** `#ffffff` for primary panels, `#f7fafc` for header strips, and `#101c26` for code blocks.
-- **Internal Padding:** `1.35rem 1.5rem` on panels and `1.4rem 1.5rem` on hairlined ledger columns.
+- **Internal Padding:** `1.35rem 1.5rem` on workbench ledgers and `1.5rem` on hairlined architecture columns.
 
 ### Navigation
-- **Style:** Top horizontal bar with breadcrumb identity (`Lifan Chen / faster-mac-use`) and `v0.1.0 (MIT)` badge on the left, and section anchor links (`0.9375rem`, weight `600`, `#344b5c` → `#0c1720` on hover) on the right.
+- **Style:** Top horizontal bar with breadcrumb identity (`Lifan Chen / faster-mac-use`) and `v0.1.0 · MIT` badge on the left, and section anchor links (`0.9375rem`, weight `600`, `#344b5c` → `#0c1720` on hover) on the right.
 
 ## Do's and Don'ts
 

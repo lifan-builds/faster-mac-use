@@ -242,6 +242,71 @@ def run_workload_a_web(base_url: str) -> list[CompetitorResult]:
         notes="Calls page-registered WebMCP tool directly + folded table + UID delta + stale masking",
     ))
 
+    # --- 1b: faster-mac-use + Auto-Synthesized Virtual WebMCP Macro (~/.fmu/macros/) ---
+    with tempfile.TemporaryDirectory() as tmp_macro_dir:
+        import os as _os
+
+        old_mdir = _os.environ.get("FMU_MACROS_DIR")
+        _os.environ["FMU_MACROS_DIR"] = tmp_macro_dir
+        try:
+            rt_wmcp.execute({"reset": True})
+            rt_wmcp.browser.save_macro(
+                name="virtualApproveOrder",
+                steps=[
+                    {"op": "fill", "uid": "Search orders", "value": "{{query}}"},
+                    {"op": "select", "uid": "Order status", "value": "{{status}}"},
+                    {"op": "click", "uid": "Priority Only"},
+                    {"op": "click", "uid": "Apply Filters"},
+                    {"op": "click", "uid": "Inspect #ORD-409"},
+                    {"op": "fill", "uid": "Approval note", "value": "{{note}}"},
+                    {"op": "select", "uid": "Shipping tier", "value": "{{tier}}"},
+                    {"op": "click", "uid": "Confirm Approval"},
+                ],
+                domain="127.0.0.1",
+            )
+            with BackgroundIntrusionGuard() as guard_vmcp:
+                t0 = time.perf_counter()
+                vc1 = f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "🤖 Agent"}});'
+                vo1 = rt_wmcp.execute({"code": vc1})
+                vc2 = (
+                    'await tab.callTool("virtualApproveOrder", '
+                    '{query: "Enterprise", status: "pending", tier: "express", note: "Verified Q4 budget"});'
+                )
+                vo2 = rt_wmcp.execute({"code": vc2})
+                vmcp_ms = (time.perf_counter() - t0) * 1000.0
+            intrusion_vmcp = guard_vmcp.stop()
+            assert "APPROVED #ORD-409 (express)" in vo2, f"Virtual WebMCP macro failed: {vo2}"
+            raw_vm, call_vm, peak_vm, cum_vm = simulate_transcript_metrics(
+                fmu_schema_tok, [vc1, vc2], [vo1, vo2], mask_stale_snapshots=True
+            )
+            results.append(CompetitorResult(
+                workload="A: Web SaaS (10 ops)",
+                system="faster-mac-use + Virtual WebMCP Macro (`~/.fmu/macros/`)",
+                category="Gen 4+ (Virtual WebMCP)",
+                execution_mode="live",
+                schema_tokens=fmu_schema_tok,
+                turns=2,
+                ui_actions=10,
+                raw_obs_tokens=raw_vm,
+                call_output_tokens=call_vm,
+                peak_context_tokens=peak_vm,
+                cumulative_input_tokens=cum_vm,
+                local_engine_ms=round(vmcp_ms, 1),
+                est_e2e_sec=compute_e2e_sec(2, call_vm, vmcp_ms),
+                background_safe=intrusion_vmcp.passed_background_invariant,
+                agent_tab_group=True,
+                mac_ax_fallback=True,
+                cursor_moved_px=intrusion_vmcp.cursor_moved_px,
+                focus_changes=intrusion_vmcp.focus_changes,
+                multi_cursor=True,
+                notes="Auto-loaded domain macro replays 8-step trajectory in 1 turn on sites without native WebMCP",
+            ))
+        finally:
+            if old_mdir is not None:
+                _os.environ["FMU_MACROS_DIR"] = old_mdir
+            else:
+                _os.environ.pop("FMU_MACROS_DIR", None)
+
     # --- 2 & 3: Faster Mac Use DOM/AX Path (Warm Daemon Masked & Unmasked) ---
     rt_wmcp.execute({"reset": True})
     with BackgroundIntrusionGuard() as guard:

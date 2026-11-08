@@ -540,9 +540,321 @@ class TestFasterMacUse(unittest.TestCase):
                     mac_engine._resolve_ax_binary()
                 self.assertIn("xcode-select --install", str(ctx.exception))
 
+    def test_16_virtual_webmcp_macros_save_autoload_and_replay(self) -> None:
+        import os
+
+        pricing_url = f"{self.server.base_url}/pricing"
+        orders_url = f"{self.server.base_url}/orders"
+        with tempfile.TemporaryDirectory() as macro_tmp:
+            old_mdir = os.environ.get("FMU_MACROS_DIR")
+            os.environ["FMU_MACROS_DIR"] = macro_tmp
+            try:
+                self.rt.execute({"reset": True})
+                # 1. Auto-synthesize a Virtual WebMCP macro from recorded steps on /pricing (which has no native navigator.modelContext)
+                rec_out = self.rt.execute(
+                    {
+                        "code": (
+                            f'let tab = await cua.createBrowserTab("chrome", "{pricing_url}"); '
+                            'await tab.click("Generate Quote Token"); '
+                            'await tab.saveMacro("auto_quote_macro");'
+                        )
+                    }
+                )
+                self.assertIn("ENT-1000-OK", rec_out)
+
+                # Reset runtime & open fresh /pricing tab: macro should auto-load into webmcp=[...] and execute in 1 turn
+                self.rt.execute({"reset": True})
+                replay_out = self.rt.execute(
+                    {
+                        "code": (
+                            f'let tab = await cua.createBrowserTab("chrome", "{pricing_url}"); '
+                            'await tab.callTool("auto_quote_macro");'
+                        )
+                    }
+                )
+                self.assertIn("auto_quote_macro", replay_out)
+                self.assertIn("ENT-1000-OK", replay_out)
+
+                # 2. Parameterized Virtual WebMCP macro with {{template}} interpolation on /orders
+                save_out = self.rt.execute(
+                    {
+                        "code": (
+                            'return await cua.saveMacro("macro_approve_order", ['
+                            '  {op: "fill", uid: "Search orders", value: "{{customer}}"},'
+                            '  {op: "click", uid: "Apply Filters"},'
+                            '  {op: "click", uid: "Inspect #ORD-412"},'
+                            '  {op: "fill", uid: "Approval note", value: "{{note}}"},'
+                            '  {op: "select", uid: "Shipping tier", value: "{{tier}}"},'
+                            '  {op: "click", uid: "Confirm Approval"}'
+                            '], "127.0.0.1", "Parameterized order approval macro");'
+                        )
+                    }
+                )
+                self.assertIn('name="macro_approve_order"', save_out)
+
+                list_out = self.rt.execute({"code": "return await cua.listMacros();"})
+                self.assertIn("macro_approve_order", list_out)
+                self.assertIn("auto_quote_macro", list_out)
+
+                param_out = self.rt.execute(
+                    {
+                        "code": (
+                            f'let otab = await cua.createBrowserTab("chrome", "{orders_url}"); '
+                            'await otab.callTool("macro_approve_order", {customer: "Linear", note: "Synthesized Macro OK", tier: "freight"});'
+                        )
+                    }
+                )
+                self.assertIn("APPROVED #ORD-412 (freight)", param_out)
+                self.assertIn("Synthesized Macro OK", param_out)
+
+                del_out = self.rt.execute({"code": 'return await cua.deleteMacro("macro_approve_order");'})
+                self.assertIn("ok=true", del_out)
+            finally:
+                if old_mdir is not None:
+                    os.environ["FMU_MACROS_DIR"] = old_mdir
+                else:
+                    os.environ.pop("FMU_MACROS_DIR", None)
+
+    def test_17_canvas_semantic_ocr_fusion_and_click(self) -> None:
+        canvas_url = f"{self.server.base_url}/canvas"
+        self.rt.execute({"reset": True})
+
+        # Open /canvas: buttons "Deploy Cluster" and "Rollback Node" exist ONLY as pixels on <canvas>
+        snap = self.rt.execute(
+            {"code": f'let tab = await cua.createBrowserTab("chrome", "{canvas_url}");'}
+        )
+        self.assertIn("canvas", snap)
+        self.assertIn("@ocr", snap)
+        self.assertIn("Deploy Cluster", snap)
+        self.assertIn("Rollback Node", snap)
+
+        # Click the canvas-drawn "Deploy Cluster" button by its OCR semantic label
+        click_out = self.rt.execute({"code": 'await tab.click("Deploy Cluster");'})
+        self.assertNotIn("! errors:", click_out)
+        self.assertIn("DEPLOY_CLUSTER_OK", click_out)
+        self.assertIn("DEPLOYED", click_out)
+
+        # Click the second canvas-drawn button ("Rollback Node") via its @ocr UID
+        full_after = self.rt.execute({"code": "return await tab.snapshot();"})
+        rollback_uid = None
+        for line in full_after.splitlines():
+            if line.startswith("@ocr") and "Rollback Node" in line:
+                rollback_uid = line.split()[0]
+                break
+        self.assertIsNotNone(rollback_uid, f"Expected @ocr UID for Rollback Node in:\n{full_after}")
+        rb_out = self.rt.execute({"code": f'await tab.click("{rollback_uid}");'})
+        self.assertNotIn("! errors:", rb_out)
+        self.assertIn("ROLLBACK_NODE_OK", rb_out)
+
+    def test_18_outbound_mv3_extension_websocket_bridge(self) -> None:
+        import base64
+        import os
+        import socket
+        import struct
+        import threading
+
+        self.rt.execute({"reset": True})
+        port = self.rt.browser.bridge_port
+        self.assertGreater(port, 0)
+
+        def send_masked_ws_text(sock: socket.socket, text: str) -> None:
+            payload = text.encode("utf-8")
+            mask_key = b"\x12\x34\x56\x78"
+            hdr = bytearray([0x81])
+            n = len(payload)
+            if n < 126:
+                hdr.append(0x80 | n)
+            elif n <= 65535:
+                hdr.append(0x80 | 126)
+                hdr.extend(struct.pack("!H", n))
+            else:
+                hdr.append(0x80 | 127)
+                hdr.extend(struct.pack("!Q", n))
+            hdr.extend(mask_key)
+            masked = bytearray(payload)
+            for i in range(n):
+                masked[i] ^= mask_key[i & 3]
+            sock.sendall(bytes(hdr) + bytes(masked))
+
+        def recv_unmasked_ws_text(sock: socket.socket) -> str:
+            hdr = sock.recv(2)
+            if len(hdr) < 2:
+                raise ConnectionError("EOF")
+            length = hdr[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", sock.recv(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", sock.recv(8))[0]
+            buf = bytearray()
+            while len(buf) < length:
+                chunk = sock.recv(length - len(buf))
+                if not chunk:
+                    raise ConnectionError("EOF")
+                buf.extend(chunk)
+            return buf.decode("utf-8")
+
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_sock.settimeout(5.0)
+        client_sock.connect(("127.0.0.1", port))
+        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        handshake = (
+            f"GET /ext HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        client_sock.sendall(handshake.encode("ascii"))
+        resp = client_sock.recv(4096).decode("utf-8", errors="replace")
+        self.assertIn("101 Switching Protocols", resp)
+
+        stop_mock = threading.Event()
+        rpc_calls: list[str] = []
+
+        def mock_extension_worker() -> None:
+            send_masked_ws_text(
+                client_sock,
+                json.dumps({"type": "hello", "client": "fmu-mv3-extension", "version": "0.1.0"}),
+            )
+            while not stop_mock.is_set():
+                try:
+                    raw_msg = recv_unmasked_ws_text(client_sock)
+                except Exception:
+                    break
+                msg = json.loads(raw_msg)
+                req_id = msg.get("id")
+                method = msg.get("method")
+                params = msg.get("params") or {}
+                rpc_calls.append(str(method))
+                if method == "createBrowserTab":
+                    res = {
+                        "tabId": 777,
+                        "groupId": 42,
+                        "sessionName": params.get("sessionName", "🤖 Agent"),
+                        "url": params.get("url", "about:blank"),
+                    }
+                elif method == "evaluate":
+                    res = True if params.get("runtimeInit") else []
+                elif method == "executeBatch":
+                    steps = params.get("steps") or []
+                    clicked = any(s.get("op") == "click" for s in steps)
+                    res = {
+                        "url": "http://127.0.0.1/ext-live",
+                        "title": "Live Extension Profile Tab",
+                        "crc": "abcd1234" if not clicked else "ef567890",
+                        "seq": 1 if not clicked else 2,
+                        "count": 2,
+                        "cursor": {"agent": "default", "x": 120, "y": 64, "uid": "@u1", "label": "One-Click SSO", "op": "click" if clicked else "init"},
+                        "webMcpTools": ["liveProfileAuth"],
+                        "canvases": [],
+                        "errors": [],
+                        "evalOutputs": [],
+                        "escalations": [],
+                        "lines": (
+                            ['~ @u2 status "SSO_READY" -> "SSO_AUTHENTICATED"']
+                            if clicked
+                            else ['@u1 button "One-Click SSO"', '@u2 status "SSO_READY"']
+                        ),
+                    }
+                else:
+                    res = {"ok": True}
+                send_masked_ws_text(client_sock, json.dumps({"id": req_id, "result": res}))
+
+        worker = threading.Thread(target=mock_extension_worker, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(self.rt.browser._ext_bridge.wait_connected(timeout=2.0))
+            ext_out = self.rt.execute(
+                {
+                    "code": (
+                        'let et = await cua.createBrowserTab("extension", "http://127.0.0.1/ext-live"); '
+                        'await et.click("@u1");'
+                    )
+                }
+            )
+            self.assertIn('bridge="mv3"', ext_out)
+            self.assertIn("SSO_AUTHENTICATED", ext_out)
+            self.assertIn("createBrowserTab", rpc_calls)
+            self.assertIn("executeBatch", rpc_calls)
+        finally:
+            stop_mock.set()
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+            worker.join(timeout=1.0)
+
+        # Wait briefly for disconnect and verify seamless fallback to headless Chromium
+        for _ in range(20):
+            if not self.rt.browser.extension_connected:
+                break
+            time.sleep(0.02)
+        self.assertFalse(self.rt.browser.extension_connected)
+        fallback_out = self.rt.execute(
+            {"code": f'let ht = await cua.createBrowserTab("chrome", "{self.server.base_url}/pricing");'}
+        )
+        self.assertNotIn('bridge="mv3"', fallback_out)
+        self.assertIn("Generate Quote Token", fallback_out)
+
+    def test_19_ax_observer_dirty_tracking_and_fast_diff(self) -> None:
+        # Initial snapshot registers AXObserver on Calculator PID
+        snap = self.rt.execute(
+            {
+                "surface": "app",
+                "app": "Calculator",
+                "steps": [{"op": "key", "name": "escape"}],
+                "diff": False,
+            }
+        )
+        self.assertIn('app="Calculator"', snap)
+
+        # Unchanged Turn 2+ diff should fast-path via AXObserver dirty-tracking in < 5ms
+        latencies_ms: list[float] = []
+        last_diff = ""
+        for _ in range(5):
+            t0 = time.perf_counter()
+            last_diff = self.rt.execute({"surface": "app", "app": "Calculator", "diff": True})
+            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+        self.assertIn("= unchanged", last_diff)
+        self.assertIn("obs=", last_diff)
+        avg_ms = sum(latencies_ms) / len(latencies_ms)
+        self.assertLess(avg_ms, 5.0, f"Expected AXObserver unchanged diff < 5.0ms, got {avg_ms:.2f}ms")
+
+        # Mutating Calculator state must immediately reflect in the delta
+        mut_diff = self.rt.execute(
+            {
+                "surface": "app",
+                "app": "Calculator",
+                "steps": [{"op": "click", "name": "5"}],
+                "diff": True,
+            }
+        )
+        self.assertNotIn("= unchanged", mut_diff)
+        self.assertIn("5", mut_diff)
+
+    def test_20_site_packages_swift_binary_fallback(self) -> None:
+        from fmu import mac_engine
+
+        self.assertTrue(
+            (mac_engine.PKG_DIR / "native" / "fmu_ax.swift").is_file(),
+            "Bundled src/fmu/native/fmu_ax.swift must exist for site-packages / uvx installs",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_site_root = Path(tmpdir) / "site_root"
+            fake_cache = Path(tmpdir) / "fmu_cache"
+            fake_site_root.mkdir(parents=True, exist_ok=True)
+            resolved = mac_engine._resolve_ax_binary(
+                root_dir=fake_site_root,
+                cache_dir=fake_cache,
+            )
+            self.assertEqual(resolved, fake_cache / "fmu-ax")
+            self.assertTrue(resolved.is_file())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 

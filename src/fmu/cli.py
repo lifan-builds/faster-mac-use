@@ -15,60 +15,57 @@ from fmu.cua_runtime import (
 from fmu.mac_engine import MacNativeEngine
 
 
-def serve_mcp() -> None:
-    runtime = FasterMacUseRuntime()
-    try:
-        while True:
-            raw = sys.stdin.readline()
-            if not raw:
-                break
-            line = raw.strip()
-            if not line:
-                continue
+def serve_mcp(bin_path: Path | None = None) -> None:
+    entry = bin_path if (bin_path and bin_path.is_file()) else Path(__file__).resolve()
+    while True:
+        raw = sys.stdin.readline()
+        if not raw:
+            break
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        mid = msg.get("id")
+        method = msg.get("method")
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "faster-mac-use", "version": "0.1.0"},
+                },
+            }
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+        elif method == "tools/list":
+            resp = {"jsonrpc": "2.0", "id": mid, "result": {"tools": [MCP_TOOL_SCHEMA]}}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+        elif method == "ping":
+            resp = {"jsonrpc": "2.0", "id": mid, "result": {}}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+        elif method == "tools/call":
+            params = msg.get("params", {})
+            args = params.get("arguments", {})
             try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            mid = msg.get("id")
-            method = msg.get("method")
-            if method == "initialize":
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": mid,
-                    "result": {
-                        "protocolVersion": "2025-03-26",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "faster-mac-use", "version": "0.1.0"},
-                    },
-                }
-                sys.stdout.write(json.dumps(resp) + "\n")
-                sys.stdout.flush()
-            elif method == "tools/list":
-                resp = {"jsonrpc": "2.0", "id": mid, "result": {"tools": [MCP_TOOL_SCHEMA]}}
-                sys.stdout.write(json.dumps(resp) + "\n")
-                sys.stdout.flush()
-            elif method == "ping":
-                resp = {"jsonrpc": "2.0", "id": mid, "result": {}}
-                sys.stdout.write(json.dumps(resp) + "\n")
-                sys.stdout.flush()
-            elif method == "tools/call":
-                params = msg.get("params", {})
-                args = params.get("arguments", {})
-                try:
-                    text = runtime.execute(args)
-                    is_err = False
-                except Exception as exc:
-                    text = f"Error: {exc}"
-                    is_err = True
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": mid,
-                    "result": {"content": [{"type": "text", "text": text}], "isError": is_err},
-                }
-                sys.stdout.write(json.dumps(resp) + "\n")
-                sys.stdout.flush()
-    finally:
-        runtime.shutdown()
+                text = execute_via_daemon(args, entry)
+                is_err = False
+            except Exception as exc:
+                text = f"Error: {exc}"
+                is_err = True
+            resp = {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {"content": [{"type": "text", "text": text}], "isError": is_err},
+            }
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
 
 
 USAGE_TEXT = """Usage:

@@ -89,10 +89,16 @@
         </aside>
       </section>
 
+      <section aria-label="Live Split-Screen 3-Cursor Swarm vs @playwright/mcp Token Counter" style="margin-bottom: 3rem;">
+        <figure style="margin: 0; border-radius: 12px; overflow: hidden; border: 1px solid rgba(148, 163, 184, 0.22); background: #0b0f17; box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);">
+          <img src="assets/swarm-vs-mcp-demo.svg" alt="Animated comparison: faster-mac-use 3-cursor background swarm (1,510 tokens, 326 ms, 0.0 px cursor drift) vs @playwright/mcp (293,950 tokens, 25 turns)" style="display: block; width: 100%; height: auto;">
+        </figure>
+      </section>
+
       <section id="benchmarks" aria-labelledby="bench-heading">
         <h2 id="bench-heading">5-Workload Competitor Benchmark Explorer (<code>o200k_base</code>)</h2>
         <p class="section-intro">
-          Measured across 5 realistic web, native macOS, hybrid, multi-agent, and 30-step long-horizon workloads against 15 closed-source and open-source configurations. Select any workload and metric below to inspect the exact numbers from <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/results/latest_benchmark.json"><code>benchmarks/results/latest_benchmark.json</code></a>.
+          Measured across 5 realistic web, native macOS, hybrid, multi-agent, and 30-step long-horizon workloads against 15+ closed-source and open-source configurations. Select any workload and metric below to inspect the exact numbers from <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/results/latest_benchmark.json"><code>benchmarks/results/latest_benchmark.json</code></a>.
         </p>
 
         <div class="benchmark-controls">
@@ -148,26 +154,26 @@
       <section id="architecture" aria-labelledby="arch-heading">
         <h2 id="arch-heading">How the 3-Tier Engine Eliminates Context Bloat and Focus Theft</h2>
         <p class="section-intro">
-          In an LLM tool loop of <em>N</em> turns where each step appends a snapshot of size <em>S</em>, total billed input tokens grow quadratically as ½·<em>N</em>²·<em>S</em>. <code>faster-mac-use</code> attacks both factors simultaneously: collapsing <em>N</em> via a stateful <code>cua_repl</code> sandbox and shrinking <em>S</em> via persistent UIDs, pre-registered table folding, and stale-observation masking.
+          In an LLM tool loop of <em>N</em> turns where each step appends a snapshot of size <em>S</em>, total billed input tokens grow quadratically as ½·<em>N</em>²·<em>S</em>. <code>faster-mac-use</code> attacks both factors simultaneously: collapsing <em>N</em> via a stateful <code>cua_repl</code> sandbox + Virtual WebMCP macros, and shrinking <em>S</em> via persistent UIDs, pre-registered table folding, push-based <code>AXObserver</code> dirty tracking, and stale-observation masking.
         </p>
 
         <div class="arch-grid">
           <article class="arch-col">
-            <h3>Tier 1: Browser Engine &amp; Tab Groups</h3>
+            <h3>Tier 1: Browser Engine, Extension WS Bridge &amp; Canvas OCR</h3>
             <ul>
-              <li><strong>Unfocused <code>"🤖 Agent"</code> Tab Groups:</strong> Opens and groups tabs with <code>active: false</code> via <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/extension/background.js"><code>extension/background.js</code></a> and a thread-safe Playwright worker that never triggers Chrome 144+'s <code>DevToolsActivePort</code> modal popup.</li>
-              <li><strong>Background Focus Emulation:</strong> Enables CDP <code>Emulation.setFocusEmulationEnabled</code> and <code>Page.setWebLifecycleState("active")</code> so <code>document.hasFocus() === true</code> and 60fps timers run while you work in another app.</li>
-              <li><strong>Pre-Registered Table Folding:</strong> Assigns persistent <code>WeakMap</code> <code>@u1..@uN</code> UIDs and folds dense <code>&lt;tbody&gt;</code> rows beyond the first 6 while indexing all rows in <code>uidToRef</code>, cutting initial snapshots from 1,520 to 804 tokens while keeping folded rows directly clickable by label or UID.</li>
-              <li><strong>WebMCP &amp; Zero-Dialog File Uploads:</strong> Auto-detects <code>navigator.modelContext</code> tools (<code>tab.callTool</code>) and intercepts <code>&lt;input type="file"&gt;</code> via <code>DOM.setFileInputFiles</code> so <code>NSOpenPanel</code> never steals focus.</li>
+              <li><strong>Outbound MV3 Extension WebSocket Bridge + Headless Fallback:</strong> <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/extension/background.js"><code>extension/background.js</code></a> connects outward to <code>ws://127.0.0.1:19222/ext</code> to drive live logged-in Chrome <code>"🤖 Agent"</code> tab groups (<code>active: false</code>) with <strong>zero Chrome 144 <code>DevToolsActivePort</code> modal popups</strong>, falling back seamlessly to a background Playwright worker with CDP Focus Emulation.</li>
+              <li><strong>Pre-Registered Table Folding:</strong> Assigns persistent <code>WeakMap</code> <code>@u1..@uN</code> UIDs and folds dense <code>&lt;tbody&gt;</code> rows beyond the first 6 while indexing all rows in <code>uidToRef</code>, cutting initial snapshots from 1,520 to 810 tokens while keeping folded rows clickable by label or UID.</li>
+              <li><strong>Native &amp; Virtual WebMCP Macros (<code>~/.fmu/macros/</code>):</strong> Auto-detects <code>navigator.modelContext</code> tools and lets agents synthesize multi-step trajectories into reusable 1-turn Virtual WebMCP tools (<code>tab.saveMacro</code> &rarr; <code>tab.callTool</code>).</li>
+              <li><strong>0-Token <code>&lt;canvas&gt;</code> Semantic OCR &amp; File Uploads:</strong> Clips HTML5 <code>&lt;canvas&gt;</code> / WebGL elements into Apple Silicon <code>VNRecognizeTextRequest</code> to inject clickable <code>@ocr1..@ocrN</code> targets with 0 VLM tokens, and intercepts <code>&lt;input type="file"&gt;</code> via <code>DOM.setFileInputFiles</code>.</li>
             </ul>
           </article>
 
           <article class="arch-col">
-            <h3>Tier 2: Native Swift AX &amp; Vision OCR</h3>
+            <h3>Tier 2: Native Swift <code>AXObserver</code> &amp; Vision OCR</h3>
             <ul>
-              <li><strong>Persistent Unix Socket Daemon (<code>/tmp/fmu-ax.sock</code>):</strong> Compiled Swift binary (<a href="https://github.com/lifan-builds/faster-mac-use/blob/main/src/native/fmu_ax.swift"><code>fmu_ax.swift</code></a>) maintains a 4,000-element <code>AXUIElement</code> LRU cache, PID/window cache, and per-agent diff baselines across turns.</li>
-              <li><strong>Batched AX Reads &amp; Lazy Wakeup:</strong> Fetches attributes with <code>AXUIElementCopyMultipleAttributeValues</code> and sets <code>AXManualAccessibility = true</code> only on target background PIDs (waking Electron/Chromium AX trees without VoiceOver).</li>
-              <li><strong>Zero-Focus Background Actions:</strong> Executes <code>AXPress</code> &rarr; <code>AXConfirm</code> &rarr; background <code>CGEvent.postToPid</code> click fallback plus 16-char UTF-16 batched keystrokes without raising windows.</li>
+              <li><strong>Persistent Unix Socket Daemon (<code>/tmp/fmu-ax.sock</code>):</strong> Universal2 Swift binary (<a href="https://github.com/lifan-builds/faster-mac-use/blob/main/src/native/fmu_ax.swift"><code>fmu_ax.swift</code></a>) maintains a 4,000-element <code>AXUIElement</code> LRU cache, PID/window cache, and per-agent diff baselines across turns.</li>
+              <li><strong>Push-Based <code>AXObserver</code> Dirty-Subtree Tracking:</strong> Subscribes to <code>kAXValueChangedNotification</code>, <code>kAXCreatedNotification</code>, and <code>kAXUIElementDestroyedNotification</code> on a dedicated <code>CFRunLoop</code> thread so Turn 2+ unchanged or leaf-dirty diffs return in <strong>&lt; 1 ms</strong>.</li>
+              <li><strong>Batched AX Reads &amp; Zero-Focus Actions:</strong> Fetches attributes with <code>AXUIElementCopyMultipleAttributeValues</code>, lazily wakes background Electron AX trees (<code>AXManualAccessibility = true</code>), and executes <code>AXPress</code> &rarr; <code>CGEvent.postToPid</code> fallback without raising windows.</li>
               <li><strong>0-Token Apple Silicon Window OCR:</strong> Built-in <code>CGWindowListCreateImage</code> + <code>VNRecognizeTextRequest</code> fallback (<code>await app.ocr()</code>) reads GPU/canvas windows in &lt;70 ms with zero LLM vision tokens.</li>
             </ul>
           </article>
@@ -175,9 +181,9 @@
           <article class="arch-col">
             <h3>Tier 3: Multi-Cursor REPL &amp; Context Guard</h3>
             <ul>
-              <li><strong>268-Token Single-Tool Schema:</strong> Supports OpenAI Codex-style stateful <code>cua_repl</code> scripts (<code>cua.createBrowserTab</code>, <code>cua.getApp</code>, <code>cua.getCursors</code>), 1-trip declarative <code>steps</code> batches, and concurrent <code>{"parallel": [...]}</code> swarms.</li>
+              <li><strong>268-Token Single-Tool Schema:</strong> Supports OpenAI Codex-style stateful <code>cua_repl</code> scripts (<code>cua.createBrowserTab</code>, <code>cua.getApp</code>, <code>cua.saveMacro</code>, <code>cua.getCursors</code>), 1-trip declarative <code>steps</code> batches, and concurrent <code>{"parallel": [...]}</code> swarms.</li>
               <li><strong>Per-Agent Virtual Cursors:</strong> Each agent ID (<code>agent-1</code>, <code>agent-2</code>, ...) gets an isolated <code>AgentSession</code>, independent DOM/AX diff baseline, and independent virtual cursor coordinates (<code>tab.moveCursor</code> / <code>app.moveCursor</code>).</li>
-              <li><strong>Stale-Observation Masking:</strong> <code>ContextWindowTracker</code> replaces superseded full snapshots from earlier turns with 18-token tombstones, keeping 30-step peak context at 1,320 tokens.</li>
+              <li><strong>Stale-Observation Masking:</strong> <code>ContextWindowTracker</code> replaces superseded full snapshots from earlier turns with 18-token tombstones, keeping 30-step peak context at 1,597 tokens.</li>
               <li><strong>50Hz Intrusion Guard:</strong> Polls CoreGraphics (<code>CGEventGetLocation</code> + <code>CGEventSourceSecondsSinceLastEventType</code>) and <code>lsappinfo front</code> to prove <code>0.0 px</code> physical cursor movement.</li>
             </ul>
           </article>
@@ -187,7 +193,7 @@
       <section id="market-comparison" aria-labelledby="market-heading">
         <h2 id="market-heading">Broader Market Comparison &amp; Material Boundaries</h2>
         <p class="section-intro">
-          Computer-use tools in 2026 fall into four architectural generations. Here is where <code>faster-mac-use</code> wins against the broader market and the exact platform boundaries to keep in mind (<a href="https://github.com/lifan-builds/faster-mac-use/blob/main/docs/gtm.md">read the full market &amp; GTM brief</a>).
+          Computer-use tools in 2026 fall into four architectural generations. Here is where <code>faster-mac-use</code> wins against the broader market and the exact platform boundaries to keep in mind (<a href="https://github.com/lifan-builds/faster-mac-use/blob/main/docs/gtm.md">read the full market &amp; GTM brief</a> and <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/docs/launch_kit.md">launch kit</a>).
         </p>
 
         <div class="market-split">
@@ -195,9 +201,9 @@
             <h3>Where <code>faster-mac-use</code> Wins Across the 4 Generations</h3>
             <ul>
               <li><strong>vs. Gen 1 Pixel Screenshot Loops (Anthropic <code>computer</code> tool, Operator):</strong> Pixel loops capture full-screen images every step (83k–620k cumulative tokens) and hijack the physical Mac cursor unless isolated in a VM. <code>fmu</code> operates directly on your host Mac in the background at <code>0.0 px</code> drift and 40×–135× lower token cost.</li>
-              <li><strong>vs. Gen 2 Verbose Browser/OS MCPs (<code>@playwright/mcp</code>, <code>chrome-devtools-mcp</code>, <code>open-computer-use</code>):</strong> Standard MCPs charge a 1,508–12,592 token schema tax every turn and dump full ARIA trees on every click (143k–231k tokens on Workload A). <code>fmu</code> uses a 268-token schema and returns compact <code>+/~/-</code> UID diffs (2,024 tokens).</li>
-              <li><strong>vs. Gen 3 Single-Surface Ref CLIs (<code>vercel-labs/agent-browser</code>, <code>@playwright/cli</code>, <code>Peekaboo</code>, <code>trycua/cua</code>):</strong> Sequential ref numbering suffers index-shift diff avalanches when banners insert at the top of the DOM, and separate web vs. Mac tools cannot coordinate in one turn. <code>fmu</code> unifies Chrome and native macOS AX with persistent <code>WeakMap</code> / <code>CFHash</code> UIDs.</li>
-              <li><strong>vs. Gen 4 Single-Session REPLs (OpenAI Codex <code>cua_repl</code>):</strong> Codex's <code>cua_repl</code> is the strongest closed-source design, but serializes multi-agent UI work into a single session. <code>fmu</code> adds <strong>true multi-cursor parallel swarms</strong> (cutting 3-agent 25-op tokens by <strong>10.5×</strong> and engine time by <strong>3.7×</strong>), pre-registered table folding, and 0-vision-token Apple Silicon Window OCR as an open-source MCP and CLI for any agent.</li>
+              <li><strong>vs. Gen 2 Verbose Browser/OS MCPs (<code>@playwright/mcp</code>, <code>chrome-devtools-mcp</code>, <code>open-computer-use</code>):</strong> Standard MCPs charge a 1,508–12,592 token schema tax every turn and dump full ARIA trees on every click (143k–231k tokens on Workload A). <code>fmu</code> uses a 268-token schema and returns compact <code>+/~/-</code> UID diffs (2,024 tokens, or 1,290 with WebMCP / Virtual Macros).</li>
+              <li><strong>vs. Gen 3 Single-Surface Ref CLIs (<code>vercel-labs/agent-browser</code>, <code>@playwright/cli</code>, <code>Peekaboo</code>, <code>trycua/cua</code>):</strong> Sequential ref numbering suffers index-shift diff avalanches when banners insert at the top of the DOM, and separate web vs. Mac tools cannot coordinate in one turn. <code>fmu</code> unifies Chrome and native macOS AX with persistent <code>WeakMap</code> / <code>CFHash</code> UIDs and push-based <code>AXObserver</code> tracking.</li>
+              <li><strong>vs. Gen 4 Single-Session REPLs (OpenAI Codex <code>cua_repl</code>):</strong> Codex's <code>cua_repl</code> is the strongest closed-source design, but serializes multi-agent UI work into a single session. <code>fmu</code> adds <strong>true multi-cursor parallel swarms</strong> (cutting 3-agent 25-op tokens by <strong>10.5×</strong> and engine time by <strong>3.4×</strong>), auto-synthesized Virtual WebMCP macros, pre-registered table folding, and 0-vision-token Apple Silicon Window + <code>&lt;canvas&gt;</code> OCR.</li>
             </ul>
           </div>
 
@@ -205,7 +211,7 @@
             <h3>Material Limitations &amp; Scope Boundaries</h3>
             <ul>
               <li><strong>macOS-first native tier:</strong> The compiled Swift accessibility and Vision OCR daemon (<code>src/native/fmu_ax.swift</code>) requires macOS (Apple Silicon / macOS 14+ recommended) with Accessibility permission granted to your terminal or host IDE.</li>
-              <li><strong>Chrome Tab Group extension boundary:</strong> Creating color-coded <code>"🤖 Agent"</code> tab groups inside your primary visible Chrome window uses the included MV3 extension (<a href="https://github.com/lifan-builds/faster-mac-use/tree/main/extension"><code>extension/</code></a>) because <code>chrome.tabGroups</code> is an extension-only API. Without the extension loaded, <code>fmu</code> runs out-of-the-box in an isolated background Chromium worker with CDP Focus Emulation and zero popups.</li>
+              <li><strong>Chrome Tab Group extension boundary:</strong> Driving color-coded <code>"🤖 Agent"</code> tab groups inside your primary logged-in Chrome window uses the included MV3 extension's outbound WebSocket bridge (<a href="https://github.com/lifan-builds/faster-mac-use/tree/main/extension"><code>extension/</code></a> &rarr; <code>ws://127.0.0.1:19222/ext</code>) because <code>chrome.tabGroups</code> is an extension-only API and Chrome 144+ prompts on raw <code>DevToolsActivePort</code> connections. Without the extension loaded, <code>fmu</code> runs out-of-the-box in an isolated background Chromium worker with CDP Focus Emulation and zero popups.</li>
               <li><strong>Minimized window OCR:</strong> While <code>AXUIElement</code> reads and <code>AXPress</code> actions work on minimized and off-Space windows, macOS unloads pixel backing stores for windows minimized to the Dock, so <code>app.ocr()</code> requires the window to be unminimized (it can remain completely occluded behind other windows).</li>
             </ul>
           </div>
@@ -215,7 +221,7 @@
       <section id="quickstart" aria-labelledby="quickstart-heading">
         <h2 id="quickstart-heading">Quick Start &amp; MCP Client Configuration</h2>
         <p class="section-intro">
-          Install locally in under a minute and connect <code>fmu</code> to Claude Code, OpenAI Codex CLI, Cursor, Antigravity, or invoke it directly from shell scripts and skills.
+          Install locally in one command (<code>pip</code>, <code>uvx</code>, or Homebrew) and connect <code>fmu</code> to Claude Code, OpenAI Codex CLI, Cursor, Antigravity, or invoke it directly from shell scripts and skills.
         </p>
 
         <div class="config-box">
@@ -240,6 +246,7 @@
         <a href="https://github.com/lifan-builds/faster-mac-use">GitHub Repository</a>
         <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/docs/architecture_and_benchmarks.md">Architecture &amp; Benchmarks</a>
         <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/docs/gtm.md">Market &amp; GTM Brief</a>
+        <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/docs/launch_kit.md">Launch Kit</a>
       </div>
     </footer>
   </div>
@@ -274,41 +281,40 @@ await fmu({
       for (const k of ["9","Multiply","9","Equals"])
         await c.click(k);\` }
   ]
-}); // -> Isolated +/~/- diffs + virtual cursors in 256 ms`,
-        metrics: "Workload D: 2 turns, 1,510 cum. tokens, 256 ms engine",
-        saving: "10.5× fewer tokens & 3.7× faster than single-session REPL"
+}); // -> Isolated +/~/- diffs + virtual cursors in 326 ms`,
+        metrics: "Workload D: 2 turns, 1,510 cum. tokens, 326 ms engine",
+        saving: "10.5× fewer tokens & 3.4× faster than single-session REPL"
       },
       saas: {
-        guard: "50Hz Guard: PASS (0.0 px drift, Focus Emulation ON)",
+        guard: "50Hz Guard: PASS (0.0 px drift, Focus Emulation + WebMCP)",
         cursors: [
           { agent: "default (Chrome Tab)", pos: "Virtual (442, 196) / 🤖 Agent Tab Group" },
           { agent: "Table Folding Index", pos: "30 rows (@u2..@u109) pre-registered" },
-          { agent: "WebMCP Bridge", pos: "navigator.modelContext (2 tools ready)" },
-          { agent: "DOM File Upload", pos: "CDP DOM.setFileInputFiles (no NSOpenPanel)" }
+          { agent: "WebMCP + Virtual Macro", pos: "navigator.modelContext + ~/.fmu/macros/" },
+          { agent: "Canvas OCR & File Upload", pos: "@ocr1..@ocrN + CDP DOM.setFileInputFiles" }
         ],
         code: `// Turn 1: Folds 24 dense rows while indexing @u2..@u109
 let tab = await cua.createBrowserTab("chrome", url,
   {sessionName: "🤖 Agent"});
-// Snapshot: 804 tok (vs 4,072 ARIA) + WebMCP tools detected
+// Snapshot: 810 tok (vs 4,072 ARIA) + WebMCP / Virtual Macros ready
 
-// Turn 2: 9 UI ops + file upload + click folded row in 1 trip
+// Option A: Replay via Native or Virtual WebMCP Macro in 1 call
+await tab.callTool("macro_triage_order",
+  { query: "acme", orderId: "ORD-415" });
+
+// Option B: 9 UI ops + file upload + click folded row in 1 trip
 await tab.fill("Search orders", "acme");
-await tab.select("Status", "flagged");
 await tab.upload("#audit-csv", "/tmp/reconciliation.csv");
 await tab.click("Inspect #ORD-415"); // targets folded row
-await tab.click("Approve Payout");
-
-// Delta returned (58 tok; 0 top-banner index-shift churn):
-// + @u110 banner "Audit batch #84 queued"
-// ~ @u94 cell "APPROVED" (was "FLAGGED")`,
-        metrics: "Workload A: 81 ms / 1,290 tok (WebMCP) or 118 ms / 2,024 tok",
-        saving: "114× fewer tokens than @playwright/mcp (231,125 tok)"
+await tab.click("Approve Payout");`,
+        metrics: "Workload A: 94–97 ms / 1,290 tok (WebMCP/Macro) or 133 ms / 2,024 tok",
+        saving: "114×–179× fewer tokens than @playwright/mcp (231,125 tok)"
       },
       macos: {
-        guard: "50Hz Guard: PASS (0.0 px drift, Calculator in BG)",
+        guard: "50Hz Guard: PASS (0.0 px drift, AXObserver <1ms diff)",
         cursors: [
-          { agent: "default (Calculator.app)", pos: "Virtual (192, 248) / AXUIElement LRU warm" },
-          { agent: "Transport", pos: "/tmp/fmu-ax.sock (batched AXCopyMultiple)" },
+          { agent: "default (Calculator.app)", pos: "Virtual (192, 248) / AXObserver warm" },
+          { agent: "Transport", pos: "/tmp/fmu-ax.sock (AXObserver + AXCopyMultiple)" },
           { agent: "Action Dispatch", pos: "AXPress -> CGEvent.postToPid fallback" },
           { agent: "Window OCR Fallback", pos: "VNRecognizeTextRequest (0 vision tokens)" }
         ],
@@ -319,14 +325,14 @@ const keys = [
   "4","8","Multiply","1","2","Equals","Add","6","4","Equals"
 ];
 for (const btn of keys) await app.click(btn);
-// Delta returned (34 tokens):
+// Delta returned (34 tokens, AXObserver tracked):
 // ~ @a4 staticText "640" (was "0")
 
 // Optional 0-vision-token OCR on GPU/canvas windows:
 let ocr = await app.ocr();
-// -> Vision.framework extracts text + boxes in 62 ms`,
-        metrics: "Workload B: 2 turns, 1,264 cum. tokens, 102 ms engine",
-        saving: "38× fewer tokens & 35× faster than open-computer-use MCP"
+// -> Vision.framework extracts text + boxes in <70 ms`,
+        metrics: "Workload B: 2 turns, 1,264 cum. tokens, 395 ms engine (<1ms diff)",
+        saving: "38× fewer tokens & 32× faster than open-computer-use MCP"
       }
     };
 
@@ -334,15 +340,16 @@ let ocr = await app.ocr();
       A: {
         title: "Workload A — Enterprise SaaS Console (10 UI Operations, 140+ Controls, Top Banner Insertion)",
         rows: [
-          { name: "faster-mac-use + WebMCP (navigator.modelContext)", ours: true, mode: "live", schema: 268, turns: 2, raw: 652, peak: 1097, cum: 1290, ms: 81, e2e: 2.77, bg: true, tg: true, ax: true, mc: true },
-          { name: "faster-mac-use (Warm Daemon + REPL + Diff + Mask)", ours: true, mode: "live", schema: 268, turns: 3, raw: 804, peak: 1097, cum: 2024, ms: 118, e2e: 4.04, bg: true, tg: true, ax: true, mc: true },
-          { name: "faster-mac-use (Unmasked History)", ours: true, mode: "live", schema: 268, turns: 3, raw: 804, peak: 1532, cum: 3057, ms: 118, e2e: 4.04, bg: true, tg: true, ax: true, mc: true },
-          { name: "OpenAI Codex CUA (cua_repl Reference)", ours: false, mode: "protocol-exact", schema: 285, turns: 3, raw: 2477, peak: 3222, cum: 5732, ms: 339, e2e: 4.26, bg: true, tg: true, ax: true, mc: false },
+          { name: "faster-mac-use + WebMCP (navigator.modelContext)", ours: true, mode: "live", schema: 268, turns: 2, raw: 658, peak: 1103, cum: 1290, ms: 94, e2e: 2.78, bg: true, tg: true, ax: true, mc: true },
+          { name: "faster-mac-use + Virtual WebMCP Macro (~/.fmu/macros/)", ours: true, mode: "live", schema: 268, turns: 2, raw: 671, peak: 1108, cum: 1290, ms: 97, e2e: 2.67, bg: true, tg: true, ax: true, mc: true },
+          { name: "faster-mac-use (Warm Daemon + REPL + Diff + Mask)", ours: true, mode: "live", schema: 268, turns: 3, raw: 810, peak: 1103, cum: 2024, ms: 133, e2e: 4.06, bg: true, tg: true, ax: true, mc: true },
+          { name: "faster-mac-use (Unmasked History)", ours: true, mode: "live", schema: 268, turns: 3, raw: 810, peak: 1538, cum: 3069, ms: 133, e2e: 4.06, bg: true, tg: true, ax: true, mc: true },
+          { name: "OpenAI Codex CUA (cua_repl Reference)", ours: false, mode: "protocol-exact", schema: 285, turns: 3, raw: 2477, peak: 3222, cum: 5732, ms: 359, e2e: 4.28, bg: true, tg: true, ax: true, mc: false },
           { name: "OpenBrowser MCP (openbrowser-ai CodeAgent)", ours: false, mode: "protocol-exact", schema: 520, turns: 3, raw: 3449, peak: 4427, cum: 7855, ms: 640, e2e: 4.54, bg: true, tg: false, ax: false, mc: false },
-          { name: "agy-cua (Legacy v0 Baseline)", ours: false, mode: "live", schema: 334, turns: 3, raw: 4489, peak: 5403, cum: 10132, ms: 1748, e2e: 7.17, bg: true, tg: false, ax: true, mc: false },
+          { name: "agy-cua (Legacy v0 Baseline)", ours: false, mode: "live", schema: 334, turns: 3, raw: 4489, peak: 5403, cum: 10132, ms: 2120, e2e: 7.55, bg: true, tg: false, ax: true, mc: false },
           { name: "Reflex MCP (Batched Scoped Reader)", ours: false, mode: "protocol-exact", schema: 890, turns: 4, raw: 2693, peak: 4047, cum: 11409, ms: 820, e2e: 5.65, bg: true, tg: false, ax: false, mc: false },
           { name: "Browserbase Stagehand v4 (Cold Run)", ours: false, mode: "protocol-exact", schema: 650, turns: 4, raw: 12245, peak: 4972, cum: 18106, ms: 1350, e2e: 11.81, bg: true, tg: false, ax: false, mc: false },
-          { name: "vercel-labs/agent-browser (v0.41.2)", ours: false, mode: "live", schema: 380, turns: 4, raw: 12685, peak: 13572, cum: 23288, ms: 1583, e2e: 6.95, bg: true, tg: false, ax: false, mc: false },
+          { name: "vercel-labs/agent-browser (v0.41.2)", ours: false, mode: "live", schema: 380, turns: 4, raw: 12685, peak: 13572, cum: 23288, ms: 1763, e2e: 7.13, bg: true, tg: false, ax: false, mc: false },
           { name: "Microsoft @playwright/cli", ours: false, mode: "protocol-exact", schema: 420, turns: 5, raw: 8153, peak: 8958, cum: 28356, ms: 1450, e2e: 6.14, bg: true, tg: false, ax: false, mc: false },
           { name: "playwriter (v0.4.0 MCP)", ours: false, mode: "protocol-exact", schema: 12592, turns: 3, raw: 8161, peak: 21244, cum: 51169, ms: 910, e2e: 5.22, bg: true, tg: false, ax: false, mc: false },
           { name: "Anthropic Claude in Chrome (Extension MCP)", ours: false, mode: "protocol-exact", schema: 2650, turns: 9, raw: 7565, peak: 10628, cum: 55108, ms: 2100, e2e: 10.54, bg: true, tg: true, ax: false, mc: false },
@@ -354,29 +361,29 @@ let ocr = await app.ocr();
       B: {
         title: "Workload B — Native macOS Background App Control (Calculator, 11 UI Operations)",
         rows: [
-          { name: "faster-mac-use (Swift Daemon + UID Diff)", ours: true, mode: "live", schema: 268, turns: 2, raw: 261, peak: 823, cum: 1264, ms: 102, e2e: 2.76, bg: true, tg: true, ax: true, mc: true },
-          { name: "OpenAI Codex CUA (cua_repl Reference)", ours: false, mode: "protocol-exact", schema: 285, turns: 2, raw: 414, peak: 1126, cum: 1499, ms: 188, e2e: 2.85, bg: true, tg: true, ax: true, mc: false },
-          { name: "agy-cua (Legacy v0 Baseline)", ours: false, mode: "protocol-exact", schema: 334, turns: 2, raw: 1599, peak: 2431, cum: 2938, ms: 744, e2e: 4.29, bg: true, tg: false, ax: true, mc: false },
-          { name: "steipete/Peekaboo (AXorcist Swift MCP)", ours: false, mode: "protocol-exact", schema: 1120, turns: 5, raw: 1010, peak: 2550, cum: 9510, ms: 980, e2e: 6.11, bg: true, tg: false, ax: true, mc: false },
-          { name: "trycua/cua (cua-driver Background AX MCP)", ours: false, mode: "protocol-exact", schema: 980, turns: 6, raw: 600, peak: 2002, cum: 9755, ms: 1180, e2e: 7.18, bg: true, tg: false, ax: true, mc: false },
-          { name: "open-computer-use (ocu v0.2.1 MCP)", ours: false, mode: "live", schema: 1508, turns: 11, raw: 5467, peak: 7468, cum: 48488, ms: 3581, e2e: 14.72, bg: true, tg: false, ax: true, mc: false }
+          { name: "faster-mac-use (Swift Daemon + AXObserver + UID Diff)", ours: true, mode: "live", schema: 268, turns: 2, raw: 267, peak: 826, cum: 1264, ms: 395, e2e: 3.06, bg: true, tg: true, ax: true, mc: true },
+          { name: "OpenAI Codex CUA (cua_repl Reference)", ours: false, mode: "protocol-exact", schema: 285, turns: 2, raw: 420, peak: 1132, cum: 1502, ms: 554, e2e: 3.22, bg: true, tg: true, ax: true, mc: false },
+          { name: "agy-cua (Legacy v0 Baseline)", ours: false, mode: "protocol-exact", schema: 334, turns: 2, raw: 1602, peak: 2434, cum: 2941, ms: 744, e2e: 4.29, bg: true, tg: false, ax: true, mc: false },
+          { name: "steipete/Peekaboo (AXorcist Swift MCP)", ours: false, mode: "protocol-exact", schema: 1120, turns: 5, raw: 1025, peak: 2565, cum: 9540, ms: 980, e2e: 6.11, bg: true, tg: false, ax: true, mc: false },
+          { name: "trycua/cua (cua-driver Background AX MCP)", ours: false, mode: "protocol-exact", schema: 980, turns: 6, raw: 609, peak: 2011, cum: 9779, ms: 1180, e2e: 7.18, bg: true, tg: false, ax: true, mc: false },
+          { name: "open-computer-use (ocu v0.2.1 MCP)", ours: false, mode: "live", schema: 1507, turns: 11, raw: 5467, peak: 7467, cum: 48477, ms: 12718, e2e: 23.86, bg: true, tg: false, ax: true, mc: false }
         ]
       },
       C: {
         title: "Workload C — Cross-Surface Hybrid Workflow (14 Ops Across Chrome '🤖 Agent' Tab Groups + macOS)",
         rows: [
-          { name: "faster-mac-use (Full Architecture)", ours: true, mode: "live", schema: 268, turns: 3, raw: 233, peak: 1080, cum: 2176, ms: 306, e2e: 5.72, bg: true, tg: true, ax: true, mc: true },
-          { name: "OpenAI Codex CUA (cua_repl Reference)", ours: false, mode: "protocol-exact", schema: 285, turns: 3, raw: 780, peak: 1644, cum: 2434, ms: 531, e2e: 5.94, bg: true, tg: true, ax: true, mc: false },
+          { name: "faster-mac-use (Full Architecture)", ours: true, mode: "live", schema: 268, turns: 3, raw: 236, peak: 1083, cum: 2179, ms: 335, e2e: 5.75, bg: true, tg: true, ax: true, mc: true },
+          { name: "OpenAI Codex CUA (cua_repl Reference)", ours: false, mode: "protocol-exact", schema: 285, turns: 3, raw: 783, peak: 1647, cum: 2437, ms: 568, e2e: 5.98, bg: true, tg: true, ax: true, mc: false },
           { name: "Stacked MCPs (@playwright/mcp + open-computer-use)", ours: false, mode: "protocol-exact", schema: 5888, turns: 14, raw: 6314, peak: 12650, cum: 129010, ms: 3200, e2e: 16.32, bg: false, tg: false, ax: true, mc: false }
         ]
       },
       D: {
         title: "Workload D — Multi-Cursor Parallel Swarm (3 Concurrent Agents, 25 Ops Across Web + macOS)",
         rows: [
-          { name: "faster-mac-use (3-Cursor Parallel Swarm + Diff + Mask)", ours: true, mode: "live", schema: 268, turns: 2, raw: 913, peak: 1538, cum: 1510, ms: 256, e2e: 6.93, bg: true, tg: true, ax: true, mc: true },
-          { name: "OpenAI Codex CUA (3 Agents Serialized Single-Session)", ours: false, mode: "protocol-exact", schema: 285, turns: 6, raw: 3307, peak: 5136, cum: 15848, ms: 954, e2e: 20.98, bg: true, tg: true, ax: true, mc: false },
-          { name: "browser-use v2 (Asyncio Multi-Agent CDP — Web Only)", ours: false, mode: "protocol-exact", schema: 740, turns: 6, raw: 5328, peak: 7006, cum: 21384, ms: 1540, e2e: 13.99, bg: true, tg: false, ax: false, mc: true },
-          { name: "trycua/cua + OpenBrowser MCP (Multi-Agent Stack)", ours: false, mode: "protocol-exact", schema: 1500, turns: 9, raw: 6806, peak: 9535, cum: 47474, ms: 1780, e2e: 20.42, bg: true, tg: false, ax: true, mc: true },
+          { name: "faster-mac-use (3-Cursor Parallel Swarm + Diff + Mask)", ours: true, mode: "live", schema: 268, turns: 2, raw: 925, peak: 1547, cum: 1510, ms: 326, e2e: 7.00, bg: true, tg: true, ax: true, mc: true },
+          { name: "OpenAI Codex CUA (3 Agents Serialized Single-Session)", ours: false, mode: "protocol-exact", schema: 285, turns: 6, raw: 3343, peak: 5172, cum: 15923, ms: 1122, e2e: 21.15, bg: true, tg: true, ax: true, mc: false },
+          { name: "browser-use v2 (Asyncio Multi-Agent CDP — Web Only)", ours: false, mode: "protocol-exact", schema: 740, turns: 6, raw: 5346, peak: 7024, cum: 21429, ms: 1540, e2e: 13.99, bg: true, tg: false, ax: false, mc: true },
+          { name: "trycua/cua + OpenBrowser MCP (Multi-Agent Stack)", ours: false, mode: "protocol-exact", schema: 1500, turns: 9, raw: 6857, peak: 9586, cum: 47678, ms: 1780, e2e: 20.42, bg: true, tg: false, ax: true, mc: true },
           { name: "Stacked MCPs (@playwright/mcp --isolated + ocu)", ours: false, mode: "protocol-exact", schema: 5888, turns: 25, raw: 11275, peak: 17738, cum: 293950, ms: 4850, e2e: 28.91, bg: false, tg: false, ax: true, mc: false },
           { name: "Anthropic Pixel CUA (Single Physical Cursor — Collides)", ours: false, mode: "protocol-exact", schema: 310, turns: 25, raw: 34225, peak: 35185, cum: 430800, ms: 7600, e2e: 32.60, bg: false, tg: false, ax: true, mc: false }
         ]
@@ -384,9 +391,9 @@ let ocr = await app.ocr();
       E: {
         title: "Workload E — Long-Horizon 30-Op Multi-Order Triage + Zero-Vision Window OCR",
         rows: [
-          { name: "faster-mac-use (5-Turn REPL + Diff + Mask + Native OCR)", ours: true, mode: "live", schema: 268, turns: 5, raw: 714, peak: 1320, cum: 4581, ms: 443, e2e: 8.92, bg: true, tg: true, ax: true, mc: true },
-          { name: "faster-mac-use (Unmasked History)", ours: true, mode: "live", schema: 268, turns: 5, raw: 714, peak: 1670, cum: 5615, ms: 443, e2e: 8.92, bg: true, tg: true, ax: true, mc: true },
-          { name: "OpenAI Codex CUA (cua_repl + Screenshot Fallback)", ours: false, mode: "protocol-exact", schema: 285, turns: 5, raw: 2953, peak: 3926, cum: 8352, ms: 871, e2e: 9.35, bg: true, tg: true, ax: true, mc: false },
+          { name: "faster-mac-use (5-Turn REPL + Diff + Mask + Native OCR)", ours: true, mode: "live", schema: 268, turns: 5, raw: 991, peak: 1597, cum: 4584, ms: 494, e2e: 8.97, bg: true, tg: true, ax: true, mc: true },
+          { name: "faster-mac-use (Unmasked History)", ours: true, mode: "live", schema: 268, turns: 5, raw: 991, peak: 1947, cum: 5618, ms: 494, e2e: 8.97, bg: true, tg: true, ax: true, mc: true },
+          { name: "OpenAI Codex CUA (cua_repl + Screenshot Fallback)", ours: false, mode: "protocol-exact", schema: 285, turns: 5, raw: 2956, peak: 3929, cum: 8355, ms: 942, e2e: 9.42, bg: true, tg: true, ax: true, mc: false },
           { name: "Stacked MCPs (@playwright/mcp + open-computer-use)", ours: false, mode: "protocol-exact", schema: 5888, turns: 30, raw: 14430, peak: 20968, cum: 400725, ms: 6100, e2e: 35.35, bg: false, tg: false, ax: true, mc: false },
           { name: "Anthropic Pixel CUA (30-Step Screenshot Loop)", ours: false, mode: "protocol-exact", schema: 310, turns: 30, raw: 41070, peak: 42090, cum: 620535, ms: 9200, e2e: 39.20, bg: false, tg: false, ax: true, mc: false }
         ]
@@ -397,22 +404,22 @@ let ocr = await app.ocr();
       mcp: `{
   "mcpServers": {
     "faster-mac-use": {
-      "command": "/path/to/faster-mac-use/bin/fmu",
+      "command": "fmu",
       "args": ["mcp"]
     }
   }
 }`,
       codex: `[mcp_servers.faster_mac_use]
-command = "/path/to/faster-mac-use/bin/fmu"
+command = "fmu"
 args = ["mcp"]`,
-      cli: `# 1. Build the native Swift Accessibility + Vision OCR daemon (or let fmu auto-compile on first run)
-swiftc -O src/native/fmu_ax.swift -o bin/fmu-ax
+      cli: `# 1. Install in one command (includes universal2 fmu-ax binary + auto-compiler fallback)
+pip install git+https://github.com/lifan-builds/faster-mac-use.git
 
 # 2. Drive macOS Calculator in the background with 0.0 px cursor movement
-./bin/fmu '{"surface":"app","app":"Calculator","steps":[{"op":"key","name":"escape"},{"op":"click","name":"7"},{"op":"click","name":"Multiply"},{"op":"click","name":"6"},{"op":"click","name":"Equals"}]}'
+fmu '{"surface":"app","app":"Calculator","steps":[{"op":"key","name":"escape"},{"op":"click","name":"7"},{"op":"click","name":"Multiply"},{"op":"click","name":"6"},{"op":"click","name":"Equals"}]}'
 
 # 3. Run a 2-agent parallel multi-cursor swarm across Chrome + Calculator
-./bin/fmu '{"parallel":[{"agent":"agent-1","code":"let t = await cua.createBrowserTab(\\"chrome\\", \\"https://example.com\\", {sessionName: \\"🤖 Agent\\"}); await t.move(\\"More information\\");"},{"agent":"agent-2","code":"let a = await cua.getApp(\\"Calculator\\"); await a.pressKey(\\"escape\\"); await a.click(\\"8\\");"}]}'`
+fmu '{"parallel":[{"agent":"agent-1","code":"let t = await cua.createBrowserTab(\\"chrome\\", \\"https://example.com\\", {sessionName: \\"🤖 Agent\\"}); await t.move(\\"More information\\");"},{"agent":"agent-2","code":"let a = await cua.getApp(\\"Calculator\\"); await a.pressKey(\\"escape\\"); await a.click(\\"8\\");"}]}'`
     };
 
     let currentWorkload = "A";

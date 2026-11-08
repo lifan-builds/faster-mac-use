@@ -196,9 +196,78 @@ PRICING_HTML = """<!doctype html>
 """
 
 
+CANVAS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Acme Canvas — Zero-DOM Architecture Board</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; background: #f8fafc; }
+    canvas { border: 2px solid #0f172a; background: #ffffff; display: block; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Canvas Topology Controller</h1>
+  <div id="canvas-status" role="status">CANVAS_IDLE</div>
+  <canvas id="board-canvas" width="720" height="280" aria-label="Topology Canvas"></canvas>
+  <script>
+    const canvas = document.getElementById("board-canvas");
+    const ctx = canvas.getContext("2d");
+    let clusterState = "READY";
+
+    function drawBoard() {
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.fillStyle = "#0f172a";
+      ctx.font = "bold 26px system-ui, sans-serif";
+      ctx.fillText("Cluster Status: " + clusterState, 40, 60);
+
+      // Button 1: Deploy Cluster (x: 40..310, y: 120..190)
+      ctx.fillStyle = "#1e293b";
+      ctx.fillRect(40, 120, 270, 70);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 24px system-ui, sans-serif";
+      ctx.fillText("Deploy Cluster", 80, 163);
+
+      // Button 2: Rollback Node (x: 360..630, y: 120..190)
+      ctx.fillStyle = "#334155";
+      ctx.fillRect(360, 120, 270, 70);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 24px system-ui, sans-serif";
+      ctx.fillText("Rollback Node", 405, 163);
+    }
+
+    drawBoard();
+
+    canvas.addEventListener("click", (ev) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      if (x >= 40 && x <= 310 && y >= 120 && y <= 190) {
+        clusterState = "DEPLOYED";
+        document.getElementById("canvas-status").textContent = "DEPLOY_CLUSTER_OK";
+        drawBoard();
+      } else if (x >= 360 && x <= 630 && y >= 120 && y <= 190) {
+        clusterState = "ROLLED_BACK";
+        document.getElementById("canvas-status").textContent = "ROLLBACK_NODE_OK";
+        drawBoard();
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
 class _BenchHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
-        body = PRICING_HTML if self.path.startswith("/pricing") else ORDERS_HTML
+        if self.path.startswith("/pricing"):
+            body = PRICING_HTML
+        elif self.path.startswith("/canvas"):
+            body = CANVAS_HTML
+        else:
+            body = ORDERS_HTML
         raw = body.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")

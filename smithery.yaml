@@ -1,0 +1,16 @@
+# Smithery.ai MCP Server Configuration
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      bridgePort:
+        type: number
+        default: 19222
+        description: Local WebSocket port for the optional outbound Chrome MV3 extension bridge
+  commandFunction: |-
+    (config) => ({
+      command: 'fmu',
+      args: ['mcp'],
+      env: config.bridgePort ? { FMU_BRIDGE_PORT: String(config.bridgePort) } : {}
+    })

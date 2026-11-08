@@ -2,24 +2,56 @@
 
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import time
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[2]
+PKG_DIR = Path(__file__).resolve().parent
+ROOT = PKG_DIR.parents[1]
 DEFAULT_SOCK = "/tmp/fmu-ax.sock"
 
 
-def _resolve_ax_binary() -> Path:
-    target_bin = ROOT / "bin" / "fmu-ax"
-    swift_src = ROOT / "src" / "native" / "fmu_ax.swift"
-    if target_bin.is_file():
-        if not swift_src.is_file() or target_bin.stat().st_mtime >= swift_src.stat().st_mtime:
-            return target_bin
+def _resolve_ax_binary(
+    root_dir: Path | None = None,
+    cache_dir: Path | None = None,
+) -> Path:
+    effective_root = root_dir or ROOT
+    repo_bin = effective_root / "bin" / "fmu-ax"
+    repo_swift = effective_root / "src" / "native" / "fmu_ax.swift"
+    pkg_swift = PKG_DIR / "native" / "fmu_ax.swift"
+    swift_src = repo_swift if repo_swift.is_file() else pkg_swift
+
+    if repo_bin.is_file():
+        if not swift_src.is_file() or repo_bin.stat().st_mtime >= swift_src.stat().st_mtime:
+            return repo_bin
+
+    if root_dir is None and not repo_swift.is_file():
+        which_bin = shutil.which("fmu-ax")
+        if which_bin and Path(which_bin).is_file():
+            return Path(which_bin)
+
+    user_cache_bin = (
+        cache_dir
+        or Path(os.environ.get("FMU_HOME", str(Path.home() / ".fmu"))).expanduser() / "bin"
+    ) / "fmu-ax"
+
+    # Decide where to compile if swift_src is available
+    target_bin = repo_bin if repo_swift.is_file() else user_cache_bin
+    if target_bin.is_file() and (
+        not swift_src.is_file() or target_bin.stat().st_mtime >= swift_src.stat().st_mtime
+    ):
+        return target_bin
+
     if swift_src.is_file():
-        target_bin.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target_bin.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            target_bin = user_cache_bin
+            target_bin.parent.mkdir(parents=True, exist_ok=True)
         try:
             subprocess.run(
                 ["swiftc", "-O", str(swift_src), "-o", str(target_bin)],
@@ -31,6 +63,8 @@ def _resolve_ax_binary() -> Path:
         except FileNotFoundError as exc:
             if target_bin.is_file():
                 return target_bin
+            if repo_bin.is_file():
+                return repo_bin
             raise RuntimeError(
                 f"Cannot compile {swift_src}: 'swiftc' not found. "
                 "Install Xcode Command Line Tools with: xcode-select --install"
@@ -38,13 +72,15 @@ def _resolve_ax_binary() -> Path:
         except subprocess.CalledProcessError as exc:
             if target_bin.is_file():
                 return target_bin
+            if repo_bin.is_file():
+                return repo_bin
             err_detail = (exc.stderr or "").strip()
             raise RuntimeError(
                 f"Failed to compile {swift_src} with swiftc: {err_detail}"
             ) from exc
         if target_bin.is_file():
             return target_bin
-    return target_bin
+    return repo_bin if repo_bin.is_file() else target_bin
 
 
 

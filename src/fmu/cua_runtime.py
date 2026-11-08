@@ -109,6 +109,9 @@ class AppHandle:
         )
         self._fresh = True
 
+    def has_pending(self) -> bool:
+        return bool(self._pending_steps)
+
     def click(self, target: str | int | dict[str, Any], y: int | None = None) -> AppHandle:
         self._fresh = False
         if y is not None and isinstance(target, (int, float)):
@@ -210,6 +213,8 @@ class TabHandle:
         self.session_name = session_name
         self.agent_id = agent_id
         self._pending_steps: list[dict[str, Any]] = []
+        self._pending_macros: list[dict[str, Any]] = []
+        self._force_ocr: bool = False
         self.initial_state = self.runtime.browser.execute_batch(
             {
                 "agent": agent_id,
@@ -220,6 +225,9 @@ class TabHandle:
             }
         )
         self._fresh = True
+
+    def has_pending(self) -> bool:
+        return bool(self._pending_steps or self._pending_macros or self._force_ocr)
 
     def goto(self, url: str) -> TabHandle:
         self._fresh = False
@@ -269,6 +277,31 @@ class TabHandle:
         self._pending_steps.append({"op": "webmcp", "name": str(name), "args": args or {}})
         return self
 
+    def saveMacro(
+        self,
+        name: str,
+        steps: list[dict[str, Any]] | None = None,
+        description: str = "",
+    ) -> TabHandle:
+        self._fresh = False
+        if steps is not None:
+            self.runtime.browser.save_macro(
+                name=name,
+                steps=steps,
+                description=description,
+                tab_id=self.tab_id,
+            )
+        else:
+            self._pending_macros.append(
+                {"name": name, "steps": None, "description": description}
+            )
+        return self
+
+    def ocr(self) -> TabHandle:
+        self._fresh = False
+        self._force_ocr = True
+        return self
+
     def upload(self, target: str, files: str | list[str]) -> TabHandle:
         self._fresh = False
         self._pending_steps.append({"op": "click", "uid": str(target), "files": files})
@@ -277,6 +310,7 @@ class TabHandle:
     def close(self) -> str:
         self._fresh = False
         self._pending_steps.clear()
+        self._pending_macros.clear()
         sess = self.runtime._get_agent_session(self.agent_id)
         sess.cua.handles.pop(self.tab_id, None)
         return self.runtime.browser.close_tab(self.tab_id)
@@ -294,7 +328,7 @@ class TabHandle:
             q = str(full_table.get("query") or query or "")
         else:
             ft = bool(full_table)
-        if self._fresh and not self._pending_steps and not ft and not q:
+        if self._fresh and not self.has_pending() and not ft and not q:
             self._fresh = False
             return self.initial_state
         return self.flush(diff=False, full_table=ft, query=q)
@@ -310,6 +344,9 @@ class TabHandle:
             "sessionName": self.session_name,
             "diff": diff,
         }
+        if self._force_ocr:
+            payload["ocr"] = True
+            self._force_ocr = False
         if full_table:
             payload["fullTable"] = True
         if query:
@@ -317,7 +354,19 @@ class TabHandle:
         if self._pending_steps:
             payload["steps"] = list(self._pending_steps)
             self._pending_steps.clear()
-        return self.runtime.browser.execute_batch(payload)
+        out = self.runtime.browser.execute_batch(payload)
+        if self._pending_macros:
+            macros = list(self._pending_macros)
+            self._pending_macros.clear()
+            for m in macros:
+                entry = self.runtime.browser.save_macro(
+                    name=m["name"],
+                    steps=m["steps"],
+                    description=m["description"],
+                    tab_id=self.tab_id,
+                )
+                out += f'\n# macro saved name="{entry["name"]}" domain="{entry["domain"]}" steps={len(entry["steps"])}'
+        return out
 
 
 class CuaNamespace:
@@ -340,7 +389,7 @@ class CuaNamespace:
         elif isinstance(browser_id, str) and browser_id.startswith(("http://", "https://", "file://", "about:")):
             opts = options if isinstance(options, dict) else {}
             actual_url = browser_id
-            b_id = "chrome"
+            b_id = str((options or {}).get("mode") or "chrome")
         else:
             opts = options or {}
             actual_url = url
@@ -357,7 +406,12 @@ class CuaNamespace:
                 self._tab_seq += 1
             tab_id = f"{prefix}t{self._tab_seq}"
             self._tab_seq += 1
-        mode = "chrome" if b_id == "chrome" else "headless"
+        if b_id == "extension":
+            mode = "extension"
+        elif b_id == "chrome":
+            mode = "chrome"
+        else:
+            mode = "headless"
         h = TabHandle(
             self.runtime,
             tab_id=tab_id,
@@ -394,6 +448,31 @@ class CuaNamespace:
             )
             h._fresh = True
         return self.handles[key]
+
+    def saveMacro(
+        self,
+        name: str,
+        steps: list[dict[str, Any]] | None = None,
+        domain: str | None = None,
+        description: str = "",
+    ) -> str:
+        entry = self.runtime.browser.save_macro(
+            name=name, steps=steps, domain=domain, description=description
+        )
+        return f'# macro saved name="{entry["name"]}" domain="{entry["domain"]}" steps={len(entry["steps"])}'
+
+    def listMacros(self, domain: str | None = None) -> str:
+        items = self.runtime.browser.list_macros(domain=domain)
+        lines = [f"# macros count={len(items)}"]
+        for m in items:
+            lines.append(
+                f'@macro name="{m.get("name")}" domain="{m.get("domain")}" steps={len(m.get("steps") or [])}'
+            )
+        return "\n".join(lines)
+
+    def deleteMacro(self, name: str, domain: str | None = None) -> str:
+        ok = self.runtime.browser.delete_macro(name=name, domain=domain)
+        return f'# macro deleted name="{name}" ok={str(ok).lower()}'
 
     def getCursors(self) -> str:
         return self.runtime.get_cursors()
@@ -563,7 +642,7 @@ class FasterMacUseRuntime:
                 if assign_m and not stmt.startswith(("if ", "assert ", "return ")):
                     var_name = assign_m.group(1).strip()
                     rhs = assign_m.group(2).strip()
-                    if last_handle is not None and last_handle._pending_steps:
+                    if last_handle is not None and last_handle.has_pending():
                         outputs.append(last_handle.flush())
                     val = eval(rhs, {"__builtins__": {}}, sess.repl_env)
                     sess.repl_env[var_name] = val
@@ -582,16 +661,16 @@ class FasterMacUseRuntime:
                 else:
                     val = eval(stmt, {"__builtins__": {}}, sess.repl_env)
                     if isinstance(val, (AppHandle, TabHandle)):
-                        if last_handle is not None and last_handle is not val and last_handle._pending_steps:
+                        if last_handle is not None and last_handle is not val and last_handle.has_pending():
                             outputs.append(last_handle.flush())
                         last_handle = val
                     elif isinstance(val, str):
                         outputs.append(val)
 
-            if last_handle is not None and last_handle._pending_steps:
+            if last_handle is not None and last_handle.has_pending():
                 outputs.append(last_handle.flush())
             for h in list(sess.cua.handles.values()):
-                if isinstance(h, (AppHandle, TabHandle)) and h._pending_steps:
+                if isinstance(h, (AppHandle, TabHandle)) and h.has_pending():
                     outputs.append(h.flush())
             if last_handle is not None and not outputs and last_handle._fresh:
                 last_handle._fresh = False

@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 500" width="100%" height="auto" role="img" aria-label="Faster Mac Use 3-Cursor Parallel Swarm vs Traditional MCP Stack">
+  <defs>
+    <style>
+      .bg { fill: #0b1020; }
+      .panel { fill: #111827; stroke: #1f2937; stroke-width: 1.5; rx: 12; }
+      .panel-win { fill: #0f172a; stroke: #10b981; stroke-width: 1.5; rx: 12; }
+      .panel-lose { fill: #0f172a; stroke: #ef4444; stroke-width: 1.5; rx: 12; }
+      .card { fill: #1e293b; stroke: #334155; stroke-width: 1; rx: 8; }
+      .title { font: 700 18px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #f8fafc; }
+      .subtitle { font: 500 12px system-ui, -apple-system, sans-serif; fill: #94a3b8; }
+      .badge-green { fill: #064e3b; stroke: #10b981; stroke-width: 1; rx: 6; }
+      .badge-red { fill: #450a0a; stroke: #ef4444; stroke-width: 1; rx: 6; }
+      .badge-blue { fill: #1e3a8a; stroke: #3b82f6; stroke-width: 1; rx: 5; }
+      .badge-purple { fill: #3b0764; stroke: #a855f7; stroke-width: 1; rx: 5; }
+      .badge-cyan { fill: #083344; stroke: #06b6d4; stroke-width: 1; rx: 5; }
+      .mono-sm { font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #e2e8f0; }
+      .mono-xs { font: 500 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #cbd5e1; }
+      .mono-green { font: 700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #34d399; }
+      .mono-red { font: 700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #f87171; }
+      .metric-big-green { font: 800 28px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #34d399; }
+      .metric-big-red { font: 800 28px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #f87171; }
+      .label-cap { font: 700 10px system-ui, -apple-system, sans-serif; fill: #94a3b8; letter-spacing: 0.08em; }
+
+      @keyframes pulseGreen {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.55; }
+      }
+      @keyframes cursor1Move {
+        0%, 15% { transform: translate(0px, 0px); }
+        45%, 100% { transform: translate(115px, 18px); }
+      }
+      @keyframes cursor2Move {
+        0%, 20% { transform: translate(0px, 0px); }
+        50%, 100% { transform: translate(140px, 12px); }
+      }
+      @keyframes cursor3Move {
+        0%, 25% { transform: translate(0px, 0px); }
+        55%, 100% { transform: translate(105px, 16px); }
+      }
+      @keyframes barFast {
+        0% { width: 12px; }
+        30%, 100% { width: 440px; }
+      }
+      @keyframes barBloat {
+        0% { width: 12px; }
+        95%, 100% { width: 440px; }
+      }
+      .pulse { animation: pulseGreen 2.2s infinite ease-in-out; }
+      .c1 { animation: cursor1Move 4.5s infinite ease-in-out; }
+      .c2 { animation: cursor2Move 4.5s infinite ease-in-out; }
+      .c3 { animation: cursor3Move 4.5s infinite ease-in-out; }
+      .bar-fmu { animation: barFast 6s infinite ease-out; }
+      .bar-mcp { animation: barBloat 6s infinite linear; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1080" height="500" rx="16"/>
+
+  <!-- Top Header -->
+  <text x="32" y="38" class="title">WORKLOAD D: 3-Agent Parallel Swarm (25 UI Actions across Chrome + macOS Calculator)</text>
+  <text x="32" y="58" class="subtitle">Live benchmark comparison (OpenAI o200k_base BPE tokens + 50Hz CGEvent / NSWorkspace Background Intrusion Guard)</text>
+
+  <!-- LEFT PANEL: faster-mac-use -->
+  <rect x="28" y="76" width="500" height="396" class="panel-win"/>
+  <rect x="46" y="92" width="196" height="24" class="badge-green"/>
+  <text x="56" y="108" class="mono-green">● faster-mac-use (Ours)</text>
+  <text x="254" y="108" class="subtitle">2 Turns · 3 Virtual Cursors · 0.0 px Moved</text>
+
+  <!-- Agent 1 Card -->
+  <rect x="46" y="128" width="464" height="72" class="card"/>
+  <rect x="58" y="138" width="110" height="20" class="badge-blue"/>
+  <text x="66" y="152" class="mono-xs">🤖 Agent 1 (Web)</text>
+  <text x="178" y="152" class="mono-xs">tab=agent-1:t1 · Order Console (10 ops)</text>
+  <text x="58" y="174" class="mono-green">+ @u14 status "APPROVED #ORD-409 (express) note=Swarm Agent-1"</text>
+  <text x="58" y="190" class="mono-xs"># ... +24 rows (@u36..@u107 folded) · +/~/- CRC-32 delta (48 tok)</text>
+  <g class="c1">
+    <circle cx="350" cy="148" r="5" fill="#3b82f6"/>
+    <text x="360" y="152" class="mono-xs" fill="#60a5fa">@cursor1(240,182)</text>
+  </g>
+
+  <!-- Agent 2 Card -->
+  <rect x="46" y="210" width="464" height="72" class="card"/>
+  <rect x="58" y="220" width="110" height="20" class="badge-purple"/>
+  <text x="66" y="234" class="mono-xs">🤖 Agent 2 (Web)</text>
+  <text x="178" y="234" class="mono-xs">tab=agent-2:t1 · Background rAF + Audit Flag</text>
+  <text x="58" y="256" class="mono-green">~ @u2 status "PENDING" -&gt; "ENT-1000-OK" (Focus Emulated!)</text>
+  <text x="58" y="272" class="mono-xs">+ @u108 alert "Order #ORD-405 flagged" · Virtual WebMCP ready</text>
+  <g class="c2">
+    <circle cx="330" cy="230" r="5" fill="#a855f7"/>
+    <text x="340" y="234" class="mono-xs" fill="#c084fc">@cursor2(180,96)</text>
+  </g>
+
+  <!-- Agent 3 Card -->
+  <rect x="46" y="292" width="464" height="72" class="card"/>
+  <rect x="58" y="302" width="116" height="20" class="badge-cyan"/>
+  <text x="66" y="316" class="mono-xs">🍎 Agent 3 (macOS)</text>
+  <text x="184" y="316" class="mono-xs">app="Calculator" · Off-Space AXObserver (&lt;1ms)</text>
+  <text x="58" y="338" class="mono-green">~ @a1 statictext val="0" -&gt; val="1037" (125×8 + 37)</text>
+  <text x="58" y="354" class="mono-xs">CGEvent.postToPid · 0 physical cursor movement · 0 focus theft</text>
+  <g class="c3">
+    <circle cx="355" cy="312" r="5" fill="#06b6d4"/>
+    <text x="365" y="316" class="mono-xs" fill="#22d3ee">@cursor3(412,308)</text>
+  </g>
+
+  <!-- Left Progress & Counter -->
+  <rect x="46" y="376" width="464" height="8" fill="#1e293b" rx="4"/>
+  <rect x="46" y="376" width="440" height="8" fill="#10b981" rx="4" class="bar-fmu"/>
+
+  <text x="46" y="408" class="label-cap">CUMULATIVE INPUT TOKENS</text>
+  <text x="46" y="440" class="metric-big-green">1,510 tok</text>
+  <text x="235" y="408" class="label-cap">WALL-CLOCK E2E</text>
+  <text x="235" y="440" class="metric-big-green">7.00 s</text>
+  <text x="380" y="408" class="label-cap">SCHEMA OVERHEAD</text>
+  <text x="380" y="440" class="metric-big-green">268 tok</text>
+  <text x="46" y="460" class="mono-green">✓ 195× fewer cumulative tokens · 4.1× faster · 100% background-safe</text>
+
+  <!-- RIGHT PANEL: Traditional Stacked MCPs -->
+  <rect x="552" y="76" width="500" height="396" class="panel-lose"/>
+  <rect x="570" y="92" width="276" height="24" class="badge-red"/>
+  <text x="580" y="108" class="mono-red">✕ @playwright/mcp + open-computer-use</text>
+  <text x="856" y="108" class="subtitle">25 Sequential Turns · O(N²) Bloat</text>
+
+  <!-- Bloated Turn Log Card -->
+  <rect x="570" y="128" width="464" height="236" class="card"/>
+  <text x="584" y="150" class="mono-red">! Turn 1/25: Re-reading 34 MCP tool schemas (+5,888 tok)</text>
+  <text x="584" y="170" class="mono-xs">  + Full YAML ARIA snapshot dumped into context (+4,072 tok)</text>
+  <text x="584" y="192" class="mono-red">! Turn 2/25: Top banner inserted -&gt; [e1..e120] index shift!</text>
+  <text x="584" y="212" class="mono-xs">  + Unfolded 30-row table re-sent on every single click</text>
+  <text x="584" y="234" class="mono-red">! Turn 11/25: Unfocused Chrome tab throttles requestAnimationFrame</text>
+  <text x="584" y="254" class="mono-xs">  + Chrome 144 DevToolsActivePort pops up focus-stealing modal</text>
+  <text x="584" y="276" class="mono-red">! Turn 18/25: Single OS pointer collides across parallel agents</text>
+  <text x="584" y="296" class="mono-xs">  + Steals foreground window focus while user is typing</text>
+  <text x="584" y="320" class="mono-red">! Turn 25/25: Context window stuffed with 24 stale DOM trees</text>
+  <text x="584" y="342" class="mono-xs">  + Peak context: 17,738 tok · Cumulative billed: 293,950 tok</text>
+
+  <!-- Right Progress & Counter -->
+  <rect x="570" y="376" width="464" height="8" fill="#1e293b" rx="4"/>
+  <rect x="570" y="376" width="440" height="8" fill="#ef4444" rx="4" class="bar-mcp"/>
+
+  <text x="570" y="408" class="label-cap">CUMULATIVE INPUT TOKENS</text>
+  <text x="570" y="440" class="metric-big-red">293,950 tok</text>
+  <text x="795" y="408" class="label-cap">WALL-CLOCK E2E</text>
+  <text x="795" y="440" class="metric-big-red">28.91 s</text>
+  <text x="930" y="408" class="label-cap">SCHEMA OVERHEAD</text>
+  <text x="930" y="440" class="metric-big-red">5,888 tok</text>
+  <text x="570" y="460" class="mono-red">✕ Steals focus · 25 round-trips · 22× higher API cost per task</text>
+</svg>

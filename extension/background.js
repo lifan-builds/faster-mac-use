@@ -1,4 +1,5 @@
-const RELAY_URL = "ws://127.0.0.1:19222/ext";
+const DEFAULT_RELAY_URL = "ws://127.0.0.1:19222/ext";
+let relayUrl = DEFAULT_RELAY_URL;
 let ws = null;
 const sessionGroups = new Map();
 const sessionTabs = new Map();
@@ -52,9 +53,26 @@ chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId) attachedDebuggers.delete(source.tabId);
 });
 
+async function evalInTab(tabId, expression, awaitPromise = true) {
+  await ensureDebuggerAndFocusEmulation(tabId);
+  const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+    expression,
+    awaitPromise,
+    returnByValue: true
+  });
+  if (res && res.exceptionDetails) {
+    const desc = (res.result && res.result.description) || res.exceptionDetails.text || "Runtime.evaluate error";
+    throw new Error(desc);
+  }
+  return res && res.result ? res.result.value : undefined;
+}
+
 async function handleRpc(msg) {
   const { id, method, params = {} } = msg;
   try {
+    if (method === "ping") {
+      return { id, result: { pong: true, attachedTabs: Array.from(attachedDebuggers) } };
+    }
     if (method === "createBrowserTab") {
       const { url = "about:blank", sessionName = "🤖 Agent", sessionId = "default", color = "blue" } = params;
       const tab = await chrome.tabs.create({ url, active: false });
@@ -65,6 +83,12 @@ async function handleRpc(msg) {
       }
       return { id, result: { tabId: tab.id, groupId, sessionName, url: tab.pendingUrl || tab.url } };
     }
+    if (method === "navigate" || method === "goto") {
+      const { tabId, url } = params;
+      await chrome.tabs.update(tabId, { url, active: false });
+      await ensureDebuggerAndFocusEmulation(tabId);
+      return { id, result: { tabId, url } };
+    }
     if (method === "getTab") {
       const { sessionId = "default", urlPattern, tabId } = params;
       if (tabId) return { id, result: { tabId } };
@@ -74,6 +98,42 @@ async function handleRpc(msg) {
       if (!match) throw new Error("No matching Chrome tab found");
       sessionTabs.set(sessionId, match.id);
       return { id, result: { tabId: match.id, url: match.url, title: match.title } };
+    }
+    if (method === "evaluate") {
+      const { tabId, expression, arg, runtimeInit, awaitPromise = true } = params;
+      const wrappedExpr = runtimeInit
+        ? expression
+        : `((__fn, __arg) => (typeof __fn === "function" ? __fn(__arg) : __fn))((${expression}), ${JSON.stringify(arg === undefined ? null : arg)})`;
+      const val = await evalInTab(tabId, wrappedExpr, awaitPromise);
+      return { id, result: val };
+    }
+    if (method === "executeBatch") {
+      const { tabId, runtimeJs, batchReq } = params;
+      if (runtimeJs) {
+        await evalInTab(tabId, runtimeJs, false);
+      }
+      const reqPayload = batchReq || params;
+      const expr = `window.__fmu.executeBatch(${JSON.stringify(reqPayload || {})})`;
+      const batchRes = await evalInTab(tabId, expr, true);
+      return { id, result: batchRes };
+    }
+    if (method === "captureClip") {
+      const { tabId, clip } = params;
+      await ensureDebuggerAndFocusEmulation(tabId);
+      const cdpParams = { format: "png" };
+      if (clip) cdpParams.clip = { ...clip, scale: clip.scale || 1 };
+      const shot = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", cdpParams);
+      return { id, result: shot };
+    }
+    if (method === "closeTab") {
+      const { tabId, sessionId } = params;
+      const targetId = tabId || (sessionId ? sessionTabs.get(sessionId) : undefined);
+      if (targetId) {
+        try { await chrome.tabs.remove(targetId); } catch (_) {}
+        attachedDebuggers.delete(targetId);
+      }
+      if (sessionId) sessionTabs.delete(sessionId);
+      return { id, result: { closed: Boolean(targetId) } };
     }
     if (method === "closeTabGroup") {
       const { sessionName = "🤖 Agent" } = params;
@@ -104,9 +164,15 @@ async function handleRpc(msg) {
 
 function connectRelay() {
   try {
-    ws = new WebSocket(RELAY_URL);
+    ws = new WebSocket(relayUrl);
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.2.0" }));
+      } catch (_) {}
+    };
     ws.onmessage = async (ev) => {
       const msg = JSON.parse(ev.data);
+      if (!msg || !msg.method) return;
       const resp = await handleRpc(msg);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(resp));

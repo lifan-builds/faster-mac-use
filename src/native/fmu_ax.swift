@@ -3,6 +3,7 @@ import ApplicationServices
 import CoreGraphics
 import Darwin
 import Foundation
+import ImageIO
 import ScreenCaptureKit
 import Vision
 
@@ -111,6 +112,11 @@ struct BatchRequest: Codable {
     let showDocs: Bool?
     let ocr: Bool?
     let getCursors: Bool?
+    let imagePath: String?
+    let clipX: Double?
+    let clipY: Double?
+    let clipW: Double?
+    let clipH: Double?
 
     var effectiveAgent: String {
         let raw = (agent ?? cursor ?? "default").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -150,12 +156,44 @@ final class EngineState {
     var windowBaselines: [String: [NodeRecord]] = [:]
     var windowCrc: [String: String] = [:]
     var latestWindowNodes: [String: [NodeRecord]] = [:]
+    var latestWindowElements: [String: [AXUIElement]] = [:]
+    var windowSyncedSeq: [String: UInt64] = [:]
     var cachedAppWindows: [pid_t: (AXUIElement, String)] = [:]
     var appCache: [String: TargetApp] = [:]
     var appPidByKey: [String: pid_t] = [:]
     var wokenPids: Set<pid_t> = []
     var documentedApps: Set<String> = []
     var agentCursors: [String: VirtualCursorState] = [:]
+
+    // Push-based AXObserver state per PID
+    let observerLock = NSLock()
+    var observersByPid: [pid_t: AXObserver] = [:]
+    var pidMutationSeq: [pid_t: UInt64] = [:]
+    var dirtyElementHashes: [pid_t: Set<UInt>] = [:]
+    var structuralDirtyPids: Set<pid_t> = []
+    var observerRunLoop: CFRunLoop?
+    var observerThreadStarted: Bool = false
+
+    func currentPidSeq(_ pid: pid_t) -> UInt64 {
+        observerLock.lock()
+        defer { observerLock.unlock() }
+        return pidMutationSeq[pid, default: 0]
+    }
+
+    func isStructurallyDirty(_ pid: pid_t) -> Bool {
+        observerLock.lock()
+        defer { observerLock.unlock() }
+        return structuralDirtyPids.contains(pid)
+    }
+
+    func consumeDirtyState(_ pid: pid_t) -> (seq: UInt64, structural: Bool, hashes: Set<UInt>) {
+        observerLock.lock()
+        defer { observerLock.unlock() }
+        let seq = pidMutationSeq[pid, default: 0]
+        let structural = structuralDirtyPids.remove(pid) != nil
+        let hashes = dirtyElementHashes.removeValue(forKey: pid) ?? []
+        return (seq, structural, hashes)
+    }
 
     func reset(agent: String? = nil) {
         if let ag = agent, !ag.isEmpty && ag != "all" {
@@ -175,12 +213,18 @@ final class EngineState {
         windowBaselines.removeAll()
         windowCrc.removeAll()
         latestWindowNodes.removeAll()
+        latestWindowElements.removeAll()
+        windowSyncedSeq.removeAll()
         cachedAppWindows.removeAll()
         appCache.removeAll()
         appPidByKey.removeAll()
         wokenPids.removeAll()
         documentedApps.removeAll()
         agentCursors.removeAll()
+        observerLock.lock()
+        dirtyElementHashes.removeAll()
+        structuralDirtyPids.removeAll()
+        observerLock.unlock()
     }
 
     func registerElement(_ el: AXUIElement, structKey: String, usedInPass: inout Set<String>) -> String {
@@ -312,12 +356,104 @@ let interactiveRoles: Set<String> = [
     "row", "cell", "incrementor", "switch", "disclosuretriangle", "sheet", "dialog"
 ]
 
+let axObserverCallback: AXObserverCallback = { _, element, notification, refcon in
+    guard let refcon = refcon else { return }
+    let pid = pid_t(Int(bitPattern: refcon))
+    let notif = notification as String
+    let elemHash = CFHash(element)
+    let state = EngineState.shared
+    state.observerLock.lock()
+    state.pidMutationSeq[pid, default: 0] &+= 1
+    state.dirtyElementHashes[pid, default: []].insert(elemHash)
+    if notif == (kAXUIElementDestroyedNotification as String)
+        || notif == (kAXCreatedNotification as String)
+        || notif == (kAXWindowCreatedNotification as String)
+        || notif == (kAXLayoutChangedNotification as String)
+        || notif == (kAXFocusedWindowChangedNotification as String) {
+        state.structuralDirtyPids.insert(pid)
+    }
+    state.observerLock.unlock()
+}
+
+func ensureAXObserverRunLoop() -> CFRunLoop? {
+    let state = EngineState.shared
+    state.observerLock.lock()
+    if let rl = state.observerRunLoop {
+        state.observerLock.unlock()
+        return rl
+    }
+    if !state.observerThreadStarted {
+        state.observerThreadStarted = true
+        let sem = DispatchSemaphore(value: 0)
+        let t = Thread {
+            let rl = CFRunLoopGetCurrent()
+            state.observerLock.lock()
+            state.observerRunLoop = rl
+            state.observerLock.unlock()
+            sem.signal()
+            var ctx = CFRunLoopSourceContext()
+            if let dummySrc = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &ctx) {
+                CFRunLoopAddSource(rl, dummySrc, .defaultMode)
+            }
+            CFRunLoopRun()
+        }
+        t.name = "fmu-ax-observer"
+        t.qualityOfService = .userInteractive
+        t.start()
+        state.observerLock.unlock()
+        _ = sem.wait(timeout: .now() + 0.5)
+        state.observerLock.lock()
+    }
+    let rl = state.observerRunLoop
+    state.observerLock.unlock()
+    return rl
+}
+
+func ensureAXObserver(_ pid: pid_t, appElement: AXUIElement) {
+    let state = EngineState.shared
+    state.observerLock.lock()
+    if state.observersByPid[pid] != nil {
+        state.observerLock.unlock()
+        return
+    }
+    state.observerLock.unlock()
+
+    guard let rl = ensureAXObserverRunLoop() else { return }
+    var obsRef: AXObserver?
+    guard AXObserverCreate(pid, axObserverCallback, &obsRef) == .success,
+          let obs = obsRef else { return }
+
+    let refcon = UnsafeMutableRawPointer(bitPattern: Int(pid))
+    let notifications: [String] = [
+        kAXValueChangedNotification as String,
+        kAXTitleChangedNotification as String,
+        kAXUIElementDestroyedNotification as String,
+        kAXCreatedNotification as String,
+        kAXWindowCreatedNotification as String,
+        kAXFocusedWindowChangedNotification as String,
+        kAXFocusedUIElementChangedNotification as String,
+        kAXSelectedChildrenChangedNotification as String,
+        kAXLayoutChangedNotification as String
+    ]
+    for notif in notifications {
+        _ = AXObserverAddNotification(obs, appElement, notif as CFString, refcon)
+    }
+    CFRunLoopAddSource(rl, AXObserverGetRunLoopSource(obs), .defaultMode)
+    CFRunLoopWakeUp(rl)
+
+    state.observerLock.lock()
+    state.observersByPid[pid] = obs
+    state.observerLock.unlock()
+}
+
 func wakeLazyAXIfNeeded(_ pid: pid_t, appElement: AXUIElement) {
     let state = EngineState.shared
-    guard !state.wokenPids.contains(pid) else { return }
-    state.wokenPids.insert(pid)
-    _ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-    _ = AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+    if !state.wokenPids.contains(pid) {
+        state.wokenPids.insert(pid)
+        _ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+    }
+    ensureAXObserver(pid, appElement: appElement)
 }
 
 func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxElements: Int = 250) -> ([NodeRecord], [AXUIElement]) {
@@ -382,6 +518,53 @@ func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxEl
     return (records, elements)
 }
 
+func refreshDirtyLeavesInPlace(
+    nodes: [NodeRecord],
+    elements: [AXUIElement],
+    dirtyHashes: Set<UInt>,
+    refreshValueBearers: Bool
+) -> [NodeRecord]? {
+    guard !nodes.isEmpty, nodes.count == elements.count else { return nil }
+    let state = EngineState.shared
+    var updated = nodes
+    for i in 0..<nodes.count {
+        let rec = nodes[i]
+        let el = elements[i]
+        let h = CFHash(el)
+        let shouldRefresh = dirtyHashes.contains(h)
+            || (refreshValueBearers && (
+                rec.role != "button"
+                || rec.label.lowercased() == "clear"
+                || rec.label.lowercased() == "all clear"
+            ))
+        if !shouldRefresh { continue }
+        let attrs = readBatchedAttrs(el)
+        if attrs.role.isEmpty {
+            return nil
+        }
+        var label = !attrs.title.isEmpty ? attrs.title : attrs.desc
+        if label.isEmpty && (attrs.role == "textfield" || attrs.role == "textarea" || attrs.role == "searchfield") {
+            label = axString(el, "AXPlaceholderValue")
+        }
+        if label.isEmpty { label = rec.label }
+        let newRec = NodeRecord(
+            uid: rec.uid,
+            structKey: rec.structKey,
+            role: attrs.role,
+            label: label,
+            value: attrs.value,
+            enabled: attrs.enabled,
+            x: attrs.x,
+            y: attrs.y,
+            w: attrs.w,
+            h: attrs.h
+        )
+        updated[i] = newRec
+        state.uidToRecord[rec.uid] = newRec
+    }
+    return updated
+}
+
 func isProcessAndAXAlive(_ pid: pid_t) -> Bool {
     guard pid > 0, kill(pid, 0) == 0 else { return false }
     guard let running = NSRunningApplication(processIdentifier: pid), !running.isTerminated else {
@@ -433,9 +616,7 @@ func findApp(nameOrBundle: String, launchIfNeeded: Bool = true) -> TargetApp? {
     let lower = nameOrBundle.lowercased()
     let state = EngineState.shared
     if let cached = state.appCache[lower] {
-        if kill(cached.pid, 0) == 0,
-           let running = NSRunningApplication(processIdentifier: cached.pid),
-           !running.isTerminated {
+        if isProcessAndAXAlive(cached.pid) {
             if let cachedWin = state.cachedAppWindows[cached.pid],
                axString(cachedWin.0, kAXRoleAttribute) == "AXWindow" {
                 return cached
@@ -507,8 +688,10 @@ func findApp(nameOrBundle: String, launchIfNeeded: Bool = true) -> TargetApp? {
 func getTargetRoot(_ app: TargetApp, windowFilter: String? = nil) -> (AXUIElement, String) {
     let state = EngineState.shared
     if windowFilter == nil, let cached = state.cachedAppWindows[app.pid] {
-        if axString(cached.0, kAXRoleAttribute) == "AXWindow" && !axChildren(cached.0).isEmpty {
-            return cached
+        if axString(cached.0, kAXRoleAttribute) == "AXWindow" {
+            if !state.isStructurallyDirty(app.pid) || !axChildren(cached.0).isEmpty {
+                return cached
+            }
         }
         state.cachedAppWindows.removeValue(forKey: app.pid)
     }
@@ -640,6 +823,57 @@ func postBackgroundClickToPid(_ pid: pid_t, x: Int, y: Int) -> Bool {
     return true
 }
 
+func performImageFileOCR(
+    imagePath: String,
+    clipX: Double = 0.0,
+    clipY: Double = 0.0,
+    clipW: Double = 0.0,
+    clipH: Double = 0.0
+) -> String {
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    let url = URL(fileURLWithPath: imagePath)
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let cgImg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        return "Error: unable to load image at \(imagePath)"
+    }
+    var ocrItems: [(text: String, x: Int, y: Int, w: Int, h: Int)] = []
+    func runPass(level: VNRequestTextRecognitionLevel) {
+        ocrItems.removeAll()
+        let req = VNRecognizeTextRequest { request, _ in
+            guard let results = request.results as? [VNRecognizedTextObservation] else { return }
+            for obs in results.prefix(80) {
+                if let top = obs.topCandidates(1).first {
+                    let text = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !text.isEmpty {
+                        let bbox = obs.boundingBox
+                        let w = clipW > 0 ? clipW : Double(cgImg.width)
+                        let h = clipH > 0 ? clipH : Double(cgImg.height)
+                        let rx = Int(round(clipX + Double(bbox.midX) * w))
+                        let ry = Int(round(clipY + (1.0 - Double(bbox.midY)) * h))
+                        let rw = max(1, Int(round(Double(bbox.width) * w)))
+                        let rh = max(1, Int(round(Double(bbox.height) * h)))
+                        ocrItems.append((text: text, x: rx, y: ry, w: rw, h: rh))
+                    }
+                }
+            }
+        }
+        req.recognitionLevel = level
+        req.usesLanguageCorrection = false
+        let handler = VNImageRequestHandler(cgImage: cgImg, options: [:])
+        try? handler.perform([req])
+    }
+    runPass(level: .fast)
+    if ocrItems.isEmpty {
+        runPass(level: .accurate)
+    }
+    let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+    var lines = ["# image-ocr count=\(ocrItems.count) ms=\(String(format: "%.1f", elapsedMs))"]
+    for (idx, item) in ocrItems.enumerated() {
+        lines.append("@ocr\(idx + 1) canvas-text \"\(item.text)\" (\(item.x),\(item.y)) [\(item.w)x\(item.h)]")
+    }
+    return lines.joined(separator: "\n")
+}
+
 func performWindowOCR(app: TargetApp, fallbackNodes: [NodeRecord] = []) -> [String] {
     _ = CGMainDisplayID()
     var cgImage: CGImage?
@@ -726,25 +960,43 @@ func invokeMenuBar(_ pid: pid_t, path: [String]) -> Bool {
 func settleAndWalkAXTree(
     root: AXUIElement,
     winKey: String,
+    pid: pid_t,
+    cachedNodes: [NodeRecord],
+    cachedElements: [AXUIElement],
     prevCrc: String,
     query: String?,
     shouldSettle: Bool
 ) -> ([NodeRecord], [AXUIElement], String) {
+    let state = EngineState.shared
     if shouldSettle {
-        Thread.sleep(forTimeInterval: 0.008)
+        Thread.sleep(forTimeInterval: 0.015)
     }
     var (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
     var curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
-    if shouldSettle && curCrc == prevCrc {
-        Thread.sleep(forTimeInterval: 0.012)
-        (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
-        curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
+    if shouldSettle {
+        for _ in 0..<4 where curCrc == prevCrc {
+            Thread.sleep(forTimeInterval: 0.025)
+            (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
+            curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
+        }
     }
+    _ = state.consumeDirtyState(pid)
+    state.windowSyncedSeq[winKey] = state.currentPidSeq(pid)
     return (nodes, els, curCrc)
 }
 
 func executeRequest(_ req: BatchRequest) -> String {
     let t0 = DispatchTime.now().uptimeNanoseconds
+    if let imgPath = req.imagePath, !imgPath.isEmpty {
+        return performImageFileOCR(
+            imagePath: imgPath,
+            clipX: req.clipX ?? 0.0,
+            clipY: req.clipY ?? 0.0,
+            clipW: req.clipW ?? 0.0,
+            clipH: req.clipH ?? 0.0
+        )
+    }
+
     let state = EngineState.shared
     state.lock.lock()
     defer { state.lock.unlock() }
@@ -787,26 +1039,63 @@ func executeRequest(_ req: BatchRequest) -> String {
             state.uidToRecord.removeValue(forKey: uid)
         }
         state.latestWindowNodes.removeValue(forKey: winKey)
+        state.latestWindowElements.removeValue(forKey: winKey)
+        state.windowSyncedSeq.removeValue(forKey: winKey)
     }
     state.appPidByKey[winKey] = app.pid
     let hadBaseline = state.windowBaselines[baselineKey] != nil
+    let hasSteps = !(req.steps?.isEmpty ?? true)
 
     var currentNodes: [NodeRecord]
     var currentElements: [AXUIElement]
-    if !pidChanged && !hasQuery,
-       let cachedNodes = state.windowBaselines[baselineKey] ?? state.latestWindowNodes[winKey],
-       !cachedNodes.isEmpty,
-       !(req.steps?.isEmpty ?? true) {
-        currentNodes = cachedNodes
-        currentElements = cachedNodes.compactMap { state.uidToElement[$0.uid] }
-        if currentElements.count != currentNodes.count {
+    if !pidChanged && !hasQuery && (hasSteps || req.diff != false),
+       let cachedNodes = state.latestWindowNodes[winKey] ?? state.windowBaselines[baselineKey],
+       !cachedNodes.isEmpty {
+        let cachedEls = state.latestWindowElements[winKey] ?? cachedNodes.compactMap { state.uidToElement[$0.uid] }
+        if cachedEls.count == cachedNodes.count {
+            if hasSteps {
+                currentNodes = cachedNodes
+                currentElements = cachedEls
+            } else {
+                let curSeq = state.currentPidSeq(app.pid)
+                let syncedSeq = state.windowSyncedSeq[winKey]
+                if !state.isStructurallyDirty(app.pid) && syncedSeq == curSeq {
+                    currentNodes = cachedNodes
+                    currentElements = cachedEls
+                } else {
+                    let dirtyInfo = state.consumeDirtyState(app.pid)
+                    if !dirtyInfo.structural,
+                       let refreshed = refreshDirtyLeavesInPlace(
+                           nodes: cachedNodes,
+                           elements: cachedEls,
+                           dirtyHashes: dirtyInfo.hashes,
+                           refreshValueBearers: true
+                       ) {
+                        currentNodes = refreshed
+                        currentElements = cachedEls
+                        state.windowSyncedSeq[winKey] = dirtyInfo.seq
+                    } else {
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                        _ = state.consumeDirtyState(app.pid)
+                        state.windowSyncedSeq[winKey] = state.currentPidSeq(app.pid)
+                    }
+                }
+            }
+        } else {
             (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+            _ = state.consumeDirtyState(app.pid)
+            state.windowSyncedSeq[winKey] = state.currentPidSeq(app.pid)
         }
     } else {
         (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+        if !hasQuery {
+            _ = state.consumeDirtyState(app.pid)
+            state.windowSyncedSeq[winKey] = state.currentPidSeq(app.pid)
+        }
     }
     if !hasQuery && !currentNodes.isEmpty {
         state.latestWindowNodes[winKey] = currentNodes
+        state.latestWindowElements[winKey] = currentElements
     }
 
     if !hadBaseline && !hasQuery && !currentNodes.isEmpty {
@@ -821,6 +1110,20 @@ func executeRequest(_ req: BatchRequest) -> String {
     var didMutate = false
 
     if let steps = req.steps, !steps.isEmpty {
+        let appElForMain = AXUIElementCreateApplication(app.pid)
+        var prevMainRef: CFTypeRef?
+        let hadPrevMain = AXUIElementCopyAttributeValue(appElForMain, kAXMainWindowAttribute as CFString, &prevMainRef) == .success
+        if axString(root, kAXRoleAttribute) == kAXWindowRole {
+            _ = AXUIElementSetAttributeValue(root, kAXMainAttribute as CFString, kCFBooleanTrue)
+        }
+        defer {
+            if hadPrevMain, let pm = prevMainRef {
+                let pmEl = pm as! AXUIElement
+                if CFHash(pmEl) != CFHash(root) {
+                    _ = AXUIElementSetAttributeValue(pmEl, kAXMainAttribute as CFString, kCFBooleanTrue)
+                }
+            }
+        }
         for (i, step) in steps.enumerated() {
             let op = step.effectiveOp
             if op != "move" && op != "ocr" {
@@ -960,12 +1263,18 @@ func executeRequest(_ req: BatchRequest) -> String {
                 if op == "move" {
                     continue
                 } else if op == "click" {
+                    if targetNode?.role == "textfield" || targetNode?.role == "textarea" {
+                        _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                    }
                     var err = AXUIElementPerformAction(el, kAXPressAction as CFString)
                     if err == .invalidUIElement || err == .cannotComplete {
                         (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
                         if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
                             el = refreshed
                             targetNode = state.uidToRecord[uid]
+                            if targetNode?.role == "textfield" || targetNode?.role == "textarea" {
+                                _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                            }
                             err = AXUIElementPerformAction(el, kAXPressAction as CFString)
                         }
                     }
@@ -983,19 +1292,48 @@ func executeRequest(_ req: BatchRequest) -> String {
                         stepErrors.append("step \(i+1): AXPress failed (\(err.rawValue))")
                     }
                 } else {
-                    let val = (step.value ?? "") as CFTypeRef
-                    _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                    var err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
-                    if err == .invalidUIElement || err == .cannotComplete {
-                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
-                        if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
-                            el = refreshed
-                            _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                            err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                    let textStr = step.value ?? ""
+                    let val = textStr as CFTypeRef
+                    let isTextarea = (targetNode?.role == "textarea")
+                    var didStick = false
+                    if !isTextarea {
+                        _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                        var err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                        if err == .invalidUIElement || err == .cannotComplete {
+                            (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                            if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
+                                el = refreshed
+                                _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                                err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                            }
                         }
+                        didStick = (err == .success) && (textStr.isEmpty || !axString(el, kAXValueAttribute).isEmpty)
                     }
-                    if err != .success {
-                        postBatchedUnicodeTextToPid(app.pid, text: step.value ?? "")
+                    if !didStick {
+                        _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                        _ = AXUIElementPerformAction(el, kAXPressAction as CFString)
+                        Thread.sleep(forTimeInterval: 0.025)
+                        _ = invokeMenuBar(app.pid, path: ["Edit", "Select All"])
+                        Thread.sleep(forTimeInterval: 0.015)
+                        if textStr.isEmpty {
+                            if !invokeMenuBar(app.pid, path: ["Edit", "Delete"]) {
+                                postKeyChordToPid(app.pid, chord: "backspace")
+                            }
+                        } else {
+                            let pb = NSPasteboard.general
+                            let oldStr = pb.string(forType: .string)
+                            pb.clearContents()
+                            pb.setString(textStr, forType: .string)
+                            if invokeMenuBar(app.pid, path: ["Edit", "Paste"]) {
+                                Thread.sleep(forTimeInterval: 0.050)
+                            } else {
+                                postBatchedUnicodeTextToPid(app.pid, text: textStr)
+                            }
+                            if let prev = oldStr {
+                                pb.clearContents()
+                                pb.setString(prev, forType: .string)
+                            }
+                        }
                     }
                 }
             default:
@@ -1009,6 +1347,9 @@ func executeRequest(_ req: BatchRequest) -> String {
         let settled = settleAndWalkAXTree(
             root: root,
             winKey: winKey,
+            pid: app.pid,
+            cachedNodes: currentNodes,
+            cachedElements: currentElements,
             prevCrc: prevCrc,
             query: req.query,
             shouldSettle: req.settle ?? true
@@ -1018,6 +1359,7 @@ func executeRequest(_ req: BatchRequest) -> String {
         newCrc = settled.2
         if !hasQuery && !currentNodes.isEmpty {
             state.latestWindowNodes[winKey] = currentNodes
+            state.latestWindowElements[winKey] = currentElements
         }
     } else {
         newCrc = crc32(currentNodes.map { $0.compactLine }.joined(separator: "\n"))
@@ -1048,7 +1390,7 @@ func executeRequest(_ req: BatchRequest) -> String {
     if (agentId != "default" || hasMoveStep), let cur = state.agentCursors[agentId] {
         header += " cursor=\(cur.uid)@(\(cur.x),\(cur.y))"
     }
-    header += " els=\(currentNodes.count) crc=\(newCrc) ms=\(String(format: "%.1f", elapsedMs))"
+    header += " els=\(currentNodes.count) crc=\(newCrc) obs=\(state.currentPidSeq(app.pid)) ms=\(String(format: "%.1f", elapsedMs))"
     if isFirstDoc || (req.showDocs == true) {
         header += "\n# api: click(uid|name), set(uid|name,value), move(uid|name), type(value), key(chord), menu([path]), ocr()"
     }

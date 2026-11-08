@@ -52,7 +52,7 @@
             </div>
             <div class="spec-cell">
               <dt class="spec-label">25-op parallel multi-cursor swarm across Web + Mac</dt>
-              <dd class="spec-val">256 ms / 3 agents</dd>
+              <dd class="spec-val">1,510 tok / 326 ms</dd>
             </div>
           </dl>
 
@@ -77,6 +77,7 @@
             <button type="button" class="trace-tab" role="tab" aria-selected="true" data-trace="swarm">Workload D: 3-Cursor Swarm</button>
             <button type="button" class="trace-tab" role="tab" aria-selected="false" data-trace="saas">Workload A: SaaS + WebMCP</button>
             <button type="button" class="trace-tab" role="tab" aria-selected="false" data-trace="macos">Workload B: macOS AX + OCR</button>
+            <button type="button" class="trace-tab" role="tab" aria-selected="false" data-trace="field">Live Chrome: Rich-Text &amp; Upload</button>
           </div>
           <div class="workbench-body">
             <div class="cursor-telemetry" id="trace-cursors" aria-live="polite"></div>
@@ -161,10 +162,10 @@
           <article class="arch-col">
             <h3>Tier 1: Browser Engine, Extension WS Bridge &amp; Canvas OCR</h3>
             <ul>
-              <li><strong>Outbound MV3 Extension WebSocket Bridge + Headless Fallback:</strong> <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/extension/background.js"><code>extension/background.js</code></a> connects outward to <code>ws://127.0.0.1:19222/ext</code> to drive live logged-in Chrome <code>"🤖 Agent"</code> tab groups (<code>active: false</code>) with <strong>zero Chrome 144 <code>DevToolsActivePort</code> modal popups</strong>, falling back seamlessly to a background Playwright worker with CDP Focus Emulation.</li>
+              <li><strong>Outbound MV3 Extension WebSocket Bridge + Headless Worker:</strong> <a href="https://github.com/lifan-builds/faster-mac-use/blob/main/extension/background.js"><code>extension/background.js</code></a> connects outward to <code>ws://127.0.0.1:19222/ext</code> (single-daemon owner via <code>/tmp/fmu-runtime.sock</code>, inspectable via <code>cua.getBridgeStatus()</code>) to drive live logged-in Chrome <code>"🤖 Agent"</code> tab groups (<code>active: false</code>, with <code>window</code> / <code>windowId</code> / <code>reuseExisting</code> targeting) with <strong>zero Chrome 144 <code>DevToolsActivePort</code> modal popups</strong>, paired with a background Playwright worker with CDP Focus Emulation.</li>
               <li><strong>Pre-Registered Table Folding:</strong> Assigns persistent <code>WeakMap</code> <code>@u1..@uN</code> UIDs and folds dense <code>&lt;tbody&gt;</code> rows beyond the first 6 while indexing all rows in <code>uidToRef</code>, cutting initial snapshots from 1,520 to 810 tokens while keeping folded rows clickable by label or UID.</li>
               <li><strong>Native &amp; Virtual WebMCP Macros (<code>~/.fmu/macros/</code>):</strong> Auto-detects <code>navigator.modelContext</code> tools and lets agents synthesize multi-step trajectories into reusable 1-turn Virtual WebMCP tools (<code>tab.saveMacro</code> &rarr; <code>tab.callTool</code>).</li>
-              <li><strong>0-Token <code>&lt;canvas&gt;</code> Semantic OCR &amp; File Uploads:</strong> Clips HTML5 <code>&lt;canvas&gt;</code> / WebGL elements into Apple Silicon <code>VNRecognizeTextRequest</code> to inject clickable <code>@ocr1..@ocrN</code> targets with 0 VLM tokens, and intercepts <code>&lt;input type="file"&gt;</code> via <code>DOM.setFileInputFiles</code>.</li>
+              <li><strong>Rich-Text DOM Engine, 0-Token <code>&lt;canvas&gt;</code> OCR &amp; File Uploads:</strong> Deterministically replaces or appends (<code>append: true</code>) multi-block <code>contenteditable</code> / Draft.js / ProseMirror editors in &lt;50 ms without touching the OS clipboard, clips <code>&lt;canvas&gt;</code> into Apple Silicon <code>VNRecognizeTextRequest</code> (<code>@ocr1..@ocrN</code>), and injects files via <code>DOM.setFileInputFiles</code> without opening <code>NSOpenPanel</code>.</li>
             </ul>
           </article>
 
@@ -173,7 +174,7 @@
             <ul>
               <li><strong>Persistent Unix Socket Daemon (<code>/tmp/fmu-ax.sock</code>):</strong> Universal2 Swift binary (<a href="https://github.com/lifan-builds/faster-mac-use/blob/main/src/native/fmu_ax.swift"><code>fmu_ax.swift</code></a>) maintains a 4,000-element <code>AXUIElement</code> LRU cache, PID/window cache, and per-agent diff baselines across turns.</li>
               <li><strong>Push-Based <code>AXObserver</code> Dirty-Subtree Tracking:</strong> Subscribes to <code>kAXValueChangedNotification</code>, <code>kAXCreatedNotification</code>, and <code>kAXUIElementDestroyedNotification</code> on a dedicated <code>CFRunLoop</code> thread so Turn 2+ unchanged or leaf-dirty diffs return in <strong>&lt; 1 ms</strong>.</li>
-              <li><strong>Batched AX Reads &amp; Zero-Focus Actions:</strong> Fetches attributes with <code>AXUIElementCopyMultipleAttributeValues</code>, lazily wakes background Electron AX trees (<code>AXManualAccessibility = true</code>), and executes <code>AXPress</code> &rarr; <code>CGEvent.postToPid</code> fallback without raising windows.</li>
+              <li><strong>Non-Destructive Hygiene &amp; Multi-Window Guards:</strong> Fetches attributes with <code>AXUIElementCopyMultipleAttributeValues</code>, never overwrites <code>NSPasteboard.general</code> on <code>op: "set"</code> (verifying <code>AXTextArea</code> read-back and detecting <code>NSOpenPanel</code> TCC-disabled <code>Open</code> buttons), and guards <code>CGEvent.postToPid</code> key routing on non-main windows.</li>
               <li><strong>0-Token Apple Silicon Window OCR:</strong> Built-in <code>CGWindowListCreateImage</code> + <code>VNRecognizeTextRequest</code> fallback (<code>await app.ocr()</code>) reads GPU/canvas windows in &lt;70 ms with zero LLM vision tokens.</li>
             </ul>
           </article>
@@ -181,7 +182,7 @@
           <article class="arch-col">
             <h3>Tier 3: Multi-Cursor REPL &amp; Context Guard</h3>
             <ul>
-              <li><strong>268-Token Single-Tool Schema:</strong> Supports OpenAI Codex-style stateful <code>cua_repl</code> scripts (<code>cua.createBrowserTab</code>, <code>cua.getApp</code>, <code>cua.saveMacro</code>, <code>cua.getCursors</code>), 1-trip declarative <code>steps</code> batches, and concurrent <code>{"parallel": [...]}</code> swarms.</li>
+              <li><strong>268-Token Single-Tool Schema &amp; Strict Step Validation:</strong> Supports OpenAI Codex-style stateful <code>cua_repl</code> scripts (<code>cua.createBrowserTab</code>, <code>cua.getApp</code>, <code>cua.getBridgeStatus</code>, <code>cua.saveMacro</code>, <code>cua.getCursors</code>), 1-trip declarative <code>steps</code> batches (normalizing <code>op</code>/<code>action</code>, <code>uid</code>/<code>target</code>, and <code>value</code>/<code>text</code> with explicit missing-<code>op</code> errors), and concurrent <code>{"parallel": [...]}</code> swarms.</li>
               <li><strong>Per-Agent Virtual Cursors:</strong> Each agent ID (<code>agent-1</code>, <code>agent-2</code>, ...) gets an isolated <code>AgentSession</code>, independent DOM/AX diff baseline, and independent virtual cursor coordinates (<code>tab.moveCursor</code> / <code>app.moveCursor</code>).</li>
               <li><strong>Stale-Observation Masking:</strong> <code>ContextWindowTracker</code> replaces superseded full snapshots from earlier turns with 18-token tombstones, keeping 30-step peak context at 1,597 tokens.</li>
               <li><strong>50Hz Intrusion Guard:</strong> Polls CoreGraphics (<code>CGEventGetLocation</code> + <code>CGEventSourceSecondsSinceLastEventType</code>) and <code>lsappinfo front</code> to prove <code>0.0 px</code> physical cursor movement.</li>
@@ -208,11 +209,12 @@
           </div>
 
           <div class="panel-box">
-            <h3>Material Limitations &amp; Scope Boundaries</h3>
+            <h3>Material Limitations &amp; Field-Tested Guardrails</h3>
             <ul>
               <li><strong>macOS-first native tier:</strong> The compiled Swift accessibility and Vision OCR daemon (<code>src/native/fmu_ax.swift</code>) requires macOS (Apple Silicon / macOS 14+ recommended) with Accessibility permission granted to your terminal or host IDE.</li>
-              <li><strong>Chrome Tab Group extension boundary:</strong> Driving color-coded <code>"🤖 Agent"</code> tab groups inside your primary logged-in Chrome window uses the included MV3 extension's outbound WebSocket bridge (<a href="https://github.com/lifan-builds/faster-mac-use/tree/main/extension"><code>extension/</code></a> &rarr; <code>ws://127.0.0.1:19222/ext</code>) because <code>chrome.tabGroups</code> is an extension-only API and Chrome 144+ prompts on raw <code>DevToolsActivePort</code> connections. Without the extension loaded, <code>fmu</code> runs out-of-the-box in an isolated background Chromium worker with CDP Focus Emulation and zero popups.</li>
-              <li><strong>Minimized window OCR:</strong> While <code>AXUIElement</code> reads and <code>AXPress</code> actions work on minimized and off-Space windows, macOS unloads pixel backing stores for windows minimized to the Dock, so <code>app.ocr()</code> requires the window to be unminimized (it can remain completely occluded behind other windows).</li>
+              <li><strong>Single-daemon <code>:19222</code> bridge &amp; explicit MV3 bridge diagnostics:</strong> Driving color-coded <code>"🤖 Agent"</code> tab groups inside your primary logged-in Chrome window uses the MV3 extension's outbound WebSocket bridge (<a href="https://github.com/lifan-builds/faster-mac-use/tree/main/extension"><code>extension/</code></a> &rarr; <code>ws://127.0.0.1:19222/ext</code>, owned exclusively by <code>/tmp/fmu-runtime.sock</code> and inspectable via <code>cua.getBridgeStatus()</code>). When <code>mode: "extension"</code> (or <code>"live"</code> / <code>requireExtension: true</code>) is requested without the extension connected, <code>fmu</code> fails fast with a clear setup diagnostic; when default <code>mode: "chrome"</code> targets an external URL while disconnected, <code>fmu</code> tags the header <code>bridge="headless-fallback"</code> and emits an explicit <code>! warning:</code>; in <code>mode: "headless"</code> or on local dev URLs, it runs out-of-the-box in an isolated background Chromium worker with CDP Focus Emulation.</li>
+              <li><strong>Web rich-text editors (<code>contenteditable</code> / Draft.js / ProseMirror) &amp; <code>NSOpenPanel</code> TCC:</strong> On sites like X and RedNote, macOS Accessibility exposes multi-block <code>contenteditable</code> editors as a single <code>AXTextArea</code> whose <code>kAXValueAttribute</code> does not fire DOM <code>beforeinput</code> state updates, and clicking web upload buttons via AX opens macOS <code>NSOpenPanel</code> where AppKit/TCC locks the <code>Open</code> button. Always drive web rich-text editors (supporting deterministic replace and <code>append: true</code>) and file uploads through the Browser DOM tier (<code>surface: "web"</code> / CDP <code>DOM.setFileInputFiles</code>); <code>fmu-ax</code> never overwrites <code>NSPasteboard.general</code> and surfaces explicit <code>! errors:</code> diagnostics when <code>AXTextArea</code> read-back or <code>NSOpenPanel</code> TCC blocks synthetic AX actions.</li>
+              <li><strong>Multi-window background key routing &amp; minimized window OCR:</strong> While <code>AXUIElement</code> reads and <code>AXPress</code> actions work on any background or minimized window (and <code>cua.createBrowserTab</code> supports <code>window</code> / <code>windowId</code> / <code>reuseExisting</code> Chrome window routing), macOS routes <code>CGEvent.postToPid</code> keystrokes to an app's <code>AXMainWindow</code> and unloads pixel backing stores for Dock-minimized windows. <code>fmu-ax</code> guards non-main-window key routing, and <code>app.ocr()</code> requires the target window to be unminimized (it can remain completely occluded behind other windows).</li>
             </ul>
           </div>
         </div>
@@ -333,6 +335,32 @@ let ocr = await app.ocr();
 // -> Vision.framework extracts text + boxes in <70 ms`,
         metrics: "Workload B: 2 turns, 1,264 cum. tokens, 395 ms engine (<1ms diff)",
         saving: "38× fewer tokens & 32× faster than open-computer-use MCP"
+      },
+      field: {
+        guard: "50Hz Guard: PASS (Clipboard intact, 0 NSOpenPanel popups)",
+        cursors: [
+          { agent: "Extension WS Bridge", pos: "ws://127.0.0.1:19222/ext (single-daemon owner)" },
+          { agent: "Rich-Text Composer", pos: "DOM Selection + insertText (replace & append)" },
+          { agent: "Zero-Dialog Media Upload", pos: "CDP DOM.setFileInputFiles (bypasses NSOpenPanel)" },
+          { agent: "Clipboard & Window Guard", pos: "NSPasteboard untouched · Multi-window isolated" }
+        ],
+        code: `// Live Logged-In Chrome ("🤖 Agent" group) while user watches video
+let tab = await cua.createBrowserTab({
+  mode: "extension", url: "https://x.com/compose/post",
+  window: "X / Twitter", reuseExisting: true
+});
+
+// 1. Deterministic <50ms rich-text replace & append on Draft.js / ProseMirror
+//    (avoids macOS AXTextArea kAXValue truncation & preserves clipboard)
+await tab.fill("What's happening?",
+  "faster-mac-use: 0.0 px drift & 114x fewer tokens.");
+await tab.fill("What's happening?", " #fmu", true); // append=true
+
+// 2. Direct CDP file injection via DOM.setFileInputFiles
+//    (never opens macOS NSOpenPanel where TCC locks 'Open' button)
+await tab.upload("@u1", ["docs/assets/swarm-vs-mcp-demo.png"]);`,
+        metrics: "Field-Verified: <50 ms DOM rich-text + upload in background Chrome",
+        saving: "Zero Chrome 144 popups · Zero NSPasteboard overwrite · Zero focus steal"
       }
     };
 

@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+
+os.environ.setdefault("FMU_RUNTIME_SOCK", "/tmp/fmu-test-suite.sock")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -531,13 +534,15 @@ class TestFasterMacUse(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
             (tmp_root / "src" / "native").mkdir(parents=True)
+            (tmp_root / "src" / "fmu" / "native").mkdir(parents=True)
             (tmp_root / "src" / "native" / "fmu_ax.swift").write_text("import Foundation\n")
             with (
                 patch.object(mac_engine, "ROOT", tmp_root),
+                patch.object(mac_engine, "PKG_DIR", tmp_root / "src" / "fmu"),
                 patch.object(mac_engine.subprocess, "run", side_effect=FileNotFoundError("swiftc")),
             ):
                 with self.assertRaises(RuntimeError) as ctx:
-                    mac_engine._resolve_ax_binary()
+                    mac_engine._resolve_ax_binary(root_dir=tmp_root)
                 self.assertIn("xcode-select --install", str(ctx.exception))
 
     def test_16_virtual_webmcp_macros_save_autoload_and_replay(self) -> None:
@@ -837,8 +842,9 @@ class TestFasterMacUse(unittest.TestCase):
         from fmu import mac_engine
 
         self.assertTrue(
-            (mac_engine.PKG_DIR / "native" / "fmu_ax.swift").is_file(),
-            "Bundled src/fmu/native/fmu_ax.swift must exist for site-packages / uvx installs",
+            (mac_engine.PKG_DIR / "native" / "fmu_ax.swift").is_file()
+            or (mac_engine.ROOT / "src" / "native" / "fmu_ax.swift").is_file(),
+            "Bundled fmu_ax.swift must exist",
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_site_root = Path(tmpdir) / "site_root"
@@ -851,9 +857,321 @@ class TestFasterMacUse(unittest.TestCase):
             self.assertEqual(resolved, fake_cache / "fmu-ax")
             self.assertTrue(resolved.is_file())
 
+    def test_21_rich_text_contenteditable_draftjs_prosemirror_replace_and_append(self) -> None:
+        import tempfile
+
+        editor_url = f"{self.server.base_url}/editor"
+        self.rt.execute({"reset": True})
+
+        snap = self.rt.execute({"surface": "web", "url": editor_url, "session": "t1"})
+        self.assertIn('textbox "What\'s happening?"', snap)
+        self.assertIn('textbox "输入正文描述，真诚有价值的分享予人温暖"', snap)
+
+        # Turn 1: Fill both Draft.js (with beforeinput listener that removes placeholder) and ProseMirror editors
+        turn1 = self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {"op": "fill", "target": "What's happening?", "value": "Draft v1 initial"},
+                    {"op": "fill", "target": "填写标题", "value": "RedNote Title v1"},
+                    {"op": "fill", "target": "输入正文描述", "value": "ProseMirror body v1"},
+                    {"op": "eval", "code": "Boolean(document.getElementById('x-placeholder'))"},
+                ],
+            }
+        )
+        self.assertNotIn("! errors:", turn1)
+        self.assertIn('val="Draft v1 initial"', turn1)
+        self.assertNotIn("Draft v1 initialDraft v1 initial", turn1)
+        self.assertIn('val="ProseMirror body v1"', turn1)
+        self.assertIn("> false", turn1)
+
+        # Turn 2: Fill again with multi-paragraph text using the same stable label (even after placeholder unmount)
+        turn2 = self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {"op": "fill", "target": "What's happening?", "value": "Draft v2 line 1\nDraft v2 line 2"},
+                    {"op": "fill", "target": "输入正文描述", "value": "ProseMirror line 1\nProseMirror line 2"},
+                    {"op": "eval", "code": "document.querySelectorAll('#x-composer [data-block=\"true\"]').length"},
+                ],
+            }
+        )
+        self.assertNotIn("! errors:", turn2)
+        self.assertIn('textbox "What\'s happening?"', turn2)
+        self.assertIn('-> val="Draft v2 line 1 Draft v2 line 2"', turn2)
+        self.assertNotIn("Draft v1 initialDraft v2", turn2)
+        self.assertIn('-> val="ProseMirror line 1 ProseMirror line 2"', turn2)
+        self.assertNotIn("ProseMirror body v1ProseMirror", turn2)
+        self.assertIn("> 2", turn2)
+
+        # Turn 3: Explicit append=True + upload via sibling button of hidden <input type="file"> + publish
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_file = Path(tmpdir) / "demo_clip.mp4"
+            media_file.write_bytes(b"fake-mp4-payload")
+            turn3 = self.rt.execute(
+                {
+                    "surface": "web",
+                    "session": "t1",
+                    "steps": [
+                        {"op": "fill", "target": "What's happening?", "value": " #fmu", "append": True},
+                        {"op": "upload", "target": "Add photos or video", "files": [str(media_file)]},
+                        {"op": "click", "target": "Publish Post"},
+                        {"op": "eval", "code": "document.getElementById('publish-status').textContent"},
+                    ],
+                }
+            )
+        self.assertNotIn("! errors:", turn3)
+        self.assertIn(
+            'PUBLISHED x="Draft v2 line 1 | Draft v2 line 2 #fmu" title="RedNote Title v1" '
+            'body="ProseMirror line 1 | ProseMirror line 2" media="MEDIA:demo_clip.mp4"',
+            turn3,
+        )
+
+    def test_22_extension_connection_diagnostics_multi_window_and_file_upload(self) -> None:
+        import subprocess
+
+        self.rt.execute({"reset": True})
+
+        # 1. Bridge status when disconnected
+        st_disc = self.rt.execute({"bridgeStatus": True})
+        self.assertIn("# fmu-web bridge connected=false", st_disc)
+        self.assertIn("preferredPort=19222", st_disc)
+
+        # 2. Default mode="chrome" on external URL (or surface="browser") fails fast instead of silent headless fallback
+        with self.assertRaises(RuntimeError) as ctx_ext_url:
+            self.rt.execute(
+                {
+                    "surface": "browser",
+                    "url": "https://x.com/home",
+                }
+            )
+        self.assertIn("MV3 extension not connected on ws://127.0.0.1:", str(ctx_ext_url.exception))
+        self.assertIn("extension in Chrome or pass mode='headless'", str(ctx_ext_url.exception))
+
+        # 3. Explicit mode="extension" on localhost also fails fast when disconnected
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rt.execute(
+                {
+                    "surface": "web",
+                    "mode": "extension",
+                    "url": f"{self.server.base_url}/pricing",
+                }
+            )
+        self.assertIn("MV3 extension not connected on ws://127.0.0.1:", str(ctx.exception))
+
+        # 4. Run real extension/background.js in Node against ExtensionWebSocketBridge to verify multi-window & upload
+        port = self.rt.browser.bridge_port
+        bg_js_path = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        bg_js_patched = bg_js_path.replace("ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{port}/ext")
+
+        node_harness = f"""
+const state = {{
+  createdTabs: [],
+  updatedTabs: [],
+  groupCalls: [],
+  groupUpdates: [],
+  setFileCalls: [],
+  tabs: [
+    {{ id: 101, windowId: 100, groupId: 10, title: "Bilibili Video", url: "https://www.bilibili.com/video/1", status: "complete", active: true }},
+    {{ id: 201, windowId: 200, groupId: -1, title: "Home / X", url: "https://x.com/home", status: "complete", active: true }},
+  ],
+  groups: [
+    {{ id: 10, windowId: 100, title: "🤖 Agent", color: "blue", collapsed: false }},
+  ],
+  windows: [
+    {{ id: 100, focused: true, type: "normal" }},
+    {{ id: 200, focused: false, type: "normal" }},
+  ],
+}};
+
+globalThis.chrome = {{
+  tabs: {{
+    query: async (q) => {{
+      return state.tabs.filter(t => {{
+        if (q.windowId !== undefined && t.windowId !== q.windowId) return false;
+        if (q.groupId !== undefined && t.groupId !== q.groupId) return false;
+        return true;
+      }});
+    }},
+    get: async (tabId) => state.tabs.find(t => t.id === tabId) || {{ id: tabId, windowId: 200, status: "complete", url: "https://x.com/compose/post" }},
+    create: async (opts) => {{
+      const newTab = {{
+        id: 888,
+        windowId: opts.windowId || 100,
+        groupId: -1,
+        title: "Compose / X",
+        url: opts.url || "about:blank",
+        pendingUrl: undefined,
+        status: "complete",
+        active: Boolean(opts.active),
+      }};
+      state.createdTabs.push(opts);
+      state.tabs.push(newTab);
+      return newTab;
+    }},
+    update: async (tabId, opts) => {{
+      state.updatedTabs.push({{ tabId, opts }});
+      const t = state.tabs.find(x => x.id === tabId);
+      if (t && opts.url) t.url = opts.url;
+      return t || {{ id: tabId, windowId: 200, status: "complete", url: opts.url }};
+    }},
+    group: async (opts) => {{
+      state.groupCalls.push(opts);
+      if (opts.groupId) return opts.groupId;
+      const winId = (opts.createProperties && opts.createProperties.windowId) || 200;
+      const newGid = 55;
+      state.groups.push({{ id: newGid, windowId: winId, title: "", color: "blue", collapsed: false }});
+      return newGid;
+    }},
+    onRemoved: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{
+    query: async (q) => state.groups.filter(g => (q.title === undefined || g.title === q.title) && (q.windowId === undefined || g.windowId === q.windowId)),
+    update: async (gid, opts) => {{ state.groupUpdates.push({{ gid, opts }}); return {{ id: gid, ...opts }}; }},
+  }},
+  windows: {{
+    getAll: async () => state.windows,
+  }},
+  debugger: {{
+    attach: async () => {{
+      // Simulate MV3 service worker waking up when debugger is already attached
+      throw new Error("Another debugger is already attached to the tab with id: 888");
+    }},
+    sendCommand: async (target, method, params) => {{
+      if (method === "DOM.getDocument") return {{ root: {{ nodeId: 1 }} }};
+      if (method === "DOM.querySelector") return {{ nodeId: 42 }};
+      if (method === "DOM.setFileInputFiles") {{
+        state.setFileCalls.push({{ tabId: target.tabId, files: params.files, nodeId: params.nodeId }});
+        return {{}};
+      }}
+      if (method === "Runtime.evaluate") {{
+        const expr = params.expression || "";
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const hasUpload = expr.includes("demo_video.mp4") || expr.includes('"upload"');
+          return {{
+            result: {{
+              value: {{
+                url: "https://x.com/compose/post",
+                title: "Compose / X",
+                crc: hasUpload ? "55667788" : "11223344",
+                seq: hasUpload ? 2 : 1,
+                count: 2,
+                cursor: {{ agent: "default", x: 80, y: 40, uid: "@u1", label: "Add photos or video", op: "click" }},
+                webMcpTools: [],
+                canvases: [],
+                errors: [],
+                evalOutputs: expr.includes("__fmuState") ? [JSON.stringify(state)] : [],
+                escalations: hasUpload ? [{{ reason: "file_input", uid: "@u1", step: 1 }}] : [],
+                lines: ['@u1 file "Add photos or video"', '@u2 textbox "What\\'s happening?"'],
+              }}
+            }}
+          }};
+        }}
+        if (expr.includes("collectSnapshot('', 180, true).canvases")) {{
+          return {{ result: {{ value: [] }} }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{
+    create: () => {{}},
+    onAlarm: {{ addListener: () => {{}} }},
+  }},
+  runtime: {{
+    onInstalled: {{ addListener: () => {{}} }},
+    onStartup: {{ addListener: () => {{}} }},
+  }},
+}};
+
+{bg_js_patched}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(
+            ["node", "-e", node_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(self.rt.browser.ensure_bridge().wait_connected(timeout=3.0))
+            st_conn = self.rt.execute({"code": "return await cua.getBridgeStatus();"})
+            self.assertIn("connected=true", st_conn)
+
+            # Open tab in Window 2 (matching "Home / X") with reuseExisting=false:
+            # Must create a new tab in Window 2 (windowId=200), NOT overwrite tab 201, and NOT group into Window 1 (groupId=10)!
+            ext_res = self.rt.execute(
+                {
+                    "code": (
+                        'let xtab = await cua.createBrowserTab({mode: "chrome", url: "https://x.com/compose/post", window: "Home / X", reuseExisting: false}); '
+                        'await xtab.upload("@u1", "/tmp/demo_video.mp4"); '
+                        'await xtab.evaluate("__fmuState");'
+                    )
+                }
+            )
+            self.assertIn('bridge="mv3"', ext_res)
+            self.assertIn("window=200", ext_res)
+            state_lines = [l for l in ext_res.splitlines() if l.startswith("> {")]
+            self.assertTrue(state_lines, f"Missing eval state in output: {ext_res}")
+            ext_state = json.loads(state_lines[0][len("> "):])
+            self.assertEqual(len(ext_state["createdTabs"]), 1)
+            self.assertEqual(ext_state["createdTabs"][0]["windowId"], 200)
+            self.assertEqual(ext_state["createdTabs"][0]["active"], False)
+            self.assertEqual(len(ext_state["updatedTabs"]), 0)
+            self.assertEqual(ext_state["groupCalls"][0]["tabIds"], [888])
+            self.assertEqual(ext_state["groupCalls"][0]["createProperties"]["windowId"], 200)
+            self.assertEqual(len(ext_state["setFileCalls"]), 1)
+            self.assertEqual(ext_state["setFileCalls"][0]["files"], ["/tmp/demo_video.mp4"])
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+
+    def test_23_web_steps_schema_validation_and_aliases(self) -> None:
+        editor_url = f"{self.server.base_url}/editor"
+        self.rt.execute({"reset": True})
+        self.rt.execute({"surface": "web", "url": editor_url, "session": "t1"})
+
+        # 1. Missing op / unsupported op / missing target return explicit step errors instead of silent no-ops
+        bad_steps_out = self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {"target": "Publish Post"},
+                    {"op": "teleport", "target": "Publish Post"},
+                    {"op": "click"},
+                ],
+            }
+        )
+        self.assertIn("step 1: missing 'op'", bad_steps_out)
+        self.assertIn("step 2: unsupported op 'teleport'", bad_steps_out)
+        self.assertIn("step 3 (click): missing target", bad_steps_out)
+
+        # 2. Aliases action="type", target="...", text="..." work seamlessly
+        alias_out = self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {"action": "type", "target": "填写标题", "text": "Schema Alias Title"},
+                    {"action": "click", "target": "Publish Post"},
+                ],
+            }
+        )
+        self.assertNotIn("! errors:", alias_out)
+        self.assertIn('title="Schema Alias Title"', alias_out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 

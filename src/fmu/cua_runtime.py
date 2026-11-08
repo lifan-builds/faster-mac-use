@@ -3,6 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -21,7 +22,7 @@ try:
 except Exception:
     _ENC = None
 
-DEFAULT_RUNTIME_SOCK = "/tmp/fmu-runtime.sock"
+DEFAULT_RUNTIME_SOCK = os.environ.get("FMU_RUNTIME_SOCK", "/tmp/fmu-runtime.sock")
 
 
 def estimate_tokens(text: str) -> int:
@@ -206,24 +207,39 @@ class TabHandle:
         mode: str = "chrome",
         session_name: str = "🤖 Agent",
         agent_id: str = "default",
+        window: str | None = None,
+        window_id: int | None = None,
+        reuse_existing: bool = False,
+        require_extension: bool = False,
     ) -> None:
         self.runtime = runtime
         self.tab_id = tab_id
         self.mode = mode
         self.session_name = session_name
         self.agent_id = agent_id
+        self.window = window
+        self.window_id = window_id
+        self.reuse_existing = reuse_existing
+        self.require_extension = require_extension
         self._pending_steps: list[dict[str, Any]] = []
         self._pending_macros: list[dict[str, Any]] = []
         self._force_ocr: bool = False
-        self.initial_state = self.runtime.browser.execute_batch(
-            {
-                "agent": agent_id,
-                "session": tab_id,
-                "url": url,
-                "mode": mode,
-                "sessionName": session_name,
-            }
-        )
+        init_req: dict[str, Any] = {
+            "agent": agent_id,
+            "session": tab_id,
+            "url": url,
+            "mode": mode,
+            "sessionName": session_name,
+        }
+        if window:
+            init_req["window"] = window
+        if window_id is not None:
+            init_req["windowId"] = window_id
+        if reuse_existing:
+            init_req["reuseExisting"] = True
+        if require_extension:
+            init_req["requireExtension"] = True
+        self.initial_state = self.runtime.browser.execute_batch(init_req)
         self._fresh = True
 
     def has_pending(self) -> bool:
@@ -252,10 +268,15 @@ class TabHandle:
     move = moveCursor
     hover = moveCursor
 
-    def fill(self, target: str, value: str) -> TabHandle:
+    def fill(self, target: str, value: str, append: bool = False) -> TabHandle:
         self._fresh = False
-        self._pending_steps.append({"op": "fill", "uid": str(target), "value": str(value)})
+        step: dict[str, Any] = {"op": "fill", "uid": str(target), "value": str(value)}
+        if append:
+            step["append"] = True
+        self._pending_steps.append(step)
         return self
+
+    set = fill
 
     def select(self, target: str, value: str) -> TabHandle:
         self._fresh = False
@@ -271,6 +292,8 @@ class TabHandle:
         self._fresh = False
         self._pending_steps.append({"op": "eval", "code": str(code)})
         return self
+
+    evaluate = eval
 
     def callTool(self, name: str, args: dict[str, Any] | None = None) -> TabHandle:
         self._fresh = False
@@ -344,6 +367,12 @@ class TabHandle:
             "sessionName": self.session_name,
             "diff": diff,
         }
+        if self.window:
+            payload["window"] = self.window
+        if self.window_id is not None:
+            payload["windowId"] = self.window_id
+        if self.require_extension:
+            payload["requireExtension"] = True
         if self._force_ocr:
             payload["ocr"] = True
             self._force_ocr = False
@@ -406,12 +435,16 @@ class CuaNamespace:
                 self._tab_seq += 1
             tab_id = f"{prefix}t{self._tab_seq}"
             self._tab_seq += 1
-        if b_id == "extension":
+        if b_id in ("extension", "chrome-extension", "live"):
             mode = "extension"
         elif b_id == "chrome":
             mode = "chrome"
         else:
             mode = "headless"
+        win_filter = str(opts["window"]) if opts.get("window") else None
+        win_id = int(opts["windowId"]) if opts.get("windowId") is not None else None
+        reuse_existing = bool(opts.get("reuseExisting"))
+        require_ext = bool(opts.get("requireExtension")) or mode == "extension"
         h = TabHandle(
             self.runtime,
             tab_id=tab_id,
@@ -419,6 +452,10 @@ class CuaNamespace:
             mode=mode,
             session_name=session_name,
             agent_id=self.agent_id,
+            window=win_filter,
+            window_id=win_id,
+            reuse_existing=reuse_existing,
+            require_extension=require_ext,
         )
         self.handles[tab_id] = h
         return h
@@ -430,10 +467,17 @@ class CuaNamespace:
             tid = criteria.get("tabId") or criteria.get("session")
             if tid and tid in self.handles:
                 return self.handles[tid]
+            if any(k in criteria for k in ("url", "window", "windowId", "reuseExisting", "mode")):
+                opts = dict(criteria)
+                opts.setdefault("reuseExisting", True)
+                return self.createBrowserTab(opts)
         for h in self.handles.values():
             if isinstance(h, TabHandle):
                 return h
         return self.createBrowserTab("chrome", "about:blank")
+
+    def getBridgeStatus(self) -> str:
+        return self.runtime.browser.execute_batch({"bridgeStatus": True})
 
     def getApp(self, identifier: str, window: str | None = None) -> AppHandle:
         key = f"app:{identifier}:{window or ''}"
@@ -510,6 +554,7 @@ class FasterMacUseRuntime:
         from concurrent.futures import ThreadPoolExecutor
         import threading
 
+        self._is_mcp_stdio = len(sys.argv) >= 2 and sys.argv[1] in ("mcp", "--mcp")
         self._threading = threading
         self._global_lock = threading.RLock()
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="fmu-agent")
@@ -699,8 +744,14 @@ class FasterMacUseRuntime:
         return "\n".join(parts)
 
     def execute(self, req: dict[str, Any]) -> str:
+        if getattr(self, "_is_mcp_stdio", False):
+            return execute_via_daemon(req, Path(__file__).resolve().parent / "cli.py")
+
         if req.get("getCursors"):
             return self.get_cursors()
+
+        if req.get("bridgeStatus"):
+            return self.browser.execute_batch({"bridgeStatus": True})
 
         if "parallel" in req and isinstance(req["parallel"], list):
             return self.execute_parallel(req["parallel"])
@@ -730,7 +781,8 @@ class FasterMacUseRuntime:
 
         sess = self._get_agent_session(agent_id)
         with sess.lock:
-            surface = req.get("surface") or ("app" if "app" in req else "web")
+            raw_surface = str(req.get("surface") or ("app" if "app" in req else "web")).lower()
+            surface = "web" if raw_surface in ("web", "browser") else raw_surface
             if surface == "app":
                 out = self.mac.execute(req)
                 sess.context_tracker.record_turn(f"app:{req.get('app', '')}", out)
@@ -769,7 +821,16 @@ def can_connect_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> bool:
 
 
 def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
+    import fcntl
     import threading
+
+    lock_path = Path(f"{socket_path}.lock")
+    lock_fp = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fp.close()
+        return
 
     sock_file = Path(socket_path)
     sock_file.unlink(missing_ok=True)
@@ -777,6 +838,8 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
     srv.bind(socket_path)
     srv.listen(32)
     runtime = FasterMacUseRuntime()
+    runtime._is_mcp_stdio = False
+    runtime.browser.ensure_bridge()
     stop_ev = threading.Event()
 
     def _handle_client(conn: socket.socket) -> None:
@@ -827,6 +890,12 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
         srv.close()
         sock_file.unlink(missing_ok=True)
         runtime.shutdown()
+        try:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fp.close()
+        lock_path.unlink(missing_ok=True)
 
 
 def execute_via_daemon(
@@ -840,19 +909,31 @@ def execute_via_daemon(
         if req.get("reset") and len(req) == 1:
             MacNativeEngine().reset()
             return "# fmu runtime reset"
-        proc = subprocess.Popen(
-            [sys.executable, str(fmu_bin_path), "--daemon", socket_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-        proc._child_created = False
-        for _ in range(50):
-            if can_connect_runtime_daemon(socket_path):
-                break
-            time.sleep(0.015)
+        import fcntl
+
+        spawn_lock_path = Path(f"{socket_path}.spawn.lock")
+        with open(spawn_lock_path, "a+", encoding="utf-8") as spawn_lock_fp:
+            fcntl.flock(spawn_lock_fp.fileno(), fcntl.LOCK_EX)
+            try:
+                if not can_connect_runtime_daemon(socket_path):
+                    proc = subprocess.Popen(
+                        [sys.executable, str(fmu_bin_path), "--daemon", socket_path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                    proc._child_created = False
+                    for _ in range(80):
+                        if can_connect_runtime_daemon(socket_path):
+                            break
+                        time.sleep(0.015)
+            finally:
+                try:
+                    fcntl.flock(spawn_lock_fp.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
 
     payload = (json.dumps(req) + "\n").encode("utf-8")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -870,6 +951,7 @@ def execute_via_daemon(
         return b"".join(chunks).decode("utf-8", errors="replace").strip()
     except OSError:
         rt = FasterMacUseRuntime()
+        rt._is_mcp_stdio = False
         try:
             return rt.execute(req)
         finally:
@@ -892,9 +974,15 @@ MCP_TOOL_SCHEMA = {
             "code": {"type": "string"},
             "agent": {"type": "string"},
             "parallel": {"type": "array", "items": {"type": "object"}},
-            "surface": {"type": "string", "enum": ["web", "app"]},
+            "surface": {"type": "string", "enum": ["web", "browser", "app"]},
             "app": {"type": "string"},
+            "window": {"type": "string"},
+            "windowId": {"type": "integer"},
             "url": {"type": "string"},
+            "mode": {"type": "string", "enum": ["chrome", "extension", "headless"]},
+            "requireExtension": {"type": "boolean"},
+            "reuseExisting": {"type": "boolean"},
+            "bridgeStatus": {"type": "boolean"},
             "session": {"type": "string"},
             "query": {"type": "string"},
             "diff": {"type": "boolean"},

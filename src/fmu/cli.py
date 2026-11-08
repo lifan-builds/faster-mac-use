@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 import sys
 
+_SRC_DIR = str(Path(__file__).resolve().parents[1])
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 from fmu.cua_runtime import (
     DEFAULT_RUNTIME_SOCK,
     FasterMacUseRuntime,
@@ -89,7 +93,7 @@ def main(bin_path: Path | None = None) -> None:
         sys.stdout.write(f"faster-mac-use {__version__}\n")
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("mcp", "--mcp"):
-        serve_mcp()
+        serve_mcp(bin_path)
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("--daemon", "daemon"):
         sock = sys.argv[2] if len(sys.argv) >= 3 else DEFAULT_RUNTIME_SOCK

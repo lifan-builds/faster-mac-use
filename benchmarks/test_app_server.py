@@ -260,12 +260,98 @@ CANVAS_HTML = """<!doctype html>
 """
 
 
+EDITOR_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Rich-Text Composer Suite — Draft.js &amp; ProseMirror</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    .editor-box { border: 1px solid #cbd5e1; padding: 12px; margin-bottom: 16px; border-radius: 8px; }
+    [contenteditable="true"] { min-height: 48px; outline: none; padding: 8px; border: 1px solid #94a3b8; }
+  </style>
+</head>
+<body>
+  <h1>Rich-Text Social Composer</h1>
+  <div id="publish-status" role="status">DRAFT_IDLE</div>
+  <div id="media-status" role="status">NO_MEDIA</div>
+
+  <!-- X / Draft.js style composer -->
+  <div class="editor-box">
+    <div id="x-placeholder" class="public-DraftEditorPlaceholder-root">What's happening?</div>
+    <div id="x-composer" data-testid="tweetTextarea_0" role="textbox" contenteditable="true" aria-multiline="true">
+      <div data-contents="true"><div data-block="true"><span data-text="true"></span></div></div>
+    </div>
+    <div class="toolbar" style="margin-top:8px;">
+      <input id="x-media-file" type="file" accept="video/*,image/*" style="display:none">
+      <button id="x-media-btn" type="button" aria-label="Add photos or video">Add photos or video</button>
+    </div>
+  </div>
+
+  <!-- RedNote / ProseMirror style composer -->
+  <div class="editor-box">
+    <input id="rn-title" placeholder="填写标题会有更多赞哦" aria-label="填写标题会有更多赞哦" value="">
+    <div id="rn-body" class="tiptap ProseMirror" contenteditable="true" data-placeholder="输入正文描述，真诚有价值的分享予人温暖">
+      <p><br></p>
+    </div>
+  </div>
+
+  <button id="publish-btn" type="button" onclick="publishPost()">Publish Post</button>
+
+  <script>
+    (function() {
+      const xComp = document.getElementById("x-composer");
+      let draftState = "";
+      function renderDraftState() {
+        const contents = xComp.querySelector("[data-contents='true']") || xComp;
+        const lines = draftState.split(/\\r?\\n/);
+        contents.innerHTML = lines.map(line =>
+          `<div data-block="true"><span data-text="true">${line.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</span></div>`
+        ).join("");
+        const ph = document.getElementById("x-placeholder");
+        if (draftState.length > 0 && ph) {
+          ph.remove();
+        }
+      }
+      xComp.addEventListener("beforeinput", function(e) {
+        if (e.inputType === "deleteContentBackward" || e.inputType === "deleteContentForward" || e.inputType === "deleteByCut") {
+          e.preventDefault();
+          draftState = "";
+          renderDraftState();
+        } else if (e.inputType === "insertText" || e.inputType === "insertFromPaste") {
+          e.preventDefault();
+          draftState += (e.data || "");
+          renderDraftState();
+        }
+      });
+      document.getElementById("x-media-file").addEventListener("change", function(e) {
+        const f = e.target.files && e.target.files[0];
+        document.getElementById("media-status").textContent = f ? `MEDIA:${f.name}` : "NO_MEDIA";
+      });
+    })();
+
+    function publishPost() {
+      const xText = (document.getElementById("x-composer").innerText || "").trim().replace(/\\r?\\n+/g, " | ");
+      const rnTitle = (document.getElementById("rn-title").value || "").trim();
+      const rnBody = (document.getElementById("rn-body").innerText || "").trim().replace(/\\r?\\n+/g, " | ");
+      const media = (document.getElementById("media-status").textContent || "").trim();
+      document.getElementById("publish-status").textContent =
+        `PUBLISHED x="${xText}" title="${rnTitle}" body="${rnBody}" media="${media}"`;
+    }
+  </script>
+</body>
+</html>
+"""
+
+
 class _BenchHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path.startswith("/pricing"):
             body = PRICING_HTML
         elif self.path.startswith("/canvas"):
             body = CANVAS_HTML
+        elif self.path.startswith("/editor"):
+            body = EDITOR_HTML
         else:
             body = ORDERS_HTML
         raw = body.encode("utf-8")

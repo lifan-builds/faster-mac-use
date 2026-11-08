@@ -47,6 +47,19 @@ struct NodeRecord: Codable {
     }
 }
 
+func parseNormalizedAxUid(_ raw: String?) -> String? {
+    guard let c = raw?.trimmingCharacters(in: .whitespacesAndNewlines), c.count >= 3 else {
+        return nil
+    }
+    if c.hasPrefix("@a") || c.hasPrefix("@u") || c.hasPrefix("@e") {
+        let suffix = c.dropFirst(2)
+        if !suffix.isEmpty && suffix.allSatisfy({ $0.isNumber }) {
+            return "@a" + String(suffix)
+        }
+    }
+    return nil
+}
+
 struct StepSpec: Codable {
     let op: String?
     let action: String?
@@ -57,45 +70,102 @@ struct StepSpec: Codable {
     let index: Int?
     let role: String?
     let name: String?
+    let label: String?
+    let text: String?
     let key: String?
     let value: String?
     let path: [String]?
+    let files: [String]?
     let ms: Int?
     let x: Int?
     let y: Int?
     let optional: Bool?
 
     var effectiveOp: String {
-        let raw = (op ?? action ?? "").lowercased()
-        if raw == "press" {
-            if key != nil && uid == nil && ref == nil && target == nil && name == nil && index == nil {
+        let raw = (op ?? action ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch raw {
+        case "press":
+            if key != nil && uid == nil && ref == nil && target == nil && label == nil && index == nil {
                 return "key"
             }
             return "click"
-        }
-        if raw == "fill" {
+        case "type":
+            let hasExplicitTarget = (uid != nil || ref != nil || target != nil || selector != nil || label != nil || index != nil)
+                || (name != nil && (value != nil || text != nil))
+                || (effectiveUid != nil)
+            if hasExplicitTarget {
+                return "set"
+            }
+            return "type"
+        case "tap":
+            return "click"
+        case "fill", "input":
             return "set"
-        }
-        if raw == "hover" || raw == "cursor" || raw == "point" {
+        case "hover", "cursor", "point":
             return "move"
+        case "sleep", "delay":
+            return "wait"
+        case "hotkey", "shortcut":
+            return "key"
+        default:
+            return raw
         }
-        return raw
     }
 
     var effectiveUid: String? {
-        for cand in [uid, ref, target, selector, name] {
-            if let c = cand, c.hasPrefix("@a") || c.hasPrefix("@u") || c.hasPrefix("@e") {
-                if c.hasPrefix("@u") || c.hasPrefix("@e") {
-                    return "@a" + String(c.dropFirst(2))
-                }
-                return c
+        for cand in [uid, ref, target, selector, name, label] {
+            if let norm = parseNormalizedAxUid(cand) {
+                return norm
             }
         }
         return nil
     }
 
     var effectiveName: String? {
-        return name ?? target ?? ref ?? selector
+        for cand in [name, label, target, ref, selector] {
+            if let c = cand?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty,
+               parseNormalizedAxUid(c) == nil {
+                return c
+            }
+        }
+        return nil
+    }
+
+    var effectiveValue: String? {
+        return value ?? text
+    }
+
+    var effectiveKey: String? {
+        for cand in [key, name, value, text, target] {
+            if let c = cand?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty {
+                return c
+            }
+        }
+        return nil
+    }
+}
+
+enum WindowSpec: Codable {
+    case titleOrUrl(String)
+    case index(Int)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let idx = try? container.decode(Int.self) {
+            self = .index(idx)
+        } else if let str = try? container.decode(String.self) {
+            self = .titleOrUrl(str)
+        } else {
+            self = .titleOrUrl("")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .titleOrUrl(let s): try container.encode(s)
+        case .index(let i): try container.encode(i)
+        }
     }
 }
 
@@ -103,7 +173,10 @@ struct BatchRequest: Codable {
     let agent: String?
     let cursor: String?
     let app: String?
-    let window: String?
+    let window: WindowSpec?
+    let windowIndex: Int?
+    let url: String?
+    let windowUrl: String?
     let query: String?
     let steps: [StepSpec]?
     let diff: Bool?
@@ -121,6 +194,36 @@ struct BatchRequest: Codable {
     var effectiveAgent: String {
         let raw = (agent ?? cursor ?? "default").trimmingCharacters(in: .whitespacesAndNewlines)
         return raw.isEmpty ? "default" : raw
+    }
+
+    var effectiveWindowIndex: Int? {
+        if let idx = windowIndex { return idx }
+        if case .index(let idx) = window { return idx }
+        if case .titleOrUrl(let raw) = window {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let direct = Int(trimmed) { return direct }
+            if trimmed.hasPrefix("#"), let n = Int(trimmed.dropFirst()) { return n }
+            if trimmed.hasPrefix("index:"), let n = Int(trimmed.dropFirst(6).trimmingCharacters(in: .whitespaces)) { return n }
+        }
+        return nil
+    }
+
+    var effectiveWindowFilter: String? {
+        if effectiveWindowIndex != nil { return nil }
+        if case .titleOrUrl(let raw) = window {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+
+    var effectiveUrlFilter: String? {
+        for cand in [windowUrl, url] {
+            if let c = cand?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty {
+                return c
+            }
+        }
+        return nil
     }
 }
 
@@ -158,12 +261,17 @@ final class EngineState {
     var latestWindowNodes: [String: [NodeRecord]] = [:]
     var latestWindowElements: [String: [AXUIElement]] = [:]
     var windowSyncedSeq: [String: UInt64] = [:]
-    var cachedAppWindows: [pid_t: (AXUIElement, String)] = [:]
+    var cachedAppWindows: [String: (AXUIElement, String)] = [:]
     var appCache: [String: TargetApp] = [:]
     var appPidByKey: [String: pid_t] = [:]
     var wokenPids: Set<pid_t> = []
     var documentedApps: Set<String> = []
     var agentCursors: [String: VirtualCursorState] = [:]
+
+    func invalidateAppWindows(forPid pid: pid_t) {
+        let prefix = "\(pid)|"
+        cachedAppWindows = cachedAppWindows.filter { !$0.key.hasPrefix(prefix) }
+    }
 
     // Push-based AXObserver state per PID
     let observerLock = NSLock()
@@ -284,6 +392,12 @@ func cleanText(_ anyVal: AnyObject?) -> String {
         return s.replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
             .trimmingCharacters(in: .whitespaces)
+    }
+    if let u = val as? URL {
+        return u.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    if let u = val as? NSURL, let s = u.absoluteString {
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     if let n = val as? NSNumber {
         return n.stringValue
@@ -456,18 +570,165 @@ func wakeLazyAXIfNeeded(_ pid: pid_t, appElement: AXUIElement) {
     ensureAXObserver(pid, appElement: appElement)
 }
 
-func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxElements: Int = 250) -> ([NodeRecord], [AXUIElement]) {
+func collectDescendantStaticText(
+    _ el: AXUIElement,
+    initialChildren: [AXUIElement]? = nil,
+    maxNodes: Int = 96
+) -> (text: String, staticCount: Int, childCount: Int) {
+    let topChildren = initialChildren ?? axChildren(el)
+    if topChildren.isEmpty {
+        return ("", 0, 0)
+    }
+    var visited = 0
+    var blockParts: [String] = []
+    var staticCount = 0
+    for top in topChildren {
+        if visited >= maxNodes { break }
+        visited += 1
+        let rawRole = axString(top, kAXRoleAttribute)
+        let r = rawRole.hasPrefix("AX") ? String(rawRole.dropFirst(2)).lowercased() : rawRole.lowercased()
+        if r == "statictext" {
+            staticCount += 1
+            let v = axString(top, kAXValueAttribute)
+            let t = !v.isEmpty ? v : axString(top, kAXTitleAttribute)
+            if !t.isEmpty {
+                blockParts.append(t)
+            }
+        } else {
+            var inlineRuns: [String] = []
+            var stack: [AXUIElement] = axChildren(top)
+            while !stack.isEmpty && visited < maxNodes {
+                let cur = stack.removeFirst()
+                visited += 1
+                let crRaw = axString(cur, kAXRoleAttribute)
+                let cr = crRaw.hasPrefix("AX") ? String(crRaw.dropFirst(2)).lowercased() : crRaw.lowercased()
+                if cr == "statictext" {
+                    staticCount += 1
+                    let v = axString(cur, kAXValueAttribute)
+                    let t = !v.isEmpty ? v : axString(cur, kAXTitleAttribute)
+                    if !t.isEmpty {
+                        inlineRuns.append(t)
+                    }
+                } else {
+                    let ch = axChildren(cur)
+                    if !ch.isEmpty {
+                        stack.insert(contentsOf: ch, at: 0)
+                    }
+                }
+            }
+            let joined = inlineRuns.joined(separator: "").trimmingCharacters(in: .whitespaces)
+            if !joined.isEmpty {
+                blockParts.append(joined)
+            }
+        }
+    }
+    return (blockParts.joined(separator: " "), staticCount, topChildren.count)
+}
+
+func isElementInWebArea(_ el: AXUIElement) -> Bool {
+    var cur: AXUIElement? = el
+    for _ in 0..<64 {
+        guard let c = cur else { break }
+        let role = axString(c, kAXRoleAttribute)
+        if role == "AXWebArea" {
+            return true
+        }
+        if role == "AXWindow" || role == "AXApplication" || role.isEmpty {
+            break
+        }
+        var parentRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &parentRef) == .success,
+           let p = parentRef {
+            cur = (p as! AXUIElement)
+        } else {
+            break
+        }
+    }
+    return false
+}
+
+func selectAllViaAX(_ el: AXUIElement) -> Bool {
+    var charCount = 65535
+    var numRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(el, kAXNumberOfCharactersAttribute as CFString, &numRef) == .success,
+       let n = numRef as? NSNumber {
+        charCount = max(n.intValue, 0)
+    }
+    var range = CFRange(location: 0, length: max(charCount, 65535))
+    guard let rangeVal = AXValueCreate(.cfRange, &range) else { return false }
+    return AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, rangeVal) == .success
+}
+
+func replaceViaAXSelectedText(_ el: AXUIElement, text: String) -> Bool {
+    _ = selectAllViaAX(el)
+    return AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
+}
+
+func verifyElementSetValue(
+    _ el: AXUIElement,
+    role: String,
+    inWebArea: Bool,
+    isSecure: Bool,
+    expectedClean: String,
+    usedPureAXOnlyOnWebRichText: Bool = false
+) -> (verified: Bool, actual: String) {
+    let rawVal = axString(el, kAXValueAttribute)
+    if isSecure {
+        return (true, rawVal)
+    }
+    if role == "textarea" {
+        let desc = collectDescendantStaticText(el)
+        let effective = (!desc.text.isEmpty && (desc.staticCount > 1 || desc.text.count > rawVal.count))
+            ? desc.text
+            : rawVal
+        if inWebArea && desc.childCount > 0 {
+            if usedPureAXOnlyOnWebRichText {
+                return (false, effective)
+            }
+            if expectedClean.isEmpty {
+                return (rawVal.isEmpty && desc.text.isEmpty, effective)
+            }
+            let ok = (!desc.text.isEmpty && desc.text == expectedClean)
+                || (desc.staticCount == 0 && rawVal == expectedClean)
+            return (ok, effective)
+        }
+        return (effective == expectedClean, effective)
+    }
+    return (rawVal == expectedClean, rawVal)
+}
+
+func detectDisabledNSOpenPanel(nodes: [NodeRecord]) -> NodeRecord? {
+    let hasSheetOrDialog = nodes.contains { n in
+        (n.role == "sheet" || n.role == "dialog")
+    }
+    guard hasSheetOrDialog else { return nil }
+    let hasCancel = nodes.contains { n in
+        n.role == "button" && ["cancel", "取消"].contains(n.label.lowercased())
+    }
+    guard hasCancel else { return nil }
+    let openLabels: Set<String> = ["open", "打开", "打開", "choose", "选择", "upload", "上传"]
+    return nodes.first { n in
+        n.role == "button" && !n.enabled && openLabels.contains(n.label.lowercased())
+    }
+}
+
+func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxElements: Int = 300) -> ([NodeRecord], [AXUIElement]) {
     var records: [NodeRecord] = []
     var elements: [AXUIElement] = []
     var stack: [AXUIElement] = [root]
     var visited = 0
+    var visitedHashes: Set<UInt> = []
     var structCounts: [String: Int] = [:]
     var usedInPass: Set<String> = []
     let q = query?.lowercased()
     let state = EngineState.shared
 
-    while !stack.isEmpty && records.count < maxElements && visited < 2200 {
+    while !stack.isEmpty && records.count < maxElements && visited < 2800 {
         let el = stack.removeFirst()
+        let elHash = CFHash(el)
+        if !visitedHashes.insert(elHash).inserted {
+            continue
+        }
         visited += 1
         let attrs = readBatchedAttrs(el)
         let role = attrs.role
@@ -478,9 +739,20 @@ func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxEl
         if label.isEmpty && (role == "textfield" || role == "textarea" || role == "searchfield") {
             label = axString(el, "AXPlaceholderValue")
         }
-        let val = attrs.value
+        if label.isEmpty && (role == "sheet" || role == "dialog") {
+            let sub = axString(el, kAXSubroleAttribute)
+            label = !sub.isEmpty ? sub : role
+        }
+        let children = axChildren(el)
+        var val = attrs.value
+        if role == "textarea" && !children.isEmpty {
+            let desc = collectDescendantStaticText(el, initialChildren: children)
+            if !desc.text.isEmpty && (desc.staticCount > 1 || desc.text.count > val.count) {
+                val = desc.text
+            }
+        }
 
-        if interactiveRoles.contains(role) && (!label.isEmpty || !val.isEmpty || role == "textfield" || role == "searchfield" || role == "textarea") {
+        if interactiveRoles.contains(role) && (!label.isEmpty || !val.isEmpty || role == "textfield" || role == "searchfield" || role == "textarea" || role == "sheet" || role == "dialog") {
             let matchesQuery: Bool
             if let q = q, !q.isEmpty {
                 matchesQuery = label.lowercased().contains(q) || val.lowercased().contains(q) || role.contains(q)
@@ -510,9 +782,22 @@ func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxEl
                 elements.append(el)
             }
         }
-        let children = axChildren(el)
         if !children.isEmpty {
-            stack.insert(contentsOf: children, at: 0)
+            if visited == 1 && children.count > 1 {
+                var sheets: [AXUIElement] = []
+                var others: [AXUIElement] = []
+                for ch in children {
+                    let cr = axString(ch, kAXRoleAttribute)
+                    if cr == "AXSheet" || cr == "AXDialog" {
+                        sheets.append(ch)
+                    } else {
+                        others.append(ch)
+                    }
+                }
+                stack.insert(contentsOf: sheets + others, at: 0)
+            } else {
+                stack.insert(contentsOf: children, at: 0)
+            }
         }
     }
     return (records, elements)
@@ -547,12 +832,19 @@ func refreshDirtyLeavesInPlace(
             label = axString(el, "AXPlaceholderValue")
         }
         if label.isEmpty { label = rec.label }
+        var val = attrs.value
+        if attrs.role == "textarea" {
+            let desc = collectDescendantStaticText(el)
+            if !desc.text.isEmpty && (desc.staticCount > 1 || desc.text.count > val.count) {
+                val = desc.text
+            }
+        }
         let newRec = NodeRecord(
             uid: rec.uid,
             structKey: rec.structKey,
             role: attrs.role,
             label: label,
-            value: attrs.value,
+            value: val,
             enabled: attrs.enabled,
             x: attrs.x,
             y: attrs.y,
@@ -617,7 +909,7 @@ func findApp(nameOrBundle: String, launchIfNeeded: Bool = true) -> TargetApp? {
     let state = EngineState.shared
     if let cached = state.appCache[lower] {
         if isProcessAndAXAlive(cached.pid) {
-            if let cachedWin = state.cachedAppWindows[cached.pid],
+            if let cachedWin = state.cachedAppWindows["\(cached.pid)|"],
                axString(cachedWin.0, kAXRoleAttribute) == "AXWindow" {
                 return cached
             }
@@ -626,7 +918,7 @@ func findApp(nameOrBundle: String, launchIfNeeded: Bool = true) -> TargetApp? {
             }
         }
         state.appCache.removeValue(forKey: lower)
-        state.cachedAppWindows.removeValue(forKey: cached.pid)
+        state.invalidateAppWindows(forPid: cached.pid)
     }
 
     if let infoList = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] {
@@ -685,53 +977,275 @@ func findApp(nameOrBundle: String, launchIfNeeded: Bool = true) -> TargetApp? {
     return nil
 }
 
-func getTargetRoot(_ app: TargetApp, windowFilter: String? = nil) -> (AXUIElement, String) {
-    let state = EngineState.shared
-    if windowFilter == nil, let cached = state.cachedAppWindows[app.pid] {
-        if axString(cached.0, kAXRoleAttribute) == "AXWindow" {
-            if !state.isStructurallyDirty(app.pid) || !axChildren(cached.0).isEmpty {
-                return cached
+func isWindowMain(_ pid: pid_t, _ win: AXUIElement) -> Bool {
+    if axString(win, kAXRoleAttribute) != "AXWindow" {
+        return true
+    }
+    var ref: CFTypeRef?
+    if AXUIElementCopyAttributeValue(win, kAXMainAttribute as CFString, &ref) == .success,
+       let b = ref as? Bool {
+        if b { return true }
+    }
+    let appEl = AXUIElementCreateApplication(pid)
+    var mainRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appEl, kAXMainWindowAttribute as CFString, &mainRef) == .success,
+       let m = mainRef {
+        return CFHash(m as! AXUIElement) == CFHash(win)
+    }
+    var winsRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &winsRef) == .success,
+       let wArr = winsRef as? [AXUIElement] {
+        return wArr.count <= 1
+    }
+    return true
+}
+
+func extractWindowWebMetadata(_ win: AXUIElement, maxNodes: Int = 120) -> String {
+    var parts: [String] = []
+    let doc = axString(win, kAXDocumentAttribute)
+    if !doc.isEmpty { parts.append(doc) }
+    let wUrl = axString(win, kAXURLAttribute)
+    if !wUrl.isEmpty { parts.append(wUrl) }
+
+    var queue: [AXUIElement] = axChildren(win)
+    var visited = 0
+    while !queue.isEmpty && visited < maxNodes {
+        let cur = queue.removeFirst()
+        visited += 1
+        let rawRole = axString(cur, kAXRoleAttribute)
+        let role = rawRole.hasPrefix("AX") ? String(rawRole.dropFirst(2)).lowercased() : rawRole.lowercased()
+        let curUrl = axString(cur, kAXURLAttribute)
+        if !curUrl.isEmpty {
+            parts.append(curUrl)
+        }
+        if role == "webarea" {
+            let t = axString(cur, kAXTitleAttribute)
+            if !t.isEmpty { parts.append(t) }
+        } else if role == "textfield" || role == "searchfield" || role == "combobox" {
+            let v = axString(cur, kAXValueAttribute)
+            if !v.isEmpty { parts.append(v) }
+        }
+        if visited < maxNodes {
+            let ch = axChildren(cur)
+            if !ch.isEmpty {
+                queue.append(contentsOf: ch)
             }
         }
-        state.cachedAppWindows.removeValue(forKey: app.pid)
     }
+    return parts.joined(separator: " ")
+}
+
+func collectAppWindows(_ pid: pid_t, includeOffSpace: Bool) -> [AXUIElement] {
+    let appEl = AXUIElementCreateApplication(pid)
+    wakeLazyAXIfNeeded(pid, appElement: appEl)
+    var seen: Set<UInt> = []
+    var wins: [AXUIElement] = []
+    var fallbackUnknownWins: [AXUIElement] = []
+    func addWin(_ w: AXUIElement, fromOffSpaceProbe: Bool = false) {
+        guard axString(w, kAXRoleAttribute) == "AXWindow" else { return }
+        let title = axString(w, kAXTitleAttribute)
+        let subrole = axString(w, kAXSubroleAttribute)
+        if fromOffSpaceProbe {
+            if title.isEmpty && axChildren(w).isEmpty {
+                return
+            }
+            if title.isEmpty && (subrole == "AXUnknown" || subrole.isEmpty) {
+                let h = CFHash(w)
+                if !seen.contains(h) {
+                    fallbackUnknownWins.append(w)
+                }
+                return
+            }
+        }
+        let h = CFHash(w)
+        if !seen.contains(h) {
+            seen.insert(h)
+            wins.append(w)
+        }
+    }
+    var ref: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &ref) == .success,
+       let wArr = ref as? [AXUIElement] {
+        for w in wArr { addWin(w) }
+    }
+    if AXUIElementCopyAttributeValue(appEl, kAXMainWindowAttribute as CFString, &ref) == .success,
+       let mainWin = ref {
+        addWin(mainWin as! AXUIElement)
+    }
+    if AXUIElementCopyAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, &ref) == .success,
+       let focWin = ref {
+        addWin(focWin as! AXUIElement)
+    }
+    if includeOffSpace || wins.isEmpty || !wins.contains(where: { !axChildren($0).isEmpty }) {
+        for w in offSpaceWindows(pid) {
+            addWin(w, fromOffSpaceProbe: true)
+        }
+    }
+    if wins.isEmpty && !fallbackUnknownWins.isEmpty {
+        for w in fallbackUnknownWins {
+            let h = CFHash(w)
+            if !seen.contains(h) {
+                seen.insert(h)
+                wins.append(w)
+            }
+        }
+    }
+    return wins
+}
+
+func describeAvailableWindows(_ pid: pid_t, _ wins: [AXUIElement]) -> String {
+    if wins.isEmpty { return "none" }
+    return wins.enumerated().map { (idx, w) in
+        let title = axString(w, kAXTitleAttribute)
+        let mainTag = isWindowMain(pid, w) ? " [main]" : ""
+        return "[\(idx + 1)] \"\(title)\"\(mainTag)"
+    }.joined(separator: ", ")
+}
+
+func extractUrlHost(_ raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !trimmed.isEmpty else { return nil }
+    if let u = URL(string: trimmed), let h = u.host, !h.isEmpty {
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+    if !trimmed.contains("://") && (trimmed.contains("/") || trimmed.contains(".")),
+       let u = URL(string: "https://" + trimmed),
+       let h = u.host, !h.isEmpty, h.contains(".") {
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+    return nil
+}
+
+enum WindowResolution {
+    case matched(AXUIElement, String)
+    case notFound(String)
+}
+
+func resolveTargetWindow(
+    _ app: TargetApp,
+    windowFilter: String? = nil,
+    windowIndex: Int? = nil,
+    urlFilter: String? = nil
+) -> WindowResolution {
+    let state = EngineState.shared
+    let wf = windowFilter?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let uf = urlFilter?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let wfLower = wf.lowercased()
+    let ufLower = uf.lowercased()
+    let hasStringFilter = !wfLower.isEmpty || !ufLower.isEmpty
+    let hasFilter = (windowIndex != nil) || hasStringFilter
+    let cacheKey: String
+    if let idx = windowIndex {
+        cacheKey = "\(app.pid)|idx:\(idx)"
+    } else if hasStringFilter {
+        cacheKey = "\(app.pid)|win:\(wfLower)|url:\(ufLower)"
+    } else {
+        cacheKey = "\(app.pid)|"
+    }
+
+    func windowMatches(_ win: AXUIElement, allowHostFallback: Bool) -> Bool {
+        let titleLower = axString(win, kAXTitleAttribute).lowercased()
+        var metaLower: String?
+        func getMeta() -> String {
+            if let m = metaLower { return m }
+            let computed = extractWindowWebMetadata(win).lowercased()
+            metaLower = computed
+            return computed
+        }
+        if !wfLower.isEmpty {
+            var wfOk = titleLower.contains(wfLower) || getMeta().contains(wfLower)
+            if !wfOk && allowHostFallback, let host = extractUrlHost(wfLower) {
+                wfOk = titleLower.contains(host) || getMeta().contains(host)
+            }
+            if !wfOk { return false }
+        }
+        if !ufLower.isEmpty {
+            var ufOk = getMeta().contains(ufLower) || titleLower.contains(ufLower)
+            if !ufOk && allowHostFallback, let host = extractUrlHost(ufLower) {
+                ufOk = getMeta().contains(host) || titleLower.contains(host)
+            }
+            if !ufOk { return false }
+        }
+        return true
+    }
+
+    if let cached = state.cachedAppWindows[cacheKey] {
+        if axString(cached.0, kAXRoleAttribute) == "AXWindow" {
+            let liveTitle = axString(cached.0, kAXTitleAttribute)
+            let filterStillMatches = !hasStringFilter
+                || windowMatches(cached.0, allowHostFallback: true)
+            if filterStillMatches && (!state.isStructurallyDirty(app.pid) || !axChildren(cached.0).isEmpty) {
+                let effectiveTitle = liveTitle.isEmpty ? cached.1 : liveTitle
+                return .matched(cached.0, effectiveTitle)
+            }
+        }
+        state.cachedAppWindows.removeValue(forKey: cacheKey)
+    }
+
     let appEl = AXUIElementCreateApplication(app.pid)
     wakeLazyAXIfNeeded(app.pid, appElement: appEl)
-    var ref: CFTypeRef?
-    var wins: [AXUIElement] = []
-    if AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &ref) == .success,
-       let wArr = ref as? [AXUIElement], !wArr.isEmpty {
-        wins = wArr
-    } else if AXUIElementCopyAttributeValue(appEl, kAXMainWindowAttribute as CFString, &ref) == .success,
-              let mainWin = ref, axString(mainWin as! AXUIElement, kAXRoleAttribute) == "AXWindow" {
-        wins = [mainWin as! AXUIElement]
-    } else if AXUIElementCopyAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, &ref) == .success,
-              let focWin = ref, axString(focWin as! AXUIElement, kAXRoleAttribute) == "AXWindow" {
-        wins = [focWin as! AXUIElement]
-    }
-    if wins.isEmpty || !wins.contains(where: { !axChildren($0).isEmpty }) || (windowFilter != nil && !wins.contains(where: { axString($0, kAXTitleAttribute).lowercased().contains(windowFilter!.lowercased()) })) {
-        let extra = offSpaceWindows(app.pid)
-        if !extra.isEmpty {
-            wins.append(contentsOf: extra)
+    var wins = collectAppWindows(app.pid, includeOffSpace: false)
+
+    if let idx = windowIndex {
+        if idx < 1 || idx > wins.count {
+            wins = collectAppWindows(app.pid, includeOffSpace: true)
         }
+        guard idx >= 1 && idx <= wins.count else {
+            let avail = describeAvailableWindows(app.pid, wins)
+            return .notFound("Error: window index \(idx) out of range for \(app.name) (available windows: \(avail))")
+        }
+        let chosen = wins[idx - 1]
+        let wTitle = axString(chosen, kAXTitleAttribute)
+        let res = (chosen, wTitle.isEmpty ? app.name : wTitle)
+        state.cachedAppWindows[cacheKey] = res
+        return .matched(res.0, res.1)
     }
-    if !wins.isEmpty {
-        if let wf = windowFilter?.lowercased(), !wf.isEmpty {
-            if let matched = wins.first(where: { axString($0, kAXTitleAttribute).lowercased().contains(wf) && !axChildren($0).isEmpty })
-                ?? wins.first(where: { axString($0, kAXTitleAttribute).lowercased().contains(wf) }) {
-                let wTitle = axString(matched, kAXTitleAttribute)
-                let res = (matched, wTitle.isEmpty ? app.name : wTitle)
-                state.cachedAppWindows[app.pid] = res
-                return res
+
+    if hasStringFilter {
+        func findMatch(in list: [AXUIElement], allowHostFallback: Bool) -> AXUIElement? {
+            if let nonEmpty = list.first(where: {
+                windowMatches($0, allowHostFallback: allowHostFallback) && !axChildren($0).isEmpty
+            }) {
+                return nonEmpty
             }
+            return list.first(where: {
+                windowMatches($0, allowHostFallback: allowHostFallback)
+            })
         }
-        let first = wins.first(where: { !axChildren($0).isEmpty }) ?? wins[0]
+
+        var matched = findMatch(in: wins, allowHostFallback: false)
+        if matched == nil {
+            wins = collectAppWindows(app.pid, includeOffSpace: true)
+            matched = findMatch(in: wins, allowHostFallback: false)
+        }
+        if matched == nil && (extractUrlHost(wfLower) != nil || extractUrlHost(ufLower) != nil) {
+            matched = findMatch(in: wins, allowHostFallback: true)
+        }
+        guard let win = matched else {
+            let avail = describeAvailableWindows(app.pid, wins)
+            let descFilter = (!wf.isEmpty && !uf.isEmpty)
+                ? "window=\"\(wf)\" url=\"\(uf)\""
+                : "\"\(!wf.isEmpty ? wf : uf)\""
+            return .notFound("Error: window matching \(descFilter) not found in \(app.name) (available windows: \(avail))")
+        }
+        let wTitle = axString(win, kAXTitleAttribute)
+        let res = (win, wTitle.isEmpty ? app.name : wTitle)
+        state.cachedAppWindows[cacheKey] = res
+        return .matched(res.0, res.1)
+    }
+
+    if !wins.isEmpty {
+        let first = wins.first(where: { isWindowMain(app.pid, $0) && !axChildren($0).isEmpty })
+            ?? wins.first(where: { !axChildren($0).isEmpty })
+            ?? wins[0]
         let wTitle = axString(first, kAXTitleAttribute)
         let res = (first, wTitle.isEmpty ? app.name : wTitle)
-        state.cachedAppWindows[app.pid] = res
-        return res
+        if !hasFilter {
+            state.cachedAppWindows[cacheKey] = res
+        }
+        return .matched(res.0, res.1)
     }
-    return (appEl, app.name)
+    return .matched(appEl, app.name)
 }
 
 func computeUidDiff(oldNodes: [NodeRecord], newNodes: [NodeRecord]) -> [String] {
@@ -969,13 +1483,13 @@ func settleAndWalkAXTree(
 ) -> ([NodeRecord], [AXUIElement], String) {
     let state = EngineState.shared
     if shouldSettle {
-        Thread.sleep(forTimeInterval: 0.015)
+        Thread.sleep(forTimeInterval: 0.010)
     }
     var (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
     var curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
     if shouldSettle {
-        for _ in 0..<4 where curCrc == prevCrc {
-            Thread.sleep(forTimeInterval: 0.025)
+        for _ in 0..<2 where curCrc == prevCrc {
+            Thread.sleep(forTimeInterval: 0.015)
             (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
             curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
         }
@@ -1027,12 +1541,27 @@ func executeRequest(_ req: BatchRequest) -> String {
 
     let agentId = req.effectiveAgent
     let hasQuery = !(req.query ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    let (root, winTitle) = getTargetRoot(app, windowFilter: req.window)
+    let root: AXUIElement
+    let winTitle: String
+    switch resolveTargetWindow(
+        app,
+        windowFilter: req.effectiveWindowFilter,
+        windowIndex: req.effectiveWindowIndex,
+        urlFilter: req.effectiveUrlFilter
+    ) {
+    case .notFound(let errMsg):
+        return errMsg
+    case .matched(let r, let wt):
+        root = r
+        winTitle = wt
+    }
+
+    let rootIsMain = isWindowMain(app.pid, root)
     let winKey = "\(app.name.lowercased()):\(winTitle)"
     let baselineKey = "\(agentId)|\(winKey)"
     let pidChanged = (state.appPidByKey[winKey] != nil && state.appPidByKey[winKey] != app.pid)
     if let oldPid = state.appPidByKey[winKey], pidChanged {
-        state.cachedAppWindows.removeValue(forKey: oldPid)
+        state.invalidateAppWindows(forPid: oldPid)
         let winPrefix = "\(winKey)|"
         for (sKey, uid) in state.structKeyToUid where sKey.hasPrefix(winPrefix) {
             state.uidToElement.removeValue(forKey: uid)
@@ -1110,22 +1639,16 @@ func executeRequest(_ req: BatchRequest) -> String {
     var didMutate = false
 
     if let steps = req.steps, !steps.isEmpty {
-        let appElForMain = AXUIElementCreateApplication(app.pid)
-        var prevMainRef: CFTypeRef?
-        let hadPrevMain = AXUIElementCopyAttributeValue(appElForMain, kAXMainWindowAttribute as CFString, &prevMainRef) == .success
-        if axString(root, kAXRoleAttribute) == kAXWindowRole {
-            _ = AXUIElementSetAttributeValue(root, kAXMainAttribute as CFString, kCFBooleanTrue)
-        }
-        defer {
-            if hadPrevMain, let pm = prevMainRef {
-                let pmEl = pm as! AXUIElement
-                if CFHash(pmEl) != CFHash(root) {
-                    _ = AXUIElementSetAttributeValue(pmEl, kAXMainAttribute as CFString, kCFBooleanTrue)
-                }
-            }
-        }
         for (i, step) in steps.enumerated() {
             let op = step.effectiveOp
+            if op.isEmpty {
+                stepErrors.append("step \(i+1): missing 'op' (or 'action') field in step; supported ops: click, set, move, type, key, menu, wait, settle, ocr")
+                continue
+            }
+            if op == "upload" {
+                stepErrors.append("step \(i+1): op 'upload' is only supported on surface=\"web\" via the MV3 extension CDP bridge (DOM.setFileInputFiles)")
+                continue
+            }
             if op != "move" && op != "ocr" {
                 didMutate = true
             }
@@ -1137,32 +1660,83 @@ func executeRequest(_ req: BatchRequest) -> String {
             case "ocr":
                 ocrOutput.append(contentsOf: performWindowOCR(app: app, fallbackNodes: currentNodes))
             case "key":
-                if let chord = step.key ?? step.name ?? step.value {
-                    let lc = chord.lowercased()
-                    var handledViaAX = false
-                    if lc == "escape" || lc == "esc" || lc == "clear" {
-                        if let clrIdx = currentNodes.firstIndex(where: {
-                            $0.role == "button" && ($0.label.lowercased() == "clear" || $0.label.lowercased() == "all clear")
-                        }), clrIdx < currentElements.count {
-                            if AXUIElementPerformAction(currentElements[clrIdx], kAXPressAction as CFString) == .success {
+                guard let chord = step.effectiveKey else {
+                    if !(step.optional ?? false) {
+                        stepErrors.append("step \(i+1): key op requires 'key' (or 'name'/'value') parameter")
+                    }
+                    continue
+                }
+                let lc = chord.lowercased()
+                var handledViaAX = false
+                if lc == "escape" || lc == "esc" || lc == "clear" {
+                    if let clrIdx = currentNodes.firstIndex(where: {
+                        $0.role == "button" && ($0.label.lowercased() == "clear" || $0.label.lowercased() == "all clear")
+                    }), clrIdx < currentElements.count {
+                        if AXUIElementPerformAction(currentElements[clrIdx], kAXPressAction as CFString) == .success {
+                            handledViaAX = true
+                        }
+                    }
+                    if !handledViaAX {
+                        var cancelRef: CFTypeRef?
+                        if AXUIElementCopyAttributeValue(root, kAXCancelButtonAttribute as CFString, &cancelRef) == .success,
+                           let cancelBtn = cancelRef,
+                           AXUIElementPerformAction(cancelBtn as! AXUIElement, kAXPressAction as CFString) == .success {
+                            handledViaAX = true
+                        } else if detectDisabledNSOpenPanel(nodes: currentNodes) != nil,
+                                  let cancelIdx = currentNodes.firstIndex(where: {
+                                      $0.role == "button" && ["cancel", "取消"].contains($0.label.lowercased())
+                                  }), cancelIdx < currentElements.count {
+                            if AXUIElementPerformAction(currentElements[cancelIdx], kAXPressAction as CFString) == .success {
                                 handledViaAX = true
                             }
                         }
                     }
-                    if !handledViaAX {
+                } else if !rootIsMain && (lc == "return" || lc == "enter") {
+                    var defRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(root, kAXDefaultButtonAttribute as CFString, &defRef) == .success,
+                       let defBtn = defRef,
+                       AXUIElementPerformAction(defBtn as! AXUIElement, kAXPressAction as CFString) == .success {
+                        handledViaAX = true
+                    }
+                }
+                if !handledViaAX {
+                    if rootIsMain {
                         postKeyChordToPid(app.pid, chord: chord)
                         Thread.sleep(forTimeInterval: 0.012)
+                    } else if !(step.optional ?? false) {
+                        stepErrors.append("step \(i+1): key '\(chord)' refused on non-main window \"\(winTitle)\" because CGEvent.postToPid routes keys to the app's AXMainWindow; use AX click/set or surface=\"web\" MV3 extension bridge")
                     }
                 }
             case "type":
-                if let text = step.value ?? step.name {
+                guard let text = step.effectiveValue ?? step.effectiveName else {
+                    if !(step.optional ?? false) {
+                        stepErrors.append("step \(i+1): type op requires 'value' (or 'text'/'name') parameter")
+                    }
+                    continue
+                }
+                if rootIsMain {
                     postBatchedUnicodeTextToPid(app.pid, text: text)
+                } else {
+                    var insertedViaAX = false
+                    if let cur = state.agentCursors[agentId], cur.window == winTitle,
+                       let focEl = state.uidToElement[cur.uid] {
+                        if AXUIElementSetAttributeValue(focEl, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+                            insertedViaAX = true
+                        }
+                    }
+                    if !insertedViaAX && !(step.optional ?? false) {
+                        stepErrors.append("step \(i+1): type refused on non-main window \"\(winTitle)\" because CGEvent.postToPid routes keys to the app's AXMainWindow; use op=\"set\" on a target uid or surface=\"web\" MV3 extension bridge")
+                    }
                 }
             case "menu":
-                if let p = step.path, !p.isEmpty {
-                    if !invokeMenuBar(app.pid, path: p) && !(step.optional ?? false) {
-                        stepErrors.append("step \(i+1): menu not found")
+                guard let p = step.path, !p.isEmpty else {
+                    if !(step.optional ?? false) {
+                        stepErrors.append("step \(i+1): menu op requires non-empty 'path' array")
                     }
+                    continue
+                }
+                if !invokeMenuBar(app.pid, path: p) && !(step.optional ?? false) {
+                    stepErrors.append("step \(i+1): menu not found")
                 }
             case "click", "set", "move":
                 if let cx = step.x, let cy = step.y, (op == "click" || op == "move") {
@@ -1217,30 +1791,80 @@ func executeRequest(_ req: BatchRequest) -> String {
                         targetEl = state.uidToElement[uid]
                         targetNode = state.uidToRecord[uid]
                     }
-                } else if let idx = step.index, idx >= 1 && idx <= currentElements.count {
-                    targetEl = currentElements[idx - 1]
-                    targetNode = currentNodes[idx - 1]
+                } else if let idx = step.index, idx >= 1 {
+                    if idx > currentElements.count {
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                    }
+                    if idx <= currentElements.count {
+                        targetEl = currentElements[idx - 1]
+                        targetNode = currentNodes[idx - 1]
+                    }
                 } else if let rawName = step.effectiveName?.lowercased() {
                     let roleFilter = step.role?.lowercased()
                     let candidates = rawName.split(separator: "|").map { String($0).trimmingCharacters(in: .whitespaces) }
-                    for cand in candidates {
-                        let exactPos = currentNodes.firstIndex { node in
-                            (roleFilter == nil || node.role == roleFilter) && node.label.lowercased() == cand
+                    let preferredRoles: Set<String>?
+                    if roleFilter != nil {
+                        preferredRoles = nil
+                    } else if op == "set" {
+                        preferredRoles = ["textfield", "textarea", "searchfield", "combobox"]
+                    } else if op == "click" {
+                        preferredRoles = [
+                            "button", "link", "menuitem", "tab", "checkbox", "radiobutton",
+                            "popupbutton", "switch", "disclosuretriangle", "row", "cell",
+                            "textfield", "textarea", "searchfield", "combobox"
+                        ]
+                    } else {
+                        preferredRoles = nil
+                    }
+                    func matchInCurrentNodes() -> (AXUIElement, NodeRecord)? {
+                        for cand in candidates {
+                            if let pref = preferredRoles {
+                                if let pos = currentNodes.firstIndex(where: {
+                                    pref.contains($0.role) && $0.label.lowercased() == cand
+                                }), pos < currentElements.count {
+                                    return (currentElements[pos], currentNodes[pos])
+                                }
+                            }
+                            if let exactPos = currentNodes.firstIndex(where: {
+                                (roleFilter == nil || $0.role == roleFilter) && $0.label.lowercased() == cand
+                            }), exactPos < currentElements.count {
+                                return (currentElements[exactPos], currentNodes[exactPos])
+                            }
+                            if let pref = preferredRoles {
+                                if let pos = currentNodes.firstIndex(where: {
+                                    pref.contains($0.role) && $0.label.lowercased().contains(cand)
+                                }), pos < currentElements.count {
+                                    return (currentElements[pos], currentNodes[pos])
+                                }
+                            }
+                            if let subPos = currentNodes.firstIndex(where: {
+                                (roleFilter == nil || $0.role == roleFilter) && $0.label.lowercased().contains(cand)
+                            }), subPos < currentElements.count {
+                                return (currentElements[subPos], currentNodes[subPos])
+                            }
                         }
-                        let subPos = exactPos ?? currentNodes.firstIndex { node in
-                            (roleFilter == nil || node.role == roleFilter) && node.label.lowercased().contains(cand)
-                        }
-                        if let pos = subPos, pos < currentElements.count {
-                            targetEl = currentElements[pos]
-                            targetNode = currentNodes[pos]
-                            break
+                        return nil
+                    }
+                    if let found = matchInCurrentNodes() {
+                        targetEl = found.0
+                        targetNode = found.1
+                    } else {
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                        if let found = matchInCurrentNodes() {
+                            targetEl = found.0
+                            targetNode = found.1
                         }
                     }
                 }
 
                 guard var el = targetEl else {
                     if !(step.optional ?? false) {
-                        stepErrors.append("step \(i+1): target not found (\(step.effectiveUid ?? step.effectiveName ?? ""))")
+                        let requestedTarget = step.effectiveUid ?? step.effectiveName ?? (step.index != nil ? String(step.index!) : "")
+                        if requestedTarget.isEmpty {
+                            stepErrors.append("step \(i+1) (\(op)): missing target (uid, name, or target)")
+                        } else {
+                            stepErrors.append("step \(i+1): target not found (\(requestedTarget))")
+                        }
                     }
                     continue
                 }
@@ -1263,6 +1887,17 @@ func executeRequest(_ req: BatchRequest) -> String {
                 if op == "move" {
                     continue
                 } else if op == "click" {
+                    if let rec = targetNode {
+                        let liveEnabled = rec.enabled && readBatchedAttrs(el).enabled
+                        if !liveEnabled,
+                           let disabledOpen = detectDisabledNSOpenPanel(nodes: currentNodes),
+                           disabledOpen.uid == rec.uid {
+                            if !(step.optional ?? false) {
+                                stepErrors.append("step \(i+1): native NSOpenPanel '\(rec.label)' button (\(rec.uid)) is disabled by macOS TCC/AppKit for synthetic AX selection; press key 'escape' to dismiss and use surface=\"web\" step {\"op\": \"upload\", \"uid\": \"...\", \"files\": [...]} via CDP DOM.setFileInputFiles")
+                            }
+                            continue
+                        }
+                    }
                     if targetNode?.role == "textfield" || targetNode?.role == "textarea" {
                         _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
                     }
@@ -1292,52 +1927,126 @@ func executeRequest(_ req: BatchRequest) -> String {
                         stepErrors.append("step \(i+1): AXPress failed (\(err.rawValue))")
                     }
                 } else {
-                    let textStr = step.value ?? ""
-                    let val = textStr as CFTypeRef
-                    let isTextarea = (targetNode?.role == "textarea")
-                    var didStick = false
-                    if !isTextarea {
+                    guard let textStr = step.effectiveValue else {
+                        if !(step.optional ?? false) {
+                            stepErrors.append("step \(i+1): set op requires 'value' (or 'text') parameter")
+                        }
+                        continue
+                    }
+                    let expectedClean = cleanText(textStr as AnyObject)
+                    let role = targetNode?.role ?? ""
+                    let subrole = axString(el, kAXSubroleAttribute)
+                    let isSecure = (subrole == "AXSecureTextField" || role == "securetextfield")
+                    let isTextarea = (role == "textarea")
+                    let inWebArea = isElementInWebArea(el)
+                    let beforeDesc = isTextarea
+                        ? collectDescendantStaticText(el)
+                        : (text: "", staticCount: 0, childCount: 0)
+                    let beforeRawVal = axString(el, kAXValueAttribute)
+                    let beforeEffective = (!beforeDesc.text.isEmpty && (beforeDesc.staticCount > 1 || beforeDesc.text.count > beforeRawVal.count))
+                        ? beforeDesc.text
+                        : beforeRawVal
+                    let isWebRichTextarea = isTextarea && inWebArea && (beforeDesc.childCount > 0)
+
+                    var verified = false
+                    var actualAfter = beforeEffective
+
+                    // Pure AX attribute setting (clipboard-free; skipped on multi-block web rich-text to avoid corrupting cached kAXValueAttribute)
+                    if !isWebRichTextarea {
                         _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                        var err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                        var err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, textStr as CFTypeRef)
                         if err == .invalidUIElement || err == .cannotComplete {
                             (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
                             if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
                                 el = refreshed
+                                targetNode = state.uidToRecord[uid]
                                 _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                                err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                                err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, textStr as CFTypeRef)
                             }
                         }
-                        didStick = (err == .success) && (textStr.isEmpty || !axString(el, kAXValueAttribute).isEmpty)
+                        var check = verifyElementSetValue(
+                            el,
+                            role: role,
+                            inWebArea: inWebArea,
+                            isSecure: isSecure,
+                            expectedClean: expectedClean,
+                            usedPureAXOnlyOnWebRichText: false
+                        )
+                        if !check.verified {
+                            _ = replaceViaAXSelectedText(el, text: textStr)
+                            check = verifyElementSetValue(
+                                el,
+                                role: role,
+                                inWebArea: inWebArea,
+                                isSecure: isSecure,
+                                expectedClean: expectedClean,
+                                usedPureAXOnlyOnWebRichText: false
+                            )
+                        }
+                        verified = check.verified
+                        actualAfter = check.actual
                     }
-                    if !didStick {
+
+                    // Non-destructive UTF-16 CGEvent typing fallback (strictly gated on rootIsMain; clipboard-free)
+                    if !verified && rootIsMain {
                         _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
                         _ = AXUIElementPerformAction(el, kAXPressAction as CFString)
-                        Thread.sleep(forTimeInterval: 0.025)
-                        _ = invokeMenuBar(app.pid, path: ["Edit", "Select All"])
+                        Thread.sleep(forTimeInterval: 0.020)
+                        _ = selectAllViaAX(el)
+                        postKeyChordToPid(app.pid, chord: "cmd+a")
                         Thread.sleep(forTimeInterval: 0.015)
-                        if textStr.isEmpty {
-                            if !invokeMenuBar(app.pid, path: ["Edit", "Delete"]) {
-                                postKeyChordToPid(app.pid, chord: "backspace")
+                        postKeyChordToPid(app.pid, chord: "backspace")
+                        Thread.sleep(forTimeInterval: 0.020)
+
+                        var canType = true
+                        if isWebRichTextarea && !beforeEffective.isEmpty {
+                            let afterClear = verifyElementSetValue(
+                                el,
+                                role: role,
+                                inWebArea: inWebArea,
+                                isSecure: isSecure,
+                                expectedClean: "",
+                                usedPureAXOnlyOnWebRichText: false
+                            )
+                            if !afterClear.verified && afterClear.actual.count >= beforeEffective.count {
+                                canType = false
+                                actualAfter = afterClear.actual
                             }
-                        } else {
-                            let pb = NSPasteboard.general
-                            let oldStr = pb.string(forType: .string)
-                            pb.clearContents()
-                            pb.setString(textStr, forType: .string)
-                            if invokeMenuBar(app.pid, path: ["Edit", "Paste"]) {
-                                Thread.sleep(forTimeInterval: 0.050)
-                            } else {
+                        }
+                        if canType {
+                            if !textStr.isEmpty {
                                 postBatchedUnicodeTextToPid(app.pid, text: textStr)
+                                Thread.sleep(forTimeInterval: 0.030)
                             }
-                            if let prev = oldStr {
-                                pb.clearContents()
-                                pb.setString(prev, forType: .string)
-                            }
+                            let check = verifyElementSetValue(
+                                el,
+                                role: role,
+                                inWebArea: inWebArea,
+                                isSecure: isSecure,
+                                expectedClean: expectedClean,
+                                usedPureAXOnlyOnWebRichText: false
+                            )
+                            verified = check.verified
+                            actualAfter = check.actual
+                        }
+                    }
+
+                    if !verified && !(step.optional ?? false) {
+                        let uidLabel = targetNode?.uid ?? step.effectiveUid ?? step.effectiveName ?? role
+                        let preview = actualAfter.count > 80 ? String(actualAfter.prefix(80)) + "..." : actualAfter
+                        if !rootIsMain {
+                            stepErrors.append("step \(i+1): set on \(role) \(uidLabel) could not verify value replacement on non-main window \"\(winTitle)\" (actual=\"\(preview)\"); CGEvent typing skipped to avoid leaking keys to AXMainWindow — use surface=\"web\" MV3 extension bridge")
+                        } else if inWebArea {
+                            stepErrors.append("step \(i+1): set on web \(role) \(uidLabel) could not verify value replacement (actual=\"\(preview)\"); for web rich-text/contenteditable editors in Chrome, use surface=\"web\" with the MV3 extension bridge")
+                        } else {
+                            stepErrors.append("step \(i+1): set on \(role) \(uidLabel) could not verify value replacement (actual=\"\(preview)\")")
                         }
                     }
                 }
             default:
-                break
+                if !(step.optional ?? false) {
+                    stepErrors.append("step \(i+1): unsupported op '\(op)'; supported ops: click, set, move, type, key, menu, wait, settle, ocr")
+                }
             }
         }
     }
@@ -1360,6 +2069,10 @@ func executeRequest(_ req: BatchRequest) -> String {
         if !hasQuery && !currentNodes.isEmpty {
             state.latestWindowNodes[winKey] = currentNodes
             state.latestWindowElements[winKey] = currentElements
+        }
+        if let disabledOpen = detectDisabledNSOpenPanel(nodes: currentNodes),
+           !stepErrors.contains(where: { $0.contains("NSOpenPanel") }) {
+            stepErrors.append("native NSOpenPanel file sheet detected with disabled '\(disabledOpen.label)' button (\(disabledOpen.uid)) — macOS TCC blocks synthetic AX file-panel confirmation; press key 'escape' to dismiss and use surface=\"web\" step {\"op\": \"upload\", \"uid\": \"...\", \"files\": [...]} via CDP DOM.setFileInputFiles")
         }
     } else {
         newCrc = crc32(currentNodes.map { $0.compactLine }.joined(separator: "\n"))
@@ -1384,6 +2097,9 @@ func executeRequest(_ req: BatchRequest) -> String {
     state.documentedApps.insert(docKey)
 
     var header = "# app=\"\(app.name)\" pid=\(app.pid) win=\"\(winTitle)\""
+    if !rootIsMain {
+        header += " main=false"
+    }
     if agentId != "default" {
         header += " agent=\"\(agentId)\""
     }
@@ -1420,6 +2136,32 @@ func executeRequest(_ req: BatchRequest) -> String {
         }
     }
     return out.joined(separator: "\n")
+}
+
+enum DecodedBatchRequest {
+    case ok(BatchRequest)
+    case err(String)
+}
+
+func decodeBatchRequestOrError(_ rawData: Data) -> DecodedBatchRequest {
+    if let req = try? JSONDecoder().decode(BatchRequest.self, from: rawData) {
+        return .ok(req)
+    }
+    guard let jsonObj = try? JSONSerialization.jsonObject(with: rawData, options: []),
+          let dict = jsonObj as? [String: Any] else {
+        return .err("Error: invalid JSON request")
+    }
+    if let stepsVal = dict["steps"], !(stepsVal is NSNull) {
+        guard let stepsArr = stepsVal as? [Any] else {
+            return .err("Error: 'steps' must be a JSON array of step objects")
+        }
+        for (idx, item) in stepsArr.enumerated() {
+            if !(item is [String: Any]) {
+                return .err("Error: step \(idx + 1) must be a JSON object")
+            }
+        }
+    }
+    return .err("Error: invalid request schema")
 }
 
 let defaultSocketPath = "/tmp/fmu-ax.sock"
@@ -1510,9 +2252,13 @@ func runDaemon(socketPath: String) -> Never {
                 return
             }
             let resp: String
-            if let cleanData = trimmed.data(using: .utf8),
-               let req = try? JSONDecoder().decode(BatchRequest.self, from: cleanData) {
-                resp = executeRequest(req)
+            if let cleanData = trimmed.data(using: .utf8) {
+                switch decodeBatchRequestOrError(cleanData) {
+                case .ok(let req):
+                    resp = executeRequest(req)
+                case .err(let errMsg):
+                    resp = errMsg
+                }
             } else {
                 resp = "Error: invalid JSON request"
             }
@@ -1553,10 +2299,18 @@ if let daemonResp = trySendToDaemon(socketPath: defaultSocketPath, payload: rawP
     exit(0)
 }
 
-guard let reqData = rawPayload.data(using: .utf8),
-      let req = try? JSONDecoder().decode(BatchRequest.self, from: reqData) else {
+guard let reqData = rawPayload.data(using: .utf8) else {
     fputs("Invalid JSON request\n", stderr)
     exit(2)
 }
 
-print(executeRequest(req))
+switch decodeBatchRequestOrError(reqData) {
+case .ok(let req):
+    print(executeRequest(req))
+case .err(let errMsg):
+    if errMsg == "Error: invalid JSON request" {
+        fputs("Invalid JSON request\n", stderr)
+        exit(2)
+    }
+    print(errMsg)
+}

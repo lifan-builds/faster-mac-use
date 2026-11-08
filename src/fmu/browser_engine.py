@@ -20,6 +20,7 @@ IN_PAGE_RUNTIME_JS = r"""
   if (window.__fmu) return true;
 
   const elToUid = new WeakMap();
+  const elToStableLabel = new WeakMap();
   const uidToRef = new Map();
   const agentStates = new Map();
   const virtualTools = new Map();
@@ -118,7 +119,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const evInit = {
       bubbles: true,
       cancelable: true,
-       view: window,
+      view: window,
       clientX: x,
       clientY: y,
       screenX: x,
@@ -168,6 +169,37 @@ IN_PAGE_RUNTIME_JS = r"""
     return uid;
   }
 
+  function isContentEditableEl(el) {
+    if (!el || !el.getAttribute) return false;
+    const ce = el.getAttribute("contenteditable");
+    return Boolean(
+      el.isContentEditable
+      || ce === "true"
+      || ce === "plaintext-only"
+      || (ce === "" && el.hasAttribute("contenteditable"))
+    );
+  }
+
+  function getCandidateAliases(el) {
+    const aliases = [getLabel(el)];
+    if (el && el.getAttribute) {
+      for (const attr of ["aria-label", "placeholder", "data-placeholder", "aria-placeholder", "data-testid", "name", "title"]) {
+        const v = el.getAttribute(attr);
+        if (v) aliases.push(cleanStr(v));
+      }
+      if (el.parentElement && el.parentElement.closest) {
+        const anc = el.parentElement.closest("[aria-label], [data-placeholder], [aria-placeholder], [data-testid]");
+        if (anc) {
+          for (const attr of ["aria-label", "data-placeholder", "aria-placeholder", "data-testid"]) {
+            const v = anc.getAttribute(attr);
+            if (v) aliases.push(cleanStr(v));
+          }
+        }
+      }
+    }
+    return aliases.filter(Boolean).map(s => s.toLowerCase());
+  }
+
   function resolveEl(target) {
     if (!target) return null;
     const t = String(target).trim();
@@ -187,14 +219,14 @@ IN_PAGE_RUNTIME_JS = r"""
     const byId = document.getElementById(t);
     if (byId) return byId;
     const lower = t.toLowerCase();
-    const candidates = document.querySelectorAll("button, a, input, select, textarea, canvas, [role], label, h1, h2, h3, [data-testid]");
+    const candidates = document.querySelectorAll("button, a, input, select, textarea, canvas, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], [role], label, h1, h2, h3, [data-testid], [data-placeholder], [aria-placeholder]");
     for (const el of candidates) {
-      const label = getLabel(el).toLowerCase();
-      if (label === lower) return el;
+      const aliases = getCandidateAliases(el);
+      if (aliases.includes(lower)) return el;
     }
     for (const el of candidates) {
-      const label = getLabel(el).toLowerCase();
-      if (label.includes(lower)) return el;
+      const aliases = getCandidateAliases(el);
+      if (aliases.some(a => a.includes(lower))) return el;
     }
     return null;
   }
@@ -216,6 +248,7 @@ IN_PAGE_RUNTIME_JS = r"""
   function getRole(el) {
     const explicit = el.getAttribute("role");
     if (explicit) return explicit.toLowerCase();
+    if (isContentEditableEl(el)) return "textbox";
     const tag = el.tagName.toLowerCase();
     if (tag === "a") return "link";
     if (tag === "button") return "button";
@@ -234,13 +267,52 @@ IN_PAGE_RUNTIME_JS = r"""
   }
 
   function getLabel(el) {
-    const aria = el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("placeholder");
-    if (aria) return cleanStr(aria);
+    const aria = el.getAttribute("aria-label")
+      || el.getAttribute("title")
+      || el.getAttribute("placeholder")
+      || el.getAttribute("data-placeholder")
+      || el.getAttribute("aria-placeholder");
+    if (aria) {
+      const cleaned = cleanStr(aria);
+      if (isContentEditableEl(el)) elToStableLabel.set(el, cleaned);
+      return cleaned;
+    }
     if (el.id) {
       try {
         const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
         if (lbl) return cleanStr(lbl.innerText || lbl.textContent);
       } catch (_) {}
+    }
+    if (isContentEditableEl(el)) {
+      const parent = el.parentElement;
+      if (parent) {
+        const ph = parent.querySelector(".public-DraftEditorPlaceholder-root, [data-placeholder], .placeholder");
+        if (ph && ph !== el) {
+          const phText = ph.getAttribute("data-placeholder") || ph.innerText || ph.textContent;
+          if (phText) {
+            const cleaned = cleanStr(phText);
+            elToStableLabel.set(el, cleaned);
+            return cleaned;
+          }
+        }
+        const ancestor = parent.closest && parent.closest("[aria-label], [data-placeholder], [aria-placeholder]");
+        if (ancestor) {
+          const ancLabel = ancestor.getAttribute("aria-label")
+            || ancestor.getAttribute("data-placeholder")
+            || ancestor.getAttribute("aria-placeholder");
+          if (ancLabel) {
+            const cleaned = cleanStr(ancLabel);
+            if (!elToStableLabel.has(el)) elToStableLabel.set(el, cleaned);
+            return elToStableLabel.get(el) || cleaned;
+          }
+        }
+      }
+      if (elToStableLabel.has(el)) {
+        return elToStableLabel.get(el);
+      }
+      const fallback = cleanStr(el.getAttribute("name") || el.getAttribute("data-testid") || el.id || "richtext");
+      elToStableLabel.set(el, fallback);
+      return fallback;
     }
     const tag = el.tagName.toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select" || tag === "canvas") {
@@ -250,6 +322,9 @@ IN_PAGE_RUNTIME_JS = r"""
   }
 
   function getValue(el) {
+    if (isContentEditableEl(el)) {
+      return cleanStr(el.innerText || el.textContent || "", 80);
+    }
     const tag = el.tagName.toLowerCase();
     if (tag === "input") {
       const type = (el.getAttribute("type") || "text").toLowerCase();
@@ -267,7 +342,7 @@ IN_PAGE_RUNTIME_JS = r"""
 
   function collectSnapshot(query = "", maxItems = 180, foldTables = true) {
     const q = String(query || "").toLowerCase();
-    const sel = "button, a[href], input, select, textarea, canvas, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='switch'], [role='option'], [contenteditable='true'], h1, h2, h3, [data-status], [role='status'], [role='alert'], output, .result, #result, #status";
+    const sel = "button, a[href], input, select, textarea, canvas, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='switch'], [role='option'], [role='textbox'], [role='searchbox'], [role='combobox'], [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], h1, h2, h3, [data-status], [role='status'], [role='alert'], output, .result, #result, #status";
     const nodes = document.querySelectorAll(sel);
     const currentMap = new Map();
     const lines = [];
@@ -279,6 +354,15 @@ IN_PAGE_RUNTIME_JS = r"""
     for (const el of nodes) {
       if (currentMap.size >= maxItems) break;
       if (!isVisible(el)) continue;
+      if (
+        el.parentElement
+        && el.parentElement.closest("[contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']")
+      ) {
+        const tag = el.tagName.toLowerCase();
+        if (tag !== "button" && tag !== "a" && tag !== "input" && tag !== "select") {
+          continue;
+        }
+      }
       const role = getRole(el);
       const label = getLabel(el);
       const val = getValue(el);
@@ -383,19 +467,101 @@ IN_PAGE_RUNTIME_JS = r"""
     return delta;
   }
 
-  function setNativeValue(el, value) {
-    const tag = el.tagName.toLowerCase();
+  function setNativeValue(el, value, append = false) {
+    let target = el;
+    const tag0 = target.tagName ? target.tagName.toLowerCase() : "";
+    if (tag0 !== "input" && tag0 !== "textarea" && tag0 !== "select" && !isContentEditableEl(target)) {
+      const inner = target.querySelector && target.querySelector("[contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], textarea, input");
+      if (inner) target = inner;
+    }
+
+    const strVal = String(value ?? "");
+    if (isContentEditableEl(target)) {
+      target.focus({ preventScroll: true });
+      const selectContents = (collapseToEnd) => {
+        const sel = window.getSelection && window.getSelection();
+        if (sel) {
+          const range = document.createRange();
+          range.selectNodeContents(target);
+          if (collapseToEnd) range.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+      };
+      const normWs = (s) => String(s || "").replace(/\s+/g, " ").trim();
+      const prevNorm = normWs(target.innerText || target.textContent || "");
+      selectContents(append);
+      if (!append && prevNorm.length > 0) {
+        try {
+          const delBi = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "deleteContentBackward", data: null });
+          target.dispatchEvent(delBi);
+        } catch (_) {}
+        if (normWs(target.innerText || target.textContent || "").length > 0) {
+          selectContents(false);
+          try {
+            document.execCommand("delete", false, null);
+          } catch (_) {}
+        }
+        if (normWs(target.innerText || target.textContent || "").length > 0) {
+          const leaves = target.querySelectorAll ? target.querySelectorAll("[data-text='true']") : [];
+          if (leaves && leaves.length === 1) {
+            leaves[0].textContent = "";
+          } else {
+            target.textContent = "";
+          }
+          target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+        }
+      }
+      if (strVal.length > 0) {
+        selectContents(true);
+        const expNorm = normWs(strVal);
+        const expectedFullNorm = append && prevNorm.length > 0 ? normWs(prevNorm + " " + expNorm) : expNorm;
+        try {
+          const bi = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: strVal });
+          target.dispatchEvent(bi);
+        } catch (_) {}
+        const afterBiNorm = normWs(target.innerText || target.textContent || "");
+        const okAfterBi = append
+          ? (afterBiNorm === expectedFullNorm || (afterBiNorm.endsWith(expNorm) && afterBiNorm.length > prevNorm.length))
+          : (afterBiNorm === expNorm);
+        let inserted = okAfterBi;
+        if (!okAfterBi) {
+          selectContents(true);
+          try {
+            inserted = Boolean(document.execCommand("insertText", false, strVal));
+          } catch (_) {}
+        }
+        const afterExecNorm = normWs(target.innerText || target.textContent || "");
+        const okAfterExec = append ? afterExecNorm.endsWith(expNorm) : (afterExecNorm === expNorm);
+        if (!inserted && !okAfterExec) {
+          const leaf = target.querySelector && target.querySelector("[data-text='true']");
+          if (leaf) {
+            leaf.textContent = append ? ((leaf.textContent || "") + strVal) : strVal;
+          } else {
+            target.textContent = append ? ((target.textContent || "") + strVal) : strVal;
+          }
+          target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: strVal }));
+        }
+      }
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      mutationSeq++;
+      return;
+    }
+
+    const tag = target.tagName.toLowerCase();
+    const finalVal = append ? (String(target.value || "") + strVal) : strVal;
     const proto = tag === "textarea"
       ? window.HTMLTextAreaElement.prototype
       : window.HTMLInputElement.prototype;
     const desc = Object.getOwnPropertyDescriptor(proto, "value");
     if (desc && desc.set) {
-      desc.set.call(el, String(value));
+      desc.set.call(target, finalVal);
     } else {
-      el.value = String(value);
+      target.value = finalVal;
     }
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: String(value) }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
+    target.dispatchEvent(new InputEvent("input", { bubbles: true, data: finalVal }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    mutationSeq++;
   }
 
   async function waitQuietDom(quietMs = 15, maxWaitMs = 110) {
@@ -503,6 +669,12 @@ IN_PAGE_RUNTIME_JS = r"""
     }
   }
 
+  const VALID_WEB_OPS = new Set([
+    "click", "upload", "fill", "set", "type", "select", "move",
+    "press", "key", "wait", "settle", "eval", "webmcp", "calltool",
+    "goto", "navigate", "open", "close", "snapshot", "diff", "ocr"
+  ]);
+
   async function executeBatch(req) {
     if (req.virtualTools) {
       registerVirtualTools(req.virtualTools);
@@ -545,22 +717,38 @@ IN_PAGE_RUNTIME_JS = r"""
     const escalations = [];
 
     for (let i = 0; i < steps.length; i++) {
-      const s = steps[i];
-      let op = String(s.op || s.action || "").toLowerCase();
+      const s = steps[i] || {};
+      let op = String(s.op || s.action || "").trim().toLowerCase();
       const targetRef = s.uid || s.ref || s.target || s.selector || s.name;
+      const stepValue = s.value !== undefined ? s.value : s.text;
+      if (!op) {
+        if (!s.optional) {
+          errors.push(`step ${i + 1}: missing 'op' (or 'action') field; valid ops: click, fill, set, type, select, upload, move, press, key, wait, eval, callTool`);
+        }
+        continue;
+      }
       if (op === "press" && targetRef && String(targetRef).startsWith("@") && !s.key) {
         op = "click";
       }
       if (op === "hover" || op === "cursor" || op === "point") {
         op = "move";
       }
+      if (!VALID_WEB_OPS.has(op)) {
+        if (!s.optional) {
+          errors.push(`step ${i + 1}: unsupported op '${op}'; valid ops: click, fill, set, type, select, upload, move, press, key, wait, eval, callTool`);
+        }
+        continue;
+      }
       try {
-        if (op === "wait") {
+        if (op === "wait" || op === "settle") {
           await new Promise(r => setTimeout(r, Number(s.ms || 25)));
           continue;
         }
+        if (op === "snapshot" || op === "diff" || op === "ocr") {
+          continue;
+        }
         if (op === "eval") {
-          const code = String(s.code || s.value || "");
+          const code = String(s.code || stepValue || "");
           const body = code.includes("return ") ? code : `return (${code})`;
           const fn = new Function(body);
           const res = await fn();
@@ -569,7 +757,7 @@ IN_PAGE_RUNTIME_JS = r"""
         }
         if (op === "webmcp" || op === "calltool") {
           const tName = s.tool || s.name || s.target;
-          const res = await invokeWebMcp(tName, s.args || s.value || {});
+          const res = await invokeWebMcp(tName, s.args || stepValue || {});
           mutationSeq++;
           if (res !== undefined) {
             evalOutputs.push(`webmcp(${tName}): ${typeof res === "string" ? res : JSON.stringify(res)}`);
@@ -577,7 +765,7 @@ IN_PAGE_RUNTIME_JS = r"""
           continue;
         }
         if (op === "press" || op === "key") {
-          const key = s.key || s.name || s.value || "Enter";
+          const key = s.key || s.name || stepValue || "Enter";
           const active = document.activeElement || document.body;
           active.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
           active.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
@@ -592,6 +780,13 @@ IN_PAGE_RUNTIME_JS = r"""
           updateAgentCursor(st, hitEl, op, s.x, s.y);
           if (op === "click") {
             dispatchCanvasClick({ x: s.x, y: s.y, label: "@xy", uid: "@xy", canvasUid: "" });
+          }
+          continue;
+        }
+
+        if (!targetRef) {
+          if (!s.optional) {
+            errors.push(`step ${i + 1} (${op}): missing target (provide 'uid', 'name', 'target', 'selector', or 'x'/'y')`);
           }
           continue;
         }
@@ -615,7 +810,7 @@ IN_PAGE_RUNTIME_JS = r"""
               continue;
             } else if (op === "fill" || op === "set" || op === "type") {
               dispatchCanvasClick(ocrItem);
-              const textVal = String(s.value ?? "");
+              const textVal = String(stepValue ?? "");
               const active = document.activeElement || document.body;
               for (const ch of textVal) {
                 active.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
@@ -637,28 +832,49 @@ IN_PAGE_RUNTIME_JS = r"""
           let fileEl = (el.tagName.toLowerCase() === "input" && (el.type || "").toLowerCase() === "file") ? el : null;
           if (!fileEl && (s.files || op === "upload")) {
             fileEl = el.querySelector && el.querySelector("input[type='file']");
-            if (!fileEl && el.tagName.toLowerCase() === "label" && el.htmlFor) {
-              const forEl = document.getElementById(el.htmlFor);
-              if (forEl && forEl.tagName.toLowerCase() === "input" && (forEl.type || "").toLowerCase() === "file") {
-                fileEl = forEl;
+            if (!fileEl) {
+              const lbl = el.tagName.toLowerCase() === "label" ? el : (el.closest && el.closest("label"));
+              if (lbl) {
+                fileEl = lbl.querySelector && lbl.querySelector("input[type='file']");
+                if (!fileEl && lbl.htmlFor) {
+                  const forEl = document.getElementById(lbl.htmlFor);
+                  if (forEl && forEl.tagName.toLowerCase() === "input" && (forEl.type || "").toLowerCase() === "file") {
+                    fileEl = forEl;
+                  }
+                }
               }
+            }
+            if (!fileEl) {
+              let anc = el.parentElement;
+              for (let d = 0; d < 4 && anc && anc !== document.body; d++, anc = anc.parentElement) {
+                const candidate = anc.querySelector && anc.querySelector("input[type='file']");
+                if (candidate) {
+                  fileEl = candidate;
+                  break;
+                }
+              }
+            }
+            if (!fileEl) {
+              fileEl = document.querySelector("input[type='file']");
             }
           }
           if (fileEl || s.files || op === "upload") {
             const targetFileEl = fileEl || el;
             const fUid = getUid(targetFileEl);
-            targetFileEl.setAttribute("data-fmu-upload-uid", fUid);
-            escalations.push({ step: i + 1, reason: "file_input", uid: fUid });
+            if (fileEl) {
+              fileEl.setAttribute("data-fmu-upload-uid", fUid);
+            }
+            escalations.push({ step: i + 1, reason: "file_input", uid: fileEl ? fUid : "" });
             continue;
           }
           el.focus({ preventScroll: true });
           el.click();
         } else if (op === "fill" || op === "set" || op === "type") {
           el.focus({ preventScroll: true });
-          setNativeValue(el, s.value ?? "");
+          setNativeValue(el, stepValue ?? "", Boolean(s.append));
         } else if (op === "select") {
           el.focus({ preventScroll: true });
-          const desired = String(s.value ?? "");
+          const desired = String(stepValue ?? "");
           let matched = false;
           if (el.options) {
             for (const opt of el.options) {
@@ -801,6 +1017,7 @@ class ExtensionWebSocketBridge:
             preferred_port = int(os.environ.get("FMU_BRIDGE_PORT", "19222"))
         self.preferred_port = preferred_port
         self.port: int = 0
+        self.port_fallback_reason: str | None = None
         self._srv_sock: socket.socket | None = None
         self._client_sock: socket.socket | None = None
         self._client_lock = threading.Lock()
@@ -816,13 +1033,45 @@ class ExtensionWebSocketBridge:
     def _start_server(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind(("127.0.0.1", self.preferred_port))
-        except OSError:
+        bound = False
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                srv.bind(("127.0.0.1", self.preferred_port))
+                bound = True
+                break
+            except OSError as exc:
+                last_err = exc
+                if attempt < 2:
+                    time.sleep(0.04)
+        if not bound:
+            self.port_fallback_reason = str(last_err) if last_err else "address in use"
             srv.bind(("127.0.0.1", 0))
         srv.listen(8)
         self.port = int(srv.getsockname()[1])
         self._srv_sock = srv
+        t = threading.Thread(target=self._accept_loop, name="fmu-ext-ws-bridge", daemon=True)
+        t.start()
+
+    def ensure_preferred_port(self) -> None:
+        if self._stopped or self.port == self.preferred_port or self.is_connected():
+            return
+        try:
+            test_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            test_srv.bind(("127.0.0.1", self.preferred_port))
+        except OSError:
+            return
+        old_srv = self._srv_sock
+        test_srv.listen(8)
+        self._srv_sock = test_srv
+        self.port = int(test_srv.getsockname()[1])
+        self.port_fallback_reason = None
+        if old_srv is not None:
+            try:
+                old_srv.close()
+            except Exception:
+                pass
         t = threading.Thread(target=self._accept_loop, name="fmu-ext-ws-bridge", daemon=True)
         t.start()
 
@@ -831,7 +1080,19 @@ class ExtensionWebSocketBridge:
             return self._client_sock is not None and self._ready_event.is_set()
 
     def wait_connected(self, timeout: float = 2.0) -> bool:
+        self.ensure_preferred_port()
         return self._ready_event.wait(timeout=timeout) and self.is_connected()
+
+    def get_status(self) -> dict[str, Any]:
+        self.ensure_preferred_port()
+        return {
+            "connected": self.is_connected(),
+            "port": self.port,
+            "preferredPort": self.preferred_port,
+            "wsUrl": f"ws://127.0.0.1:{self.preferred_port}/ext",
+            "portFallbackReason": self.port_fallback_reason,
+            "client": dict(self._hello_info),
+        }
 
     def _accept_loop(self) -> None:
         while not self._stopped and self._srv_sock is not None:
@@ -1009,17 +1270,31 @@ class _ExtensionCdpAdapter:
         self.chrome_tab_id = chrome_tab_id
 
     def send(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        cmd_params = params or {}
         return self._bridge.call_rpc(
             "cdp",
-            {"tabId": self.chrome_tab_id, "method": method, "commandParams": params or {}},
+            {
+                "tabId": self.chrome_tab_id,
+                "method": method,
+                "cdpMethod": method,
+                "commandParams": cmd_params,
+                "cdpParams": cmd_params,
+            },
         )
 
 
 class _ExtensionPageAdapter:
-    def __init__(self, bridge: ExtensionWebSocketBridge, chrome_tab_id: int, initial_url: str = "about:blank") -> None:
+    def __init__(
+        self,
+        bridge: ExtensionWebSocketBridge,
+        chrome_tab_id: int,
+        initial_url: str = "about:blank",
+        window_id: int | None = None,
+    ) -> None:
         self._bridge = bridge
         self.chrome_tab_id = chrome_tab_id
         self.url = initial_url
+        self.window_id = window_id
         self._closed = False
 
     def is_closed(self) -> bool:
@@ -1036,6 +1311,15 @@ class _ExtensionPageAdapter:
         else:
             self.url = url
         return res or {"url": self.url}
+
+    def set_input_files(self, selector: str, files: str | list[str]) -> dict[str, Any]:
+        file_list = [str(files)] if isinstance(files, (str, Path)) else [str(f) for f in files]
+        res = self._bridge.call_rpc(
+            "setInputFiles",
+            {"tabId": self.chrome_tab_id, "selector": selector, "files": file_list},
+            timeout=10.0,
+        )
+        return res if isinstance(res, dict) else {"ok": True}
 
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         expr_str = expression.strip()
@@ -1159,12 +1443,25 @@ class BrowserEngine:
         self._next_tab_num: int = 1
         self.cursors: dict[str, dict[str, Any]] = {}
         self._agent_colors: dict[str, str] = {}
-        self._ext_bridge = ExtensionWebSocketBridge()
+        self._ext_bridge_inst: ExtensionWebSocketBridge | None = None
+        self._bridge_lock = threading.Lock()
 
         self._cmd_q: queue.Queue[tuple[Callable[[], Any], threading.Event, list[Any]] | None] = queue.Queue()
         self._worker_tid: int = 0
         self._worker = threading.Thread(target=self._worker_loop, name="fmu-pw-worker", daemon=True)
         self._worker.start()
+
+    @property
+    def _ext_bridge(self) -> ExtensionWebSocketBridge:
+        with self._bridge_lock:
+            if self._ext_bridge_inst is None:
+                self._ext_bridge_inst = ExtensionWebSocketBridge()
+            else:
+                self._ext_bridge_inst.ensure_preferred_port()
+            return self._ext_bridge_inst
+
+    def ensure_bridge(self) -> ExtensionWebSocketBridge:
+        return self._ext_bridge
 
     @property
     def bridge_port(self) -> int:
@@ -1173,6 +1470,9 @@ class BrowserEngine:
     @property
     def extension_connected(self) -> bool:
         return self._ext_bridge.is_connected()
+
+    def get_bridge_status(self) -> dict[str, Any]:
+        return self._ext_bridge.get_status()
 
     @staticmethod
     def _macros_dir() -> Path:
@@ -1194,6 +1494,21 @@ class BrowserEngine:
             return re.sub(r"[^a-z0-9._-]", "_", host) or "global"
         except Exception:
             return "global"
+
+    @staticmethod
+    def _is_external_url(url: str | None) -> bool:
+        if not url:
+            return False
+        raw = str(url).strip()
+        if not raw.startswith(("http://", "https://")):
+            return False
+        try:
+            host = (urlparse(raw).hostname or "").lower()
+        except Exception:
+            return False
+        if not host or host in ("localhost", "127.0.0.1", "::1", "example.com", "www.example.com"):
+            return False
+        return True
 
     def save_macro(
         self,
@@ -1324,7 +1639,7 @@ class BrowserEngine:
                 )
             except Exception:
                 canvases = []
-        if not canvases:
+        if not canvases or not isinstance(canvases, list):
             return []
 
         from .mac_engine import MacNativeEngine
@@ -1568,17 +1883,69 @@ class BrowserEngine:
         session_name: str = "🤖 Agent",
         tab_id: str | None = None,
         group_color: str = "blue",
+        window: str | None = None,
+        window_id: int | None = None,
+        reuse_existing: bool = False,
+        require_extension: bool = False,
     ) -> BrowserTabSession:
-        return self._run_sync(lambda: self._create_tab_inner(url, mode, session_name, tab_id, group_color))
+        return self._run_sync(
+            lambda: self._create_tab_inner(
+                url,
+                mode,
+                session_name,
+                tab_id,
+                group_color,
+                window=window,
+                window_id=window_id,
+                reuse_existing=reuse_existing,
+                require_extension=require_extension,
+            )
+        )
 
-    def _should_use_extension_bridge(self, mode: str) -> bool:
-        if not self._ext_bridge.is_connected():
+    def _extension_diagnostic_error(self) -> str:
+        ext_dir = Path(__file__).resolve().parents[2] / "extension"
+        port_note = ""
+        if self._ext_bridge.port != self._ext_bridge.preferred_port:
+            reason = self._ext_bridge.port_fallback_reason or "port in use"
+            port_note = f" (daemon bound to fallback port {self._ext_bridge.port} because {self._ext_bridge.preferred_port} was busy: {reason})"
+        return (
+            f"MV3 extension not connected on ws://127.0.0.1:{self._ext_bridge.preferred_port}/ext{port_note}; "
+            f"load {ext_dir} in Chrome or pass mode='headless'"
+        )
+
+    def _should_use_extension_bridge(
+        self,
+        mode: str,
+        require_extension: bool = False,
+        url: str | None = None,
+        window: str | None = None,
+        window_id: int | None = None,
+        reuse_existing: bool = False,
+    ) -> bool:
+        explicit_ext = mode in ("extension", "chrome-extension", "live") or require_extension
+        if mode == "headless" and not explicit_ext:
             return False
-        if mode == "extension":
+        use_ext_env = os.environ.get("FMU_USE_EXTENSION", "1") != "0"
+        must_use_ext = explicit_ext or (
+            mode == "chrome"
+            and use_ext_env
+            and not self._find_chrome_devtools_ws()
+            and (
+                self._is_external_url(url)
+                or window is not None
+                or window_id is not None
+                or reuse_existing
+            )
+        )
+        if must_use_ext:
+            if not self._ext_bridge.is_connected():
+                self._ext_bridge.wait_connected(timeout=0.35)
+            if not self._ext_bridge.is_connected():
+                raise RuntimeError(self._extension_diagnostic_error())
             return True
-        if mode == "headless":
+        if not use_ext_env or self._ext_bridge_inst is None or not self._ext_bridge.is_connected():
             return False
-        return os.environ.get("FMU_USE_EXTENSION", "1") != "0"
+        return True
 
     def _create_tab_inner(
         self,
@@ -1587,11 +1954,31 @@ class BrowserEngine:
         session_name: str = "🤖 Agent",
         tab_id: str | None = None,
         group_color: str = "blue",
+        window: str | None = None,
+        window_id: int | None = None,
+        reuse_existing: bool = False,
+        require_extension: bool = False,
     ) -> BrowserTabSession:
         tid = tab_id or f"t{self._next_tab_num}"
+        effective_url = url or self._tab_last_urls.get(tid) or "about:blank"
+        must_use_ext = (
+            mode in ("extension", "chrome-extension", "live")
+            or require_extension
+            or (
+                mode == "chrome"
+                and os.environ.get("FMU_USE_EXTENSION", "1") != "0"
+                and not self._find_chrome_devtools_ws()
+                and (
+                    self._is_external_url(effective_url)
+                    or window is not None
+                    or window_id is not None
+                    or reuse_existing
+                )
+            )
+        )
         if tid in self._tabs:
             sess = self._tabs[tid]
-            if self._is_session_alive(sess):
+            if self._is_session_alive(sess) and (not must_use_ext or sess.is_extension):
                 if url and url != "about:blank" and sess._raw_page.url != url:
                     sess._raw_page.goto(url, wait_until="domcontentloaded", timeout=15000)
                     sess.last_url = url
@@ -1603,22 +1990,38 @@ class BrowserEngine:
                 return sess
             self._tabs.pop(tid, None)
 
-        effective_url = url or self._tab_last_urls.get(tid) or "about:blank"
-
-        if self._should_use_extension_bridge(mode):
+        if self._should_use_extension_bridge(
+            mode,
+            require_extension=require_extension,
+            url=effective_url,
+            window=window,
+            window_id=window_id,
+            reuse_existing=reuse_existing,
+        ):
             try:
-                ext_res = self._ext_bridge.call_rpc(
-                    "createBrowserTab",
-                    {
-                        "url": effective_url,
-                        "sessionName": session_name,
-                        "color": group_color,
-                    },
-                )
+                rpc_params: dict[str, Any] = {
+                    "url": effective_url,
+                    "sessionId": tid,
+                    "sessionName": session_name,
+                    "color": group_color,
+                }
+                if window:
+                    rpc_params["window"] = str(window)
+                if window_id is not None:
+                    rpc_params["windowId"] = int(window_id)
+                if reuse_existing:
+                    rpc_params["reuseExisting"] = True
+                ext_res = self._ext_bridge.call_rpc("createBrowserTab", rpc_params)
                 chrome_tab_id = int(ext_res.get("tabId", 1))
+                chrome_win_id = ext_res.get("windowId")
                 actual_url = str(ext_res.get("url") or effective_url)
                 self._next_tab_num += 1
-                ext_page = _ExtensionPageAdapter(self._ext_bridge, chrome_tab_id, initial_url=actual_url)
+                ext_page = _ExtensionPageAdapter(
+                    self._ext_bridge,
+                    chrome_tab_id,
+                    initial_url=actual_url,
+                    window_id=int(chrome_win_id) if chrome_win_id is not None else None,
+                )
                 ext_cdp = _ExtensionCdpAdapter(self._ext_bridge, chrome_tab_id)
                 sess = BrowserTabSession(
                     engine=self,
@@ -1635,7 +2038,7 @@ class BrowserEngine:
                 sess.ensure_runtime()
                 return sess
             except Exception:
-                if mode == "extension":
+                if must_use_ext:
                     raise
 
         self._ensure_browser_inner(mode=mode)
@@ -1695,6 +2098,8 @@ class BrowserEngine:
             return self._execute_batch_inner(req)
         except Exception as exc:
             msg = str(exc)
+            if "MV3 extension not connected on ws://" in msg:
+                raise
             if any(
                 tok in msg
                 for tok in (
@@ -1720,6 +2125,15 @@ class BrowserEngine:
             self._reset_inner(agent=req.get("agent") or req.get("cursor"))
             return "# fmu-web state reset"
 
+        if req.get("bridgeStatus"):
+            st = self._ext_bridge.get_status()
+            fb = f' fallbackReason="{st["portFallbackReason"]}"' if st.get("portFallbackReason") else ""
+            return (
+                f'# fmu-web bridge connected={str(st["connected"]).lower()} '
+                f'port={st["port"]} preferredPort={st["preferredPort"]} '
+                f'ws="{st["wsUrl"]}"{fb}'
+            )
+
         if req.get("saveMacro"):
             m_spec = req["saveMacro"]
             if isinstance(m_spec, str):
@@ -1742,7 +2156,11 @@ class BrowserEngine:
         default_group = "🤖 Agent" if agent_id == "default" else f"🤖 {agent_id}"
         group_name = str(req.get("sessionName") or req.get("group") or default_group)
         group_color = self._get_agent_color(agent_id)
-        mode = req.get("mode", "chrome")
+        mode = str(req.get("mode") or "chrome")
+        require_ext = bool(req.get("requireExtension")) or mode in ("extension", "chrome-extension", "live")
+        window_filter = str(req["window"]) if req.get("window") else None
+        window_id = int(req["windowId"]) if req.get("windowId") is not None else None
+        reuse_existing = bool(req.get("reuseExisting"))
         url = req.get("url")
         steps = list(req.get("steps") or [])
 
@@ -1755,15 +2173,43 @@ class BrowserEngine:
                 url = step_url
             steps = steps[1:]
 
-        if tab_id not in self._tabs or not self._is_session_alive(self._tabs[tab_id]):
-            self._tabs.pop(tab_id, None)
-            restore_url = url or self._tab_last_urls.get(tab_id) or "about:blank"
+        restore_url = url or self._tab_last_urls.get(tab_id) or "about:blank"
+        needs_ext_for_req = (
+            require_ext
+            or (
+                mode == "chrome"
+                and os.environ.get("FMU_USE_EXTENSION", "1") != "0"
+                and not self._find_chrome_devtools_ws()
+                and (
+                    self._is_external_url(restore_url)
+                    or window_filter is not None
+                    or window_id is not None
+                    or reuse_existing
+                )
+            )
+        )
+
+        if (
+            tab_id not in self._tabs
+            or not self._is_session_alive(self._tabs[tab_id])
+            or (needs_ext_for_req and not self._tabs[tab_id].is_extension)
+        ):
+            old_sess = self._tabs.pop(tab_id, None)
+            if old_sess is not None and not old_sess.is_extension:
+                try:
+                    old_sess._raw_page.close()
+                except Exception:
+                    pass
             sess = self._create_tab_inner(
                 url=restore_url,
                 mode=mode,
                 session_name=group_name,
                 tab_id=tab_id,
                 group_color=group_color,
+                window=window_filter,
+                window_id=window_id,
+                reuse_existing=reuse_existing,
+                require_extension=require_ext,
             )
         else:
             sess = self._tabs[tab_id]
@@ -1814,7 +2260,6 @@ class BrowserEngine:
                 s.get("files")
                 or (s.get("op") or s.get("action")) in ("upload", "goto", "navigate", "open")
             )
-            and not sess.is_extension
         ]
 
         if boundary_indices:
@@ -1846,6 +2291,8 @@ class BrowserEngine:
                         combined_evals.extend(res.get("evalOutputs") or [])
                     nav_url = str(b_step.get("url") or b_step.get("value") or "").strip()
                     if nav_url and nav_url != sess._raw_page.url:
+                        if not sess.is_extension and not self._is_cdp_chrome and mode == "chrome" and self._is_external_url(nav_url):
+                            self._should_use_extension_bridge(mode, require_extension=require_ext, url=nav_url)
                         sess._raw_page.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
                         sess.last_url = nav_url
                         self._tab_last_urls[tab_id] = nav_url
@@ -1876,11 +2323,17 @@ class BrowserEngine:
                     if files:
                         file_list = [files] if isinstance(files, str) else list(files)
                         escs = res.get("escalations") or []
-                        esc_uid = escs[-1].get("uid") if escs else None
-                        sel = f'[data-fmu-upload-uid="{esc_uid}"]' if esc_uid else "input[type='file']"
-                        if esc_uid and sess._raw_page.locator(sel).count() == 0:
-                            sel = "input[type='file']"
-                        sess._raw_page.set_input_files(sel, file_list)
+                        last_esc = escs[-1] if escs else {}
+                        esc_uid = last_esc.get("uid") if isinstance(last_esc, dict) else None
+                        already_handled = bool(last_esc.get("handled")) if isinstance(last_esc, dict) else False
+                        if not already_handled:
+                            sel = f'[data-fmu-upload-uid="{esc_uid}"]' if esc_uid else "input[type='file']"
+                            if sess.is_extension:
+                                sess._raw_page.set_input_files(sel, file_list)
+                            else:
+                                if esc_uid and sess._raw_page.locator(sel).count() == 0:
+                                    sel = "input[type='file']"
+                                sess._raw_page.set_input_files(sel, file_list)
                     had_pre_on_current_page = True
                 last_idx = b_idx + 1
 
@@ -1966,6 +2419,8 @@ class BrowserEngine:
         header = f'# web tab={sess.tab_id} group="{sess.group_name}"'
         if sess.is_extension:
             header += ' bridge="mv3"'
+            if getattr(sess._raw_page, "window_id", None) is not None:
+                header += f' window={sess._raw_page.window_id}'
         if agent_id != "default":
             header += f' agent="{agent_id}"'
         if (agent_id != "default" or has_move) and cur_info.get("uid"):
@@ -2026,6 +2481,9 @@ class BrowserEngine:
     def _shutdown_inner(self) -> None:
         self._reset_inner()
         self._evict_dead_browser()
-        self._ext_bridge.shutdown()
+        with self._bridge_lock:
+            if self._ext_bridge_inst is not None:
+                self._ext_bridge_inst.shutdown()
+                self._ext_bridge_inst = None
 
 

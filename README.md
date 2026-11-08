@@ -91,9 +91,12 @@ brew install --Formula ./Formula/faster-mac-use.rb
 
 # Multi-cursor / multi-agent parallel execution across Chrome tabs + native macOS apps
 ./bin/fmu '{"parallel":[{"agent":"agent-1","code":"let t = await cua.createBrowserTab(\"chrome\", \"https://example.com\"); await t.move(\"More information\");"},{"agent":"agent-2","code":"let a = await cua.getApp(\"Calculator\"); await a.pressKey(\"escape\"); await a.click(\"8\");"}]}'
+
+# Review real-world p50/p95/p99 latency, sub-phase breakdowns, and token efficiency (~/.fmu/logs)
+./bin/fmu --perf 7
 ```
 
-### 4. Run the 23-Test Unit & Integration Suite
+### 4. Run the 25-Test Unit & Integration Suite
 ```bash
 PYTHONPATH=src python3 tests/test_fmu.py
 ```

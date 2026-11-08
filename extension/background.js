@@ -169,6 +169,8 @@ if (chrome.debugger && chrome.debugger.onDetach) {
   });
 }
 
+const UPLOAD_FILE_URL_ERR = 'upload failed: enable "Allow access to file URLs" for the fmu extension in chrome://extensions';
+
 async function evalInTab(tabId, expression, awaitPromise = true) {
   const res = await sendDebuggerCommand(tabId, "Runtime.evaluate", {
     expression,
@@ -182,8 +184,35 @@ async function evalInTab(tabId, expression, awaitPromise = true) {
   return res && res.result ? res.result.value : undefined;
 }
 
+async function evalStepCodeOnTab(tabId, rawCode) {
+  const code = String(rawCode || "");
+  const body = code.includes("return ") ? code : `return (${code}\n)`;
+  try {
+    return await evalInTab(tabId, `(async () => {\n${body}\n})()`, true);
+  } catch (err) {
+    const msg = String((err && err.message) || err || "");
+    if (!code.includes("return ") && msg.includes("SyntaxError")) {
+      return await evalInTab(tabId, `(async () => {\n${code}\n})()`, true);
+    }
+    throw err;
+  }
+}
+
 async function setInputFilesOnTab(tabId, selector, files) {
   const fileList = Array.isArray(files) ? files.map(String) : [String(files)];
+  if (
+    fileList.length > 0
+    && chrome.extension
+    && typeof chrome.extension.isAllowedFileSchemeAccess === "function"
+  ) {
+    let allowed = true;
+    try {
+      allowed = await chrome.extension.isAllowedFileSchemeAccess();
+    } catch (_) {}
+    if (allowed === false) {
+      throw new Error(UPLOAD_FILE_URL_ERR);
+    }
+  }
   const doc = await sendDebuggerCommand(tabId, "DOM.getDocument", { depth: 0 });
   const rootId = doc && doc.root ? doc.root.nodeId : 1;
   const rawSel = selector || "input[type='file']";
@@ -220,13 +249,23 @@ async function setInputFilesOnTab(tabId, selector, files) {
   const dispatchExpr = `(() => {
     const el = document.querySelector(${JSON.stringify(matchedSel)}) || document.querySelector("input[type='file']");
     if (el) {
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
+      const count = el.files ? el.files.length : 0;
+      if (count > 0 || ${fileList.length === 0 ? "true" : "false"}) {
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      return { found: true, fileCount: count };
     }
-    return false;
+    return { found: false, fileCount: 0 };
   })()`;
-  await evalInTab(tabId, dispatchExpr, false);
+  const checkRes = await evalInTab(tabId, dispatchExpr, false);
+  if (
+    fileList.length > 0
+    && checkRes !== true
+    && (!checkRes || typeof checkRes !== "object" || Number(checkRes.fileCount || 0) === 0)
+  ) {
+    throw new Error(UPLOAD_FILE_URL_ERR);
+  }
   return { ok: true, files: fileList };
 }
 
@@ -235,6 +274,14 @@ async function handleRpc(msg) {
   try {
     if (method === "ping") {
       return { id, result: { pong: true, attachedTabs: Array.from(attachedDebuggers) } };
+    }
+    if (method === "reloadExtension") {
+      setTimeout(() => {
+        if (chrome.runtime && typeof chrome.runtime.reload === "function") {
+          chrome.runtime.reload();
+        }
+      }, 25);
+      return { id, result: { reloading: true } };
     }
     if (method === "createBrowserTab") {
       const {
@@ -286,7 +333,8 @@ async function handleRpc(msg) {
                   groupId,
                   sessionName,
                   reused: true,
-                  url: url !== "about:blank" ? url : (match.url || match.pendingUrl || url)
+                  url: url !== "about:blank" ? url : (match.url || match.pendingUrl || url),
+                  title: match.title || ""
                 }
               };
             }
@@ -312,7 +360,8 @@ async function handleRpc(msg) {
               groupId,
               sessionName,
               reused: true,
-              url: match.url || match.pendingUrl || url
+              url: match.url || match.pendingUrl || url,
+              title: match.title || ""
             }
           };
         }
@@ -367,7 +416,8 @@ async function handleRpc(msg) {
           windowId: effectiveWinId,
           groupId,
           sessionName,
-          url: tab.pendingUrl || tab.url || url
+          url: tab.pendingUrl || tab.url || url,
+          title: tab.title || ""
         }
       };
     }
@@ -378,7 +428,14 @@ async function handleRpc(msg) {
         await waitForTabLoad(tabId, timeoutMs, url);
       }
       await ensureDebuggerAndFocusEmulation(tabId);
-      return { id, result: { tabId, url } };
+      let tabTitle = "";
+      if (chrome.tabs && typeof chrome.tabs.get === "function") {
+        try {
+          const t = await chrome.tabs.get(tabId);
+          if (t && t.title) tabTitle = t.title;
+        } catch (_) {}
+      }
+      return { id, result: { tabId, url, title: tabTitle } };
     }
     if (method === "getTab") {
       const { sessionId = "default", urlPattern, window: windowFilter, tabId } = params;
@@ -416,23 +473,58 @@ async function handleRpc(msg) {
       const reqPayload = batchReq || restParams;
       const expr = `window.__fmu.executeBatch(${JSON.stringify(reqPayload || {})})`;
       let batchRes = await evalInTab(tabId, expr, true);
-      if (
-        batchRes
-        && !reqPayload.skipSnapshot
-        && Array.isArray(batchRes.escalations)
-        && batchRes.escalations.length > 0
-      ) {
+      if (batchRes && Array.isArray(batchRes.escalations) && batchRes.escalations.length > 0) {
         const steps = (reqPayload && reqPayload.steps) || [];
+        if (!Array.isArray(batchRes.evalOutputs)) batchRes.evalOutputs = [];
+        if (!Array.isArray(batchRes.errors)) batchRes.errors = [];
+        let didMutate = false;
         for (const esc of batchRes.escalations) {
-          if (esc.reason === "file_input" && !esc.handled) {
+          if (esc.reason === "eval_csp" && !esc.handled) {
+            esc.handled = true;
+            didMutate = true;
+            try {
+              const val = await evalStepCodeOnTab(tabId, esc.code);
+              if (val !== undefined) {
+                batchRes.evalOutputs.push(typeof val === "string" ? val : JSON.stringify(val));
+              }
+            } catch (evalErr) {
+              batchRes.errors.push(`step ${esc.step || 1} (eval): ${(evalErr && evalErr.message) || evalErr}`);
+            }
+          } else if (esc.reason === "file_input" && !esc.handled && !reqPayload.skipSnapshot) {
             const stepObj = steps[(esc.step || 1) - 1] || {};
             const files = stepObj.files || stepObj.value;
             if (files) {
               const sel = esc.uid ? `[data-fmu-upload-uid="${esc.uid}"]` : "input[type='file']";
-              await setInputFilesOnTab(tabId, sel, files);
               esc.handled = true;
+              didMutate = true;
+              try {
+                await setInputFilesOnTab(tabId, sel, files);
+              } catch (upErr) {
+                batchRes.errors.push(String((upErr && upErr.message) || upErr));
+              }
             }
           }
+        }
+        if (didMutate && !reqPayload.skipSnapshot) {
+          try {
+            const refreshOpts = {
+              agent: (reqPayload && reqPayload.agent) || "default",
+              query: (reqPayload && reqPayload.query) || "",
+              fullTable: Boolean(reqPayload && reqPayload.fullTable),
+              useDiff: Boolean(batchRes.useDiff)
+            };
+            const refreshed = await evalInTab(
+              tabId,
+              `window.__fmu && window.__fmu.refreshAfterOcr ? window.__fmu.refreshAfterOcr(${JSON.stringify(refreshOpts)}) : null`,
+              false
+            );
+            if (refreshed && typeof refreshed === "object") {
+              if (refreshed.crc !== undefined) batchRes.crc = refreshed.crc;
+              if (refreshed.seq !== undefined) batchRes.seq = refreshed.seq;
+              if (refreshed.count !== undefined) batchRes.count = refreshed.count;
+              if (Array.isArray(refreshed.lines)) batchRes.lines = refreshed.lines;
+            }
+          } catch (_) {}
         }
       }
       return { id, result: batchRes };
@@ -492,7 +584,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.2.0" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.2.1" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

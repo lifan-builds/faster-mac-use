@@ -245,6 +245,20 @@ class TabHandle:
     def has_pending(self) -> bool:
         return bool(self._pending_steps or self._pending_macros or self._force_ocr)
 
+    @property
+    def url(self) -> str:
+        sess = self.runtime.browser._tabs.get(self.tab_id)
+        if sess is not None and sess.last_url:
+            return sess.last_url
+        return self.runtime.browser._tab_last_urls.get(self.tab_id, "")
+
+    @property
+    def title(self) -> str:
+        sess = self.runtime.browser._tabs.get(self.tab_id)
+        if sess is not None and sess.last_title:
+            return sess.last_title
+        return self.runtime.browser._tab_last_titles.get(self.tab_id, "")
+
     def goto(self, url: str) -> TabHandle:
         self._fresh = False
         self._pending_steps.append({"op": "goto", "url": str(url)})
@@ -479,6 +493,9 @@ class CuaNamespace:
     def getBridgeStatus(self) -> str:
         return self.runtime.browser.execute_batch({"bridgeStatus": True})
 
+    def reloadExtension(self) -> str:
+        return self.runtime.browser.execute_batch({"reloadExtension": True})
+
     def getApp(self, identifier: str, window: str | None = None) -> AppHandle:
         key = f"app:{identifier}:{window or ''}"
         if key not in self.handles:
@@ -659,7 +676,7 @@ class FasterMacUseRuntime:
         masked = re.sub(r"\btrue\b", "True", masked)
         masked = re.sub(r"\bfalse\b", "False", masked)
         masked = re.sub(r"\bnull\b", "None", masked)
-        masked = re.sub(r"(\{|,\s*)([a-zA-Z_]\w*)\s*:", r'\1"\2":', masked)
+        masked = re.sub(r"(\{\s*|,\s*)([a-zA-Z_]\w*)\s*:", r'\1"\2":', masked)
         for idx, s in enumerate(strings):
             masked = masked.replace(f"__STR_{idx}__", s)
         return masked.strip()
@@ -697,6 +714,8 @@ class FasterMacUseRuntime:
                             val._fresh = False
                             outputs.append(val.initial_state)
                 elif stmt.startswith("return "):
+                    if last_handle is not None and last_handle.has_pending():
+                        outputs.append(last_handle.flush())
                     val = eval(stmt[7:].strip(), {"__builtins__": {}}, sess.repl_env)
                     if isinstance(val, (AppHandle, TabHandle)):
                         outputs.append(val.flush())
@@ -752,6 +771,9 @@ class FasterMacUseRuntime:
 
         if req.get("bridgeStatus"):
             return self.browser.execute_batch({"bridgeStatus": True})
+
+        if req.get("reloadExtension"):
+            return self.browser.execute_batch({"reloadExtension": True})
 
         if "parallel" in req and isinstance(req["parallel"], list):
             return self.execute_parallel(req["parallel"])

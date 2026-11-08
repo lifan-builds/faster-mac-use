@@ -276,16 +276,31 @@ EDITOR_HTML = """<!doctype html>
   <div id="publish-status" role="status">DRAFT_IDLE</div>
   <div id="media-status" role="status">NO_MEDIA</div>
 
+  <!-- Background timeline hidden file input (appears earlier in DOM than modal) -->
+  <div id="bg-timeline">
+    <input id="bg-timeline-file" type="file" accept="image/*" style="display:none">
+    <div id="bg-media-status" role="status">BG_NO_MEDIA</div>
+  </div>
+
   <!-- X / Draft.js style composer -->
-  <div class="editor-box">
+  <div class="editor-box DraftEditor-root">
     <div id="x-placeholder" class="public-DraftEditorPlaceholder-root">What's happening?</div>
     <div id="x-composer" data-testid="tweetTextarea_0" role="textbox" contenteditable="true" aria-multiline="true">
-      <div data-contents="true"><div data-block="true"><span data-text="true"></span></div></div>
+      <div data-contents="true"><div data-block="true"><span data-text="true"><br data-text="true"></span></div></div>
     </div>
     <div class="toolbar" style="margin-top:8px;">
       <input id="x-media-file" type="file" accept="video/*,image/*" style="display:none">
       <button id="x-media-btn" type="button" aria-label="Add photos or video">Add photos or video</button>
     </div>
+  </div>
+
+  <!-- Compose modal with file input >4 ancestor levels away from trigger button -->
+  <div id="compose-modal" role="dialog" aria-modal="true" class="editor-box">
+    <input id="modal-media-file" type="file" accept="video/*,image/*" style="display:none">
+    <div id="modal-media-status" role="status">MODAL_NO_MEDIA</div>
+    <div class="lvl-1"><div class="lvl-2"><div class="lvl-3"><div class="lvl-4"><div class="lvl-5">
+      <button id="modal-media-btn" type="button" aria-label="Add modal media">Add modal media</button>
+    </div></div></div></div></div>
   </div>
 
   <!-- RedNote / ProseMirror style composer -->
@@ -302,17 +317,42 @@ EDITOR_HTML = """<!doctype html>
     (function() {
       const xComp = document.getElementById("x-composer");
       let draftState = "";
+      document.addEventListener("selectionchange", function() {
+        const sel = window.getSelection && window.getSelection();
+        if (draftState === "" && sel && sel.rangeCount > 0) {
+          const r = sel.getRangeAt(0);
+          if (r.startContainer === xComp && !r.collapsed) {
+            xComp.dataset.emptySelectCorrupted = "1";
+          }
+        }
+      });
       function renderDraftState() {
         const contents = xComp.querySelector("[data-contents='true']") || xComp;
+        if (draftState.length === 0) {
+          contents.innerHTML = '<div data-block="true"><span data-text="true"><br data-text="true"></span></div>';
+          return;
+        }
         const lines = draftState.split(/\\r?\\n/);
         contents.innerHTML = lines.map(line =>
-          `<div data-block="true"><span data-text="true">${line.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</span></div>`
+          `<div data-block="true"><span data-text="true">${line ? line.replace(/&/g, "&amp;").replace(/</g, "&lt;") : '<br data-text="true">'}</span></div>`
         ).join("");
         const ph = document.getElementById("x-placeholder");
         if (draftState.length > 0 && ph) {
           ph.remove();
         }
       }
+      xComp.addEventListener("paste", function(e) {
+        if (!e.clipboardData) return;
+        const pasted = e.clipboardData.getData("text/plain") || "";
+        e.preventDefault();
+        const sel = window.getSelection && window.getSelection();
+        if (draftState.length > 0 && sel && sel.isCollapsed) {
+          draftState += pasted;
+        } else {
+          draftState = pasted;
+        }
+        renderDraftState();
+      });
       xComp.addEventListener("beforeinput", function(e) {
         if (e.inputType === "deleteContentBackward" || e.inputType === "deleteContentForward" || e.inputType === "deleteByCut") {
           e.preventDefault();
@@ -320,13 +360,27 @@ EDITOR_HTML = """<!doctype html>
           renderDraftState();
         } else if (e.inputType === "insertText" || e.inputType === "insertFromPaste") {
           e.preventDefault();
-          draftState += (e.data || "");
+          const data = e.data || "";
+          if (data.includes("\\n")) {
+            const parts = data.split(/\\r?\\n/);
+            draftState = parts[parts.length - 1];
+          } else {
+            draftState += data;
+          }
           renderDraftState();
         }
       });
       document.getElementById("x-media-file").addEventListener("change", function(e) {
         const f = e.target.files && e.target.files[0];
         document.getElementById("media-status").textContent = f ? `MEDIA:${f.name}` : "NO_MEDIA";
+      });
+      document.getElementById("bg-timeline-file").addEventListener("change", function(e) {
+        const f = e.target.files && e.target.files[0];
+        document.getElementById("bg-media-status").textContent = f ? `BG_MEDIA:${f.name}` : "BG_NO_MEDIA";
+      });
+      document.getElementById("modal-media-file").addEventListener("change", function(e) {
+        const f = e.target.files && e.target.files[0];
+        document.getElementById("modal-media-status").textContent = f ? `MODAL_MEDIA:${f.name}` : "MODAL_NO_MEDIA";
       });
     })();
 
@@ -344,19 +398,40 @@ EDITOR_HTML = """<!doctype html>
 """
 
 
+STRICT_CSP_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Strict CSP App — No unsafe-eval</title>
+</head>
+<body>
+  <h1>Strict CSP Workspace</h1>
+  <div id="csp-status" role="status">CSP_INITIAL</div>
+  <button id="csp-btn" type="button">Run Action</button>
+</body>
+</html>
+"""
+
+
 class _BenchHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
+        strict_csp = False
         if self.path.startswith("/pricing"):
             body = PRICING_HTML
         elif self.path.startswith("/canvas"):
             body = CANVAS_HTML
         elif self.path.startswith("/editor"):
             body = EDITOR_HTML
+        elif self.path.startswith("/strict-csp"):
+            body = STRICT_CSP_HTML
+            strict_csp = True
         else:
             body = ORDERS_HTML
         raw = body.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        if strict_csp:
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)

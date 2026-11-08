@@ -490,7 +490,9 @@ IN_PAGE_RUNTIME_JS = r"""
       };
       const normWs = (s) => String(s || "").replace(/\s+/g, " ").trim();
       const prevNorm = normWs(target.innerText || target.textContent || "");
-      selectContents(append);
+      if (prevNorm.length > 0) {
+        selectContents(append);
+      }
       if (!append && prevNorm.length > 0) {
         try {
           const delBi = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "deleteContentBackward", data: null });
@@ -513,26 +515,57 @@ IN_PAGE_RUNTIME_JS = r"""
         }
       }
       if (strVal.length > 0) {
-        selectContents(true);
         const expNorm = normWs(strVal);
         const expectedFullNorm = append && prevNorm.length > 0 ? normWs(prevNorm + " " + expNorm) : expNorm;
+        const baseLen = append ? prevNorm.length : 0;
+        const isRichEditor = Boolean(
+          (target.closest && target.closest("[data-contents], .DraftEditor-root, [data-lexical-editor], .ProseMirror"))
+          || (target.querySelector && target.querySelector("[data-contents], [data-text='true'], [data-lexical-text]"))
+        );
+        if (append && prevNorm.length > 0) {
+          selectContents(true);
+        }
+        if (strVal.includes("\n") || isRichEditor) {
+          let pasteHandled = false;
+          try {
+            const dt = new DataTransfer();
+            dt.setData("text/plain", strVal);
+            const pasteEv = new ClipboardEvent("paste", {
+              clipboardData: dt,
+              bubbles: true,
+              cancelable: true
+            });
+            pasteHandled = !target.dispatchEvent(pasteEv);
+          } catch (_) {}
+          const afterPasteNorm = normWs(target.innerText || target.textContent || "");
+          if (pasteHandled || afterPasteNorm.length > baseLen) {
+            target.dispatchEvent(new Event("change", { bubbles: true }));
+            mutationSeq++;
+            return;
+          }
+        }
+        let biHandled = false;
         try {
           const bi = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: strVal });
-          target.dispatchEvent(bi);
+          biHandled = !target.dispatchEvent(bi);
         } catch (_) {}
         const afterBiNorm = normWs(target.innerText || target.textContent || "");
-        const okAfterBi = append
-          ? (afterBiNorm === expectedFullNorm || (afterBiNorm.endsWith(expNorm) && afterBiNorm.length > prevNorm.length))
-          : (afterBiNorm === expNorm);
+        const okAfterBi = biHandled || (
+          append
+            ? (afterBiNorm === expectedFullNorm || (afterBiNorm.endsWith(expNorm) && afterBiNorm.length > prevNorm.length))
+            : (afterBiNorm === expNorm || afterBiNorm.length > 0)
+        );
         let inserted = okAfterBi;
         if (!okAfterBi) {
-          selectContents(true);
+          if (append && prevNorm.length > 0) {
+            selectContents(true);
+          }
           try {
             inserted = Boolean(document.execCommand("insertText", false, strVal));
           } catch (_) {}
         }
         const afterExecNorm = normWs(target.innerText || target.textContent || "");
-        const okAfterExec = append ? afterExecNorm.endsWith(expNorm) : (afterExecNorm === expNorm);
+        const okAfterExec = append ? afterExecNorm.endsWith(expNorm) : (afterExecNorm === expNorm || afterExecNorm.length > 0);
         if (!inserted && !okAfterExec) {
           const leaf = target.querySelector && target.querySelector("[data-text='true']");
           if (leaf) {
@@ -749,10 +782,33 @@ IN_PAGE_RUNTIME_JS = r"""
         }
         if (op === "eval") {
           const code = String(s.code || stepValue || "");
-          const body = code.includes("return ") ? code : `return (${code})`;
-          const fn = new Function(body);
-          const res = await fn();
-          if (res !== undefined) evalOutputs.push(typeof res === "string" ? res : JSON.stringify(res));
+          const body = code.includes("return ") ? code : `return (${code}\n)`;
+          try {
+            const AsyncFn = Object.getPrototypeOf(async function () {}).constructor;
+            let fn;
+            try {
+              fn = new AsyncFn(body);
+            } catch (synErr) {
+              if (!code.includes("return ")) {
+                fn = new AsyncFn(code);
+              } else {
+                throw synErr;
+              }
+            }
+            const res = await fn();
+            if (res !== undefined) evalOutputs.push(typeof res === "string" ? res : JSON.stringify(res));
+          } catch (evalErr) {
+            const msg = String((evalErr && evalErr.message) || evalErr || "");
+            if (
+              (evalErr && evalErr.name === "EvalError")
+              || msg.includes("Content Security Policy")
+              || msg.includes("unsafe-eval")
+            ) {
+              escalations.push({ step: i + 1, reason: "eval_csp", code });
+            } else {
+              throw evalErr;
+            }
+          }
           continue;
         }
         if (op === "webmcp" || op === "calltool") {
@@ -855,6 +911,12 @@ IN_PAGE_RUNTIME_JS = r"""
               }
             }
             if (!fileEl) {
+              const scope = el.closest && el.closest("[role='dialog'], [aria-modal='true'], form");
+              if (scope) {
+                fileEl = scope.querySelector && scope.querySelector("input[type='file']");
+              }
+            }
+            if (!fileEl) {
               fileEl = document.querySelector("input[type='file']");
             }
           }
@@ -862,6 +924,9 @@ IN_PAGE_RUNTIME_JS = r"""
             const targetFileEl = fileEl || el;
             const fUid = getUid(targetFileEl);
             if (fileEl) {
+              for (const old of document.querySelectorAll("[data-fmu-upload-uid]")) {
+                old.removeAttribute("data-fmu-upload-uid");
+              }
               fileEl.setAttribute("data-fmu-upload-uid", fUid);
             }
             escalations.push({ step: i + 1, reason: "file_input", uid: fileEl ? fUid : "" });
@@ -895,7 +960,7 @@ IN_PAGE_RUNTIME_JS = r"""
     }
 
     if (req.skipSnapshot) {
-      return { errors, evalOutputs, escalations, cursor: st.cursor, canvases: [], lines: [] };
+      return { url: location.href, title: document.title, errors, evalOutputs, escalations, cursor: st.cursor, canvases: [], lines: [] };
     }
 
     if ((steps.length > 0 || req.hadPreSteps) && req.settle !== false) {
@@ -1056,11 +1121,12 @@ class ExtensionWebSocketBridge:
     def ensure_preferred_port(self) -> None:
         if self._stopped or self.port == self.preferred_port or self.is_connected():
             return
+        test_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            test_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             test_srv.bind(("127.0.0.1", self.preferred_port))
         except OSError:
+            test_srv.close()
             return
         old_srv = self._srv_sock
         test_srv.listen(8)
@@ -1289,11 +1355,13 @@ class _ExtensionPageAdapter:
         bridge: ExtensionWebSocketBridge,
         chrome_tab_id: int,
         initial_url: str = "about:blank",
+        initial_title: str = "",
         window_id: int | None = None,
     ) -> None:
         self._bridge = bridge
         self.chrome_tab_id = chrome_tab_id
         self.url = initial_url
+        self.title = initial_title
         self.window_id = window_id
         self._closed = False
 
@@ -1310,6 +1378,8 @@ class _ExtensionPageAdapter:
             self.url = str(res["url"])
         else:
             self.url = url
+        if isinstance(res, dict) and "title" in res:
+            self.title = str(res.get("title") or "")
         return res or {"url": self.url}
 
     def set_input_files(self, selector: str, files: str | list[str]) -> dict[str, Any]:
@@ -1333,8 +1403,11 @@ class _ExtensionPageAdapter:
                 "executeBatch",
                 {**arg, "tabId": self.chrome_tab_id, "runtimeJs": IN_PAGE_RUNTIME_JS},
             )
-            if isinstance(res, dict) and res.get("url"):
-                self.url = str(res["url"])
+            if isinstance(res, dict):
+                if res.get("url"):
+                    self.url = str(res["url"])
+                if "title" in res:
+                    self.title = str(res.get("title") or "")
             return res
         return self._bridge.call_rpc(
             "evaluate",
@@ -1393,6 +1466,7 @@ class BrowserTabSession:
         group_name: str = "🤖 Agent",
         group_color: str = "blue",
         last_url: str = "about:blank",
+        last_title: str = "",
         is_extension: bool = False,
     ) -> None:
         self._engine = engine
@@ -1404,6 +1478,7 @@ class BrowserTabSession:
         self.group_name = group_name
         self.group_color = group_color
         self.last_url = last_url
+        self.last_title = last_title
         self.is_extension = is_extension
         self.documented = False
         self._documented_agents: set[str] = set()
@@ -1439,6 +1514,7 @@ class BrowserEngine:
         self._is_cdp_chrome: bool = False
         self._tabs: dict[str, BrowserTabSession] = {}
         self._tab_last_urls: dict[str, str] = {}
+        self._tab_last_titles: dict[str, str] = {}
         self._last_tab_steps: dict[str, list[dict[str, Any]]] = {}
         self._next_tab_num: int = 1
         self.cursors: dict[str, dict[str, Any]] = {}
@@ -2015,11 +2091,13 @@ class BrowserEngine:
                 chrome_tab_id = int(ext_res.get("tabId", 1))
                 chrome_win_id = ext_res.get("windowId")
                 actual_url = str(ext_res.get("url") or effective_url)
+                actual_title = str(ext_res.get("title") or "")
                 self._next_tab_num += 1
                 ext_page = _ExtensionPageAdapter(
                     self._ext_bridge,
                     chrome_tab_id,
                     initial_url=actual_url,
+                    initial_title=actual_title,
                     window_id=int(chrome_win_id) if chrome_win_id is not None else None,
                 )
                 ext_cdp = _ExtensionCdpAdapter(self._ext_bridge, chrome_tab_id)
@@ -2031,10 +2109,13 @@ class BrowserEngine:
                     group_name=session_name,
                     group_color=group_color,
                     last_url=actual_url,
+                    last_title=actual_title,
                     is_extension=True,
                 )
                 self._tabs[tid] = sess
                 self._tab_last_urls[tid] = actual_url
+                if actual_title:
+                    self._tab_last_titles[tid] = actual_title
                 sess.ensure_runtime()
                 return sess
             except Exception:
@@ -2083,12 +2164,95 @@ class BrowserEngine:
     def _close_tab_inner(self, tab_id: str) -> str:
         sess = self._tabs.pop(tab_id, None)
         self._tab_last_urls.pop(tab_id, None)
+        self._tab_last_titles.pop(tab_id, None)
         if sess is not None:
             try:
                 sess._raw_page.close()
             except Exception:
                 pass
         return f"# web tab={tab_id} closed"
+
+    def _eval_step_via_cdp(self, sess: BrowserTabSession, raw_code: str) -> Any:
+        code = str(raw_code or "")
+        body = code if "return " in code else f"return ({code}\n)"
+
+        def _send(expr_body: str) -> Any:
+            cdp_res = sess._raw_cdp.send(
+                "Runtime.evaluate",
+                {
+                    "expression": f"(async () => {{\n{expr_body}\n}})()",
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
+            )
+            if isinstance(cdp_res, dict) and cdp_res.get("exceptionDetails"):
+                exc_det = cdp_res["exceptionDetails"]
+                res_obj = cdp_res.get("result") or {}
+                desc = res_obj.get("description") or exc_det.get("text") or "Runtime.evaluate error"
+                raise RuntimeError(str(desc))
+            if isinstance(cdp_res, dict) and isinstance(cdp_res.get("result"), dict):
+                return cdp_res["result"].get("value")
+            return None
+
+        try:
+            return _send(body)
+        except Exception as exc:
+            if "return " not in code and "SyntaxError" in str(exc):
+                return _send(code)
+            raise
+
+    def _handle_eval_escalations(
+        self,
+        sess: BrowserTabSession,
+        res: dict[str, Any],
+        *,
+        agent_id: str,
+        query: str = "",
+        full_table: bool = False,
+        skip_snapshot: bool = False,
+    ) -> None:
+        if not isinstance(res, dict):
+            return
+        escs = res.get("escalations")
+        if not isinstance(escs, list) or not escs:
+            return
+        eval_outs = list(res.get("evalOutputs") or [])
+        errs = list(res.get("errors") or [])
+        ran_any = False
+        for esc in escs:
+            if not isinstance(esc, dict) or esc.get("reason") != "eval_csp" or esc.get("handled"):
+                continue
+            ran_any = True
+            esc["handled"] = True
+            try:
+                val = self._eval_step_via_cdp(sess, str(esc.get("code") or ""))
+                if val is not None:
+                    eval_outs.append(val if isinstance(val, str) else json.dumps(val))
+            except Exception as exc:
+                step_no = esc.get("step", 1)
+                errs.append(f"step {step_no} (eval): {exc}")
+        if not ran_any:
+            return
+        res["evalOutputs"] = eval_outs
+        res["errors"] = errs
+        if not skip_snapshot:
+            try:
+                refreshed = sess._raw_page.evaluate(
+                    "opts => window.__fmu.refreshAfterOcr(opts)",
+                    {
+                        "agent": agent_id,
+                        "query": query,
+                        "fullTable": full_table,
+                        "useDiff": bool(res.get("useDiff")),
+                    },
+                )
+                if isinstance(refreshed, dict):
+                    res["crc"] = refreshed.get("crc", res.get("crc"))
+                    res["seq"] = refreshed.get("seq", res.get("seq"))
+                    res["count"] = refreshed.get("count", res.get("count"))
+                    res["lines"] = refreshed.get("lines", res.get("lines"))
+            except Exception:
+                pass
 
     def execute_batch(self, req: dict[str, Any]) -> str:
         return self._run_sync(lambda: self._execute_batch_with_retry(req))
@@ -2128,11 +2292,16 @@ class BrowserEngine:
         if req.get("bridgeStatus"):
             st = self._ext_bridge.get_status()
             fb = f' fallbackReason="{st["portFallbackReason"]}"' if st.get("portFallbackReason") else ""
+            ver = f' version="{st["client"].get("version")}"' if isinstance(st.get("client"), dict) and st["client"].get("version") else ""
             return (
                 f'# fmu-web bridge connected={str(st["connected"]).lower()} '
                 f'port={st["port"]} preferredPort={st["preferredPort"]} '
-                f'ws="{st["wsUrl"]}"{fb}'
+                f'ws="{st["wsUrl"]}"{ver}{fb}'
             )
+
+        if req.get("reloadExtension"):
+            self._ext_bridge.call_rpc("reloadExtension", {}, timeout=3.0)
+            return "# fmu-web extension reloading"
 
         if req.get("saveMacro"):
             m_spec = req["saveMacro"]
@@ -2287,6 +2456,14 @@ class BrowserEngine:
                                 "skipSnapshot": True,
                             },
                         )
+                        self._handle_eval_escalations(
+                            sess,
+                            res,
+                            agent_id=agent_id,
+                            query=req.get("query") or "",
+                            full_table=bool(req.get("fullTable", False)),
+                            skip_snapshot=True,
+                        )
                         combined_errors.extend(res.get("errors") or [])
                         combined_evals.extend(res.get("evalOutputs") or [])
                     nav_url = str(b_step.get("url") or b_step.get("value") or "").strip()
@@ -2317,23 +2494,38 @@ class BrowserEngine:
                             "skipSnapshot": True,
                         },
                     )
+                    self._handle_eval_escalations(
+                        sess,
+                        res,
+                        agent_id=agent_id,
+                        query=req.get("query") or "",
+                        full_table=bool(req.get("fullTable", False)),
+                        skip_snapshot=True,
+                    )
                     combined_errors.extend(res.get("errors") or [])
                     combined_evals.extend(res.get("evalOutputs") or [])
                     files = b_step.get("files") or b_step.get("value")
                     if files:
                         file_list = [files] if isinstance(files, str) else list(files)
-                        escs = res.get("escalations") or []
-                        last_esc = escs[-1] if escs else {}
+                        file_escs = [
+                            e
+                            for e in (res.get("escalations") or [])
+                            if isinstance(e, dict) and e.get("reason") == "file_input"
+                        ]
+                        last_esc = file_escs[-1] if file_escs else {}
                         esc_uid = last_esc.get("uid") if isinstance(last_esc, dict) else None
                         already_handled = bool(last_esc.get("handled")) if isinstance(last_esc, dict) else False
                         if not already_handled:
                             sel = f'[data-fmu-upload-uid="{esc_uid}"]' if esc_uid else "input[type='file']"
-                            if sess.is_extension:
-                                sess._raw_page.set_input_files(sel, file_list)
-                            else:
-                                if esc_uid and sess._raw_page.locator(sel).count() == 0:
-                                    sel = "input[type='file']"
-                                sess._raw_page.set_input_files(sel, file_list)
+                            try:
+                                if sess.is_extension:
+                                    sess._raw_page.set_input_files(sel, file_list)
+                                else:
+                                    if esc_uid and sess._raw_page.locator(sel).count() == 0:
+                                        sel = "input[type='file']"
+                                    sess._raw_page.set_input_files(sel, file_list)
+                            except Exception as upload_exc:
+                                combined_errors.append(str(upload_exc))
                     had_pre_on_current_page = True
                 last_idx = b_idx + 1
 
@@ -2351,6 +2543,14 @@ class BrowserEngine:
                     "hadPreSteps": had_pre_on_current_page or bool(post_steps),
                 },
             )
+            self._handle_eval_escalations(
+                sess,
+                res,
+                agent_id=agent_id,
+                query=req.get("query") or "",
+                full_table=bool(req.get("fullTable", False)),
+                skip_snapshot=False,
+            )
             res["errors"] = combined_errors + (res.get("errors") or [])
             res["evalOutputs"] = combined_evals + (res.get("evalOutputs") or [])
         else:
@@ -2365,6 +2565,14 @@ class BrowserEngine:
                     "fullTable": req.get("fullTable", False),
                     "settle": req.get("settle", True),
                 },
+            )
+            self._handle_eval_escalations(
+                sess,
+                res,
+                agent_id=agent_id,
+                query=req.get("query") or "",
+                full_table=bool(req.get("fullTable", False)),
+                skip_snapshot=False,
             )
 
         if (
@@ -2395,6 +2603,9 @@ class BrowserEngine:
         if sess._raw_page and not sess._raw_page.is_closed() and sess._raw_page.url:
             sess.last_url = sess._raw_page.url
             self._tab_last_urls[tab_id] = sess._raw_page.url
+        if isinstance(res, dict) and "title" in res:
+            sess.last_title = str(res.get("title") or "")
+            self._tab_last_titles[tab_id] = sess.last_title
 
         cur_info = res.get("cursor") or {}
         if cur_info and cur_info.get("uid"):
@@ -2471,6 +2682,7 @@ class BrowserEngine:
                 pass
         self._tabs.clear()
         self._tab_last_urls.clear()
+        self._tab_last_titles.clear()
         self._last_tab_steps.clear()
         self.cursors.clear()
         self._next_tab_num = 1

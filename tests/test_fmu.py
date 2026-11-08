@@ -1168,6 +1168,209 @@ setInterval(() => {{}}, 1000);
         self.assertNotIn("! errors:", alias_out)
         self.assertIn('title="Schema Alias Title"', alias_out)
 
+    def test_24_mv3_field_learnings_csp_eval_upload_perm_draftjs_paste_tab_url_and_dialog_file(self) -> None:
+        import subprocess
+        import tempfile
+
+        self.rt.execute({"reset": True})
+
+        # 1. Multi-paragraph Draft.js fill (empty editor without selectNodeContents corruption + 3 paragraphs)
+        #    and dialog-scoped <input type="file"> (>4 levels deep inside [role="dialog"] when earlier <input type="file"> exists)
+        editor_url = f"{self.server.base_url}/editor"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            modal_img = Path(tmpdir) / "thread_card.jpg"
+            modal_img.write_bytes(b"fake-jpeg")
+            ed_out = self.rt.execute(
+                {
+                    "surface": "web",
+                    "url": editor_url,
+                    "session": "t1",
+                    "steps": [
+                        {
+                            "op": "fill",
+                            "target": "What's happening?",
+                            "value": "Para 1\n\nPara 2\n\nPara 3",
+                        },
+                        {
+                            "op": "upload",
+                            "target": "Add modal media",
+                            "files": [str(modal_img)],
+                        },
+                        {
+                            "op": "eval",
+                            "code": (
+                                "const blocks = Array.from(document.querySelectorAll('#x-composer [data-block=\"true\"]')).map(b => b.textContent.trim()); "
+                                "return { "
+                                "  blocks, "
+                                "  corrupted: document.getElementById('x-composer').dataset.emptySelectCorrupted || '0', "
+                                "  bgMedia: document.getElementById('bg-media-status').textContent, "
+                                "  modalMedia: document.getElementById('modal-media-status').textContent "
+                                "};"
+                            ),
+                        },
+                    ],
+                }
+            )
+        self.assertNotIn("! errors:", ed_out)
+        eval_json_lines = [l for l in ed_out.splitlines() if l.startswith("> {")]
+        self.assertTrue(eval_json_lines, f"Expected JSON eval output in: {ed_out}")
+        ed_data = json.loads(eval_json_lines[0][2:])
+        self.assertEqual(ed_data["blocks"], ["Para 1", "", "Para 2", "", "Para 3"])
+        self.assertEqual(ed_data["corrupted"], "0")
+        self.assertEqual(ed_data["bgMedia"], "BG_NO_MEDIA")
+        self.assertEqual(ed_data["modalMedia"], "MODAL_MEDIA:thread_card.jpg")
+
+        # 2. Strict-CSP page (no 'unsafe-eval') + top-level await in op: "eval" + TabHandle.url / TabHandle.title
+        csp_url = f"{self.server.base_url}/strict-csp"
+        csp_out = self.rt.execute(
+            {
+                "code": (
+                    f'let tab = await cua.createBrowserTab({{mode: "headless", url: "{csp_url}"}});\n'
+                    'let gotTab = await cua.getTab();\n'
+                    'await gotTab.eval("const v = await Promise.resolve(\'CSP_AWAIT_OK\'); document.getElementById(\'csp-status\').textContent = v; return v;");\n'
+                    'return { url: gotTab.url, title: gotTab.title };'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", csp_out)
+        self.assertIn("> CSP_AWAIT_OK", csp_out)
+        self.assertIn(csp_url, csp_out)
+        self.assertIn("Strict CSP App", csp_out)
+
+        # 3. Verify bridge="mv3" extension/background.js handling of:
+        #    (a) eval_csp escalation with top-level await + DOM refresh
+        #    (b) explicit error when DOM.setFileInputFiles leaves el.files.length === 0 ("Allow access to file URLs" off)
+        #    (c) TabHandle.url and TabHandle.title on MV3 extension tabs
+        self.rt.execute({"reset": True})
+        port = self.rt.browser.bridge_port
+        bg_js_path = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        bg_js_patched = bg_js_path.replace("ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{port}/ext")
+
+        node_harness = f"""
+const state = {{
+  evalExpressions: [],
+  allowFileUrls: false,
+}};
+
+globalThis.chrome = {{
+  extension: {{
+    isAllowedFileSchemeAccess: async () => state.allowFileUrls,
+  }},
+  tabs: {{
+    query: async () => [{{ id: 301, windowId: 300, groupId: -1, title: "Compose / X", url: "https://x.com/compose/post", status: "complete", active: false }}],
+    get: async (tabId) => ({{ id: tabId, windowId: 300, title: "Compose / X", status: "complete", url: "https://x.com/compose/post" }}),
+    create: async (opts) => ({{ id: 301, windowId: opts.windowId || 300, groupId: -1, title: "Compose / X", url: opts.url || "https://x.com/compose/post", status: "complete", active: false }}),
+    update: async (tabId, opts) => ({{ id: tabId, windowId: 300, title: "Compose / X", status: "complete", url: opts.url }}),
+    group: async () => 77,
+    onRemoved: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{
+    query: async () => [],
+    update: async (gid, opts) => ({{ id: gid, ...opts }}),
+  }},
+  windows: {{
+    getAll: async () => [{{ id: 300, focused: false, type: "normal" }}],
+  }},
+  debugger: {{
+    attach: async () => {{}},
+    sendCommand: async (target, method, params) => {{
+      if (method === "DOM.getDocument") return {{ root: {{ nodeId: 1 }} }};
+      if (method === "DOM.querySelector") return {{ nodeId: 99 }};
+      if (method === "DOM.setFileInputFiles") return {{}};
+      if (method === "Runtime.evaluate") {{
+        const expr = params.expression || "";
+        state.evalExpressions.push(expr);
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const isUpload = expr.includes("blocked.jpg");
+          const isCspEval = expr.includes("await Promise.resolve");
+          return {{
+            result: {{
+              value: {{
+                url: "https://x.com/compose/post",
+                title: "Compose / X",
+                crc: "11112222",
+                seq: 1,
+                count: 2,
+                useDiff: true,
+                cursor: {{ agent: "default", x: 50, y: 50, uid: "@u1", label: "Add photos or video", op: "click" }},
+                webMcpTools: [],
+                canvases: [],
+                errors: [],
+                evalOutputs: [],
+                escalations: isCspEval
+                  ? [{{ step: 1, reason: "eval_csp", code: "const r = await Promise.resolve('MV3_CSP_OK'); return r;" }}]
+                  : (isUpload ? [{{ step: 1, reason: "file_input", uid: "@u1" }}] : []),
+                lines: ['@u1 button "Add photos or video"'],
+              }}
+            }}
+          }};
+        }}
+        if (expr.startsWith("(async () =>")) {{
+          if (expr.includes("__enableFileAccess")) {{
+            state.allowFileUrls = true;
+            return {{ result: {{ value: "ENABLED_CHECK" }} }};
+          }}
+          return {{ result: {{ value: "MV3_CSP_OK" }} }};
+        }}
+        if (expr.includes("fileCount")) {{
+          return {{ result: {{ value: {{ found: true, fileCount: 0 }} }} }};
+        }}
+        if (expr.includes("refreshAfterOcr")) {{
+          return {{ result: {{ value: {{ crc: "33334444", seq: 2, count: 2, lines: ['+ @u9 status "MV3_CSP_OK"'] }} }} }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{
+    create: () => {{}},
+    onAlarm: {{ addListener: () => {{}} }},
+  }},
+  runtime: {{
+    onInstalled: {{ addListener: () => {{}} }},
+    onStartup: {{ addListener: () => {{}} }},
+  }},
+}};
+
+{bg_js_patched}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(
+            ["node", "-e", node_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(self.rt.browser.ensure_bridge().wait_connected(timeout=3.0))
+            mv3_out = self.rt.execute(
+                {
+                    "code": (
+                        'let xtab = await cua.createBrowserTab({mode: "chrome", url: "https://x.com/compose/post", reuseExisting: true});\n'
+                        'let cur = await cua.getTab();\n'
+                        'let evalOut = await cur.eval("const r = await Promise.resolve(\'MV3_CSP_OK\'); return r;").diff();\n'
+                        'let upOut1 = await cur.upload("@u1", "/tmp/blocked.jpg").diff();\n'
+                        'await cur.eval("const x = await Promise.resolve(\'__enableFileAccess\'); return x;").diff();\n'
+                        'let upOut2 = await cur.upload("@u1", "/tmp/blocked.jpg").diff();\n'
+                        'return { url: cur.url, title: cur.title, evalOut: evalOut, upOut1: upOut1, upOut2: upOut2 };'
+                    )
+                }
+            )
+            self.assertIn("https://x.com/compose/post", mv3_out)
+            self.assertIn("Compose / X", mv3_out)
+            self.assertIn("> MV3_CSP_OK", mv3_out)
+            self.assertIn('+ @u9 status "MV3_CSP_OK"', mv3_out)
+            expected_err = 'upload failed: enable "Allow access to file URLs" for the fmu extension in chrome://extensions'
+            self.assertEqual(mv3_out.count(expected_err), 2)
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

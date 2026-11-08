@@ -5,9 +5,12 @@
   --surface-strong: #ffffff;
   --code-bg: #101c26;
   --code-ink: #e6f0f7;
-  --code-muted: #9ab2c4;
+  --code-control: #203444;
+  --code-control-hover: #2b4559;
+  --code-border: #38556b;
   --ink: #0c1720;
   --muted: #344b5c;
+  --bar-neutral: #7c93a6;
   --accent: #095c49;
   --accent-hover: #064436;
   --accent-soft: #d7efe8;
@@ -80,13 +83,13 @@ a:hover {
   display: flex;
   align-items: center;
   gap: 0.65rem;
-  font-size: 0.95rem;
+  font-size: 0.9375rem;
   color: var(--muted);
 }
 
 .brand-trail a {
   color: var(--ink);
-  font-weight: 650;
+  font-weight: 700;
   text-decoration: none;
 }
 
@@ -96,7 +99,7 @@ a:hover {
 
 .version-pill {
   font-family: var(--font-mono);
-  font-size: 0.82rem;
+  font-size: 0.8125rem;
   padding: 0.2rem 0.55rem;
   border-radius: 6px;
   background: var(--accent-soft);
@@ -109,13 +112,13 @@ a:hover {
   align-items: center;
   gap: 1.35rem;
   flex-wrap: wrap;
-  font-size: 0.95rem;
+  font-size: 0.9375rem;
 }
 
 .site-nav a {
   color: var(--muted);
   text-decoration: none;
-  font-weight: 550;
+  font-weight: 600;
 }
 
 .site-nav a:hover {
@@ -147,26 +150,26 @@ code {
 
 h1 {
   margin: 0 0 1rem;
-  font-size: clamp(2.15rem, 3.6vw, 3.05rem);
+  font-size: clamp(2.125rem, 3.5vw, 2.875rem);
   line-height: 1.08;
   letter-spacing: -0.03em;
-  font-weight: 780;
+  font-weight: 800;
   text-wrap: balance;
   max-width: 19ch;
 }
 
 h2 {
   margin: 3.75rem 0 1rem;
-  font-size: clamp(1.5rem, 2.3vw, 1.95rem);
+  font-size: clamp(1.5rem, 2.3vw, 1.875rem);
   line-height: 1.2;
   letter-spacing: -0.02em;
-  font-weight: 740;
+  font-weight: 700;
   text-wrap: balance;
 }
 
 h3 {
   margin: 1.65rem 0 0.55rem;
-  font-size: 1.18rem;
+  font-size: 1.1875rem;
   line-height: 1.32;
   font-weight: 700;
   text-wrap: balance;
@@ -180,40 +183,47 @@ li {
 
 .hero-lead {
   margin: 0 0 1.35rem;
-  font-size: 1.12rem;
+  font-size: 1.0625rem;
   color: var(--muted);
 }
 
 .spec-strip {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 0.75rem;
   margin: 1.35rem 0 1.6rem;
+  background: var(--surface-strong);
+  border: 1px solid var(--rule-strong);
+  border-radius: 12px;
+  overflow: hidden;
 }
 
 .spec-cell {
-  background: var(--surface);
-  border: 1px solid var(--rule);
-  border-radius: 10px;
-  padding: 0.85rem 1rem;
+  padding: 0.9rem 1rem;
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+}
+
+.spec-cell + .spec-cell {
+  border-left: 1px solid var(--rule);
 }
 
 .spec-val {
-  display: block;
+  margin: 0;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 1.28rem;
-  font-weight: 750;
+  font-size: 1.1875rem;
+  font-weight: 700;
   color: var(--ink);
-  line-height: 1.2;
+  line-height: 1.25;
 }
 
 .spec-label {
-  display: block;
-  margin-top: 0.25rem;
-  font-size: 0.86rem;
+  margin: 0.25rem 0 0;
+  font-size: 0.875rem;
   color: var(--muted);
   line-height: 1.35;
+  font-weight: 500;
 }
 
 .cta-row {
@@ -231,8 +241,8 @@ li {
   gap: 0.45rem;
   padding: 0.7rem 1.15rem;
   border-radius: 8px;
-  font-size: 0.96rem;
-  font-weight: 650;
+  font-size: 0.9375rem;
+  font-weight: 600;
   text-decoration: none;
   cursor: pointer;
 }
@@ -267,9 +277,9 @@ li {
   background: var(--code-bg);
   color: var(--code-ink);
   padding: 0.75rem 1rem;
-  border-radius: 10px;
+  border-radius: 12px;
   font-family: var(--font-mono);
-  font-size: 0.86rem;
+  font-size: 0.875rem;
 }
 
 .quick-install code {
@@ -279,19 +289,19 @@ li {
 
 .copy-btn {
   flex-shrink: 0;
-  background: #203444;
+  background: var(--code-control);
   color: var(--code-ink);
-  border: 1px solid #38556b;
+  border: 1px solid var(--code-border);
   border-radius: 6px;
   padding: 0.35rem 0.7rem;
   font-family: var(--font-sans);
-  font-size: 0.82rem;
+  font-size: 0.8125rem;
   font-weight: 600;
   cursor: pointer;
 }
 
 .copy-btn:hover {
-  background: #2b4559;
+  background: var(--code-control-hover);
 }
 
 .workbench {
@@ -314,19 +324,19 @@ li {
 
 .workbench-title {
   font-weight: 700;
-  font-size: 0.94rem;
+  font-size: 0.9375rem;
   color: var(--ink);
 }
 
 .guard-badge {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 0.8rem;
+  font-size: 0.8125rem;
   padding: 0.22rem 0.6rem;
   border-radius: 6px;
   background: var(--accent-soft);
   color: var(--accent);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .trace-tabs {
@@ -345,10 +355,10 @@ li {
   background: var(--surface-strong);
   color: var(--muted);
   border: 1px solid var(--rule);
-  border-radius: 7px;
+  border-radius: 6px;
   padding: 0.42rem 0.78rem;
   font-family: var(--font-sans);
-  font-size: 0.85rem;
+  font-size: 0.875rem;
   font-weight: 600;
   cursor: pointer;
 }
@@ -379,13 +389,13 @@ li {
   padding: 0.15rem 0;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 0.8rem;
+  font-size: 0.8125rem;
 }
 
 .cursor-pill strong {
   display: block;
   color: var(--ink);
-  font-size: 0.82rem;
+  font-size: 0.8125rem;
 }
 
 .cursor-pill span {
@@ -397,10 +407,10 @@ li {
   padding: 0.9rem 1rem;
   background: var(--code-bg);
   color: var(--code-ink);
-  border-radius: 10px;
+  border-radius: 12px;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 0.81rem;
+  font-size: 0.8125rem;
   line-height: 1.5;
   overflow-x: auto;
   white-space: pre;
@@ -413,7 +423,7 @@ li {
   gap: 0.75rem;
   flex-wrap: wrap;
   margin-top: 0.8rem;
-  font-size: 0.85rem;
+  font-size: 0.875rem;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
@@ -467,7 +477,7 @@ li {
 
 .bench-caption {
   margin: 0;
-  font-size: 0.9rem;
+  font-size: 0.875rem;
   color: var(--muted);
 }
 
@@ -482,7 +492,7 @@ li {
   grid-template-columns: minmax(220px, 310px) 1fr 110px;
   gap: 0.9rem;
   align-items: center;
-  font-size: 0.88rem;
+  font-size: 0.875rem;
 }
 
 .bar-name {
@@ -495,7 +505,7 @@ li {
 
 .bar-row.is-ours .bar-name {
   color: var(--accent);
-  font-weight: 750;
+  font-weight: 700;
 }
 
 .bar-track {
@@ -509,7 +519,7 @@ li {
 
 .bar-fill {
   height: 100%;
-  background: #7c93a6;
+  background: var(--bar-neutral);
   border-radius: 6px;
   min-width: 4px;
   transition: width 220ms cubic-bezier(0.22, 1, 0.36, 1);
@@ -522,8 +532,8 @@ li {
 .bar-value {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 0.85rem;
-  font-weight: 650;
+  font-size: 0.875rem;
+  font-weight: 600;
   text-align: right;
   color: var(--ink);
 }
@@ -537,7 +547,7 @@ li {
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.83rem;
+  font-size: 0.8125rem;
   font-variant-numeric: tabular-nums;
 }
 
@@ -566,17 +576,17 @@ tr.ours-row {
 }
 
 tr.ours-row td {
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .badge-yes,
 .badge-no {
   display: inline-block;
   font-family: var(--font-mono);
-  font-size: 0.78rem;
+  font-size: 0.8125rem;
   padding: 0.12rem 0.45rem;
-  border-radius: 5px;
-  font-weight: 650;
+  border-radius: 6px;
+  font-weight: 600;
 }
 
 .badge-yes {
@@ -592,15 +602,19 @@ tr.ours-row td {
 .arch-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 1.25rem;
   margin-top: 1.25rem;
+  background: var(--surface-strong);
+  border: 1px solid var(--rule-strong);
+  border-radius: 14px;
+  overflow: hidden;
 }
 
 .arch-col {
-  background: var(--surface-strong);
-  border: 1px solid var(--rule-strong);
-  border-radius: 12px;
-  padding: 1.35rem 1.4rem;
+  padding: 1.4rem 1.5rem;
+}
+
+.arch-col + .arch-col {
+  border-left: 1px solid var(--rule);
 }
 
 .arch-col h3 {
@@ -614,7 +628,7 @@ tr.ours-row td {
 
 .arch-col li {
   margin: 0.55rem 0;
-  font-size: 0.95rem;
+  font-size: 0.9375rem;
   color: var(--muted);
 }
 
@@ -681,8 +695,15 @@ tr.ours-row td {
   justify-content: space-between;
   gap: 1rem;
   flex-wrap: wrap;
-  font-size: 0.92rem;
+  font-size: 0.9375rem;
   color: var(--muted);
+}
+
+.footer-links {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: wrap;
 }
 
 @media (max-width: 960px) {
@@ -690,6 +711,11 @@ tr.ours-row td {
   .arch-grid,
   .market-split {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .arch-col + .arch-col {
+    border-left: none;
+    border-top: 1px solid var(--rule);
   }
 
   .bar-row {
@@ -713,8 +739,14 @@ tr.ours-row td {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .spec-cell + .spec-cell {
+    border-left: none;
+    border-top: 1px solid var(--rule);
+  }
+
   .quick-install {
     flex-direction: column;
     align-items: stretch;
   }
 }
+

@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-08T01:35:00Z",
+  "title": "Design System: Faster Mac Use (fmu)",
+  "extensions": {
+    "colorMeta": {
+      "accent": {
+        "role": "primary",
+        "displayName": "Phosphor Emerald",
+        "canonical": "#095c49",
+        "tonalRamp": ["#042a21", "#064436", "#095c49", "#0f7a62", "#26997f", "#6bc2ad", "#b0e2d5", "#d7efe8"]
+      },
+      "signal": {
+        "role": "secondary",
+        "displayName": "Copper Signal",
+        "canonical": "#b53f15",
+        "tonalRamp": ["#4a1806", "#7a290c", "#b53f15", "#d4562a", "#e47b55", "#f0a68b", "#f7cbbd", "#fae6de"]
+      },
+      "ground": {
+        "role": "neutral",
+        "displayName": "Anodized Ground",
+        "canonical": "#eaf0f4",
+        "tonalRamp": ["#0c1720", "#101c26", "#203444", "#344b5c", "#7c93a6", "#9fb2c2", "#c4d1dc", "#eaf0f4"]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Hero thesis headline." },
+      "headline": { "displayName": "Headline", "purpose": "Primary section headings." },
+      "title": { "displayName": "Title", "purpose": "Panel and architectural tier titles." },
+      "body": { "displayName": "Body", "purpose": "Technical prose and list items (68ch max)." },
+      "subhead": { "displayName": "Subhead", "purpose": "Navigation links and primary CTAs." },
+      "label": { "displayName": "Label", "purpose": "Interactive workload and metric tabs." },
+      "code": { "displayName": "Code / Telemetry", "purpose": "Monospace traces, benchmark tables, and status badges." }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "ease-out-cubic",
+        "value": "cubic-bezier(0.22, 1, 0.36, 1)",
+        "purpose": "Smooth width transition on interactive benchmark bar fills."
+      }
+    ],
+    "breakpoints": [
+      { "name": "sm", "value": "600px" },
+      { "name": "md", "value": "960px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary action link for repository and installation.",
+      "html": "<a class=\"ds-btn-primary\" href=\"#\">View on GitHub</a>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; padding: 0.7rem 1.15rem; border-radius: 8px; background: var(--accent, #095c49); color: var(--surface-strong, #ffffff); border: 1px solid var(--accent, #095c49); font-size: 0.9375rem; font-weight: 600; text-decoration: none; } .ds-btn-primary:hover { background: var(--accent-hover, #064436); } .ds-btn-primary:focus-visible { outline: 2.5px solid var(--signal, #b53f15); outline-offset: 3px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Secondary navigation action to benchmark explorer or technical docs.",
+      "html": "<a class=\"ds-btn-secondary\" href=\"#benchmarks\">Explore 15-System Benchmarks</a>",
+      "css": ".ds-btn-secondary { display: inline-flex; align-items: center; padding: 0.7rem 1.15rem; border-radius: 8px; background: var(--surface-strong, #ffffff); color: var(--ink, #0c1720); border: 1px solid var(--rule-strong, #9fb2c2); font-size: 0.9375rem; font-weight: 600; text-decoration: none; } .ds-btn-secondary:hover { background: var(--surface, #f7fafc); } .ds-btn-secondary:focus-visible { outline: 2.5px solid var(--signal, #b53f15); outline-offset: 3px; }"
+    },
+    {
+      "name": "Workload / Metric Filter Tab",
+      "kind": "chip",
+      "refersTo": "chip-active",
+      "description": "Interactive tab selector for switching benchmark workloads, metrics, and traces.",
+      "html": "<button type=\"button\" class=\"ds-chip\" aria-selected=\"true\">A: Web SaaS (10 ops)</button>",
+      "css": ".ds-chip { background: var(--surface-strong, #ffffff); color: var(--muted, #344b5c); border: 1px solid var(--rule, #c4d1dc); border-radius: 6px; padding: 0.42rem 0.78rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; } .ds-chip[aria-selected=\"true\"] { background: var(--accent, #095c49); color: var(--surface-strong, #ffffff); border-color: var(--accent, #095c49); } .ds-chip:focus-visible { outline: 2.5px solid var(--signal, #b53f15); outline-offset: 3px; }"
+    },
+    {
+      "name": "Top Navigation Bar",
+      "kind": "nav",
+      "refersTo": "top-bar",
+      "description": "Header bar with project provenance and section anchors.",
+      "html": "<header class=\"ds-top-bar\"><span>Lifan Chen / faster-mac-use</span><nav><a href=\"#benchmarks\">5-Workload Benchmarks</a></nav></header>",
+      "css": ".ds-top-bar { display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; padding-bottom: 1.25rem; border-bottom: 1px solid var(--rule, #c4d1dc); font-size: 0.9375rem; } .ds-top-bar a { color: var(--muted, #344b5c); text-decoration: none; font-weight: 600; } .ds-top-bar a:hover { color: var(--ink, #0c1720); text-decoration: underline; }"
+    },
+    {
+      "name": "Specification Panel",
+      "kind": "card",
+      "refersTo": "panel-box",
+      "description": "Structural 1px-bordered specification container without drop shadow.",
+      "html": "<div class=\"ds-panel\"><h3>Tier 1: Browser Engine</h3><p>Unfocused Chrome Agent tab groups with persistent WeakMap UIDs.</p></div>",
+      "css": ".ds-panel { background: var(--surface-strong, #ffffff); border: 1px solid var(--rule-strong, #9fb2c2); border-radius: 12px; padding: 1.35rem 1.5rem; color: var(--ink, #0c1720); } .ds-panel h3 { margin: 0 0 0.55rem; font-size: 1.1875rem; font-weight: 700; } .ds-panel p { margin: 0; color: var(--muted, #344b5c); font-size: 0.9375rem; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Anodized Systems Workbench",
+    "overview": "faster-mac-use is a precision systems engine for macOS and Chrome. Its web presence rejects dark-neon AI tropes and floating SaaS feature cards in favor of a bright, high-contrast anodized-aluminum specification sheet paired with a deep-slate telemetry workbench. Every visual element encodes verifiable measurement: 50Hz hardware intrusion guard badges, multi-cursor virtual coordinates, and interactive o200k_base benchmark comparisons.",
+    "keyCharacteristics": [
+      "Cool anodized-aluminum ground (#eaf0f4) with crisp white specification ledgers (#ffffff) and structural 1px rules (#9fb2c2, #c4d1dc).",
+      "Deep slate code/trace chambers (#101c26) reserved strictly for live cua_repl traces, CLI commands, and MCP configuration snippets.",
+      "Chivo geometric grotesque for assertive headings and readable prose paired with JetBrains Mono (tabular-nums) for token counts, latencies, and virtual cursor coordinates."
+    ],
+    "rules": [
+      {
+        "name": "The Structural Hairline Rule",
+        "body": "Divide related specification cells and architectural tiers with 1px structural rules inside a unified ledger rather than chopping content into disconnected floating cards.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tabular Telemetry Rule",
+        "body": "Every numeric comparison, token count, latency figure, and virtual cursor coordinate must render with font-variant-numeric: tabular-nums so columns align vertically across switches.",
+        "section": "typography"
+      },
+      {
+        "name": "The One-Elevation Rule",
+        "body": "Declare container boundaries once via a 1px structural border (#9fb2c2); never pair a hairline border with a diffuse drop shadow.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do use exact measured numbers from benchmarks/results/latest_benchmark.json across every chart, table, and trace caption.",
+      "Do state material platform and extension boundaries alongside performance claims.",
+      "Do maintain custom browser surface theming (::selection, scrollbar-color, :focus-visible in #b53f15, and tabular-nums)."
+    ],
+    "donts": [
+      "Don't place uppercase eyebrow/kicker labels above section headings (h1, h2, h3).",
+      "Don't nest bordered cards inside bordered cards; use 1px structural hairlines (#c4d1dc) to subdivide panels.",
+      "Don't use gradient text, neon dark-mode glows, or unverified marketing superlatives."
+    ]
+  }
+}

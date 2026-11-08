@@ -9,4 +9,4 @@ build/
 .venv/
 venv/
 bin/fmu-ax
-.impeccable/
+.impeccable/review/

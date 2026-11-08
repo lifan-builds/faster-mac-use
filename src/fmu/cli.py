@@ -71,7 +71,26 @@ def serve_mcp() -> None:
         runtime.shutdown()
 
 
+USAGE_TEXT = """Usage:
+  fmu '<json>'            Execute a web, macOS AX, REPL, or parallel CUA request
+  fmu mcp                 Run as an MCP stdio server
+  fmu --reset             Reset warm browser & macOS AX daemon state
+  fmu --shutdown          Stop background runtime daemon
+  fmu --daemon [sock]     Run the warm runtime socket daemon
+  fmu --version           Show version
+  fmu --help              Show this help message
+"""
+
+
 def main(bin_path: Path | None = None) -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE_TEXT)
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-v", "--version", "version"):
+        from fmu import __version__
+
+        sys.stdout.write(f"faster-mac-use {__version__}\n")
+        return
     if len(sys.argv) >= 2 and sys.argv[1] in ("mcp", "--mcp"):
         serve_mcp()
         return
@@ -84,15 +103,27 @@ def main(bin_path: Path | None = None) -> None:
     elif len(sys.argv) >= 2 and sys.argv[1] in ("--shutdown", "shutdown"):
         req = {"shutdown_daemon": True}
     elif len(sys.argv) >= 2:
-        req = json.loads(sys.argv[1])
+        try:
+            req = json.loads(sys.argv[1])
+        except ValueError as exc:
+            sys.stderr.write(f"Error: Invalid JSON argument: {exc}\n{USAGE_TEXT}")
+            sys.exit(2)
     elif not sys.stdin.isatty():
         raw_stdin = sys.stdin.read().strip()
         if not raw_stdin:
-            sys.stderr.write("Usage: fmu '<json>' | fmu mcp | fmu --reset | fmu --daemon [sock]\n")
+            sys.stderr.write(USAGE_TEXT)
             sys.exit(2)
-        req = json.loads(raw_stdin)
+        try:
+            req = json.loads(raw_stdin)
+        except ValueError as exc:
+            sys.stderr.write(f"Error: Invalid JSON on stdin: {exc}\n{USAGE_TEXT}")
+            sys.exit(2)
     else:
-        sys.stderr.write("Usage: fmu '<json>' | fmu mcp | fmu --reset | fmu --daemon [sock]\n")
+        sys.stderr.write(USAGE_TEXT)
+        sys.exit(2)
+
+    if not isinstance(req, dict):
+        sys.stderr.write("Error: Request payload must be a JSON object.\n")
         sys.exit(2)
 
     surface = req.get("surface") or ("app" if "app" in req else "web")
@@ -107,9 +138,10 @@ def main(bin_path: Path | None = None) -> None:
         print(MacNativeEngine().execute(req))
         return
 
-    entry = bin_path or (Path(__file__).resolve().parents[2] / "bin" / "fmu")
+    entry = bin_path if (bin_path and bin_path.is_file()) else Path(__file__).resolve()
     print(execute_via_daemon(req, entry))
 
 
 if __name__ == "__main__":
     main()
+

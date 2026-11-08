@@ -510,8 +510,39 @@ class TestFasterMacUse(unittest.TestCase):
         self.assertIn("=== [good-agent] ===", par_res)
         self.assertIn("ENT-1000-OK", par_res)
 
+    def test_15_cli_help_version_invalid_json_and_swiftc_fallback(self) -> None:
+        from unittest.mock import patch
+        from fmu import mac_engine
+
+        fmu_bin = str(ROOT / "bin" / "fmu")
+        help_proc = subprocess.run([fmu_bin, "--help"], capture_output=True, text=True, check=False)
+        self.assertEqual(help_proc.returncode, 0)
+        self.assertIn("Usage:", help_proc.stdout)
+
+        ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
+        self.assertEqual(ver_proc.returncode, 0)
+        self.assertIn("faster-mac-use 0.1.0", ver_proc.stdout)
+
+        bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
+        self.assertEqual(bad_proc.returncode, 2)
+        self.assertIn("Error: Invalid JSON argument", bad_proc.stderr)
+        self.assertNotIn("Traceback", bad_proc.stderr)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            (tmp_root / "src" / "native").mkdir(parents=True)
+            (tmp_root / "src" / "native" / "fmu_ax.swift").write_text("import Foundation\n")
+            with (
+                patch.object(mac_engine, "ROOT", tmp_root),
+                patch.object(mac_engine.subprocess, "run", side_effect=FileNotFoundError("swiftc")),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    mac_engine._resolve_ax_binary()
+                self.assertIn("xcode-select --install", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 

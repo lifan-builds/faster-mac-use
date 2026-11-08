@@ -17,11 +17,11 @@ Most computer-use tools force a painful choice:
 
 | Workload | `faster-mac-use` (Cumulative Tokens / Engine Time) | OpenAI Codex `cua_repl` Ref | `@playwright/mcp` / Stacked MCPs | Anthropic Pixel CUA |
 | :--- | :--- | :--- | :--- | :--- |
-| **A. Enterprise SaaS Console (10 ops)** | **1,290 tok / 79 ms** (WebMCP)<br>**2,024 tok / 118 ms** (DOM Diff) | 5,732 tok / 339 ms | 231,125 tok / 1,850 ms | 83,215 tok / 3,400 ms |
-| **B. macOS Native Calculator (11 ops)** | **1,264 tok / 94 ms** | 1,499 tok / 188 ms | 48,477 tok / 2,694 ms (`ocu`) | — |
+| **A. Enterprise SaaS Console (10 ops)** | **1,290 tok / 81 ms** (WebMCP)<br>**2,024 tok / 118 ms** (DOM Diff) | 5,732 tok / 339 ms | 231,125 tok / 1,850 ms | 83,215 tok / 3,400 ms |
+| **B. macOS Native Calculator (11 ops)** | **1,264 tok / 102 ms** | 1,499 tok / 188 ms | 48,488 tok / 3,581 ms (`ocu`) | — |
 | **C. Hybrid Web + macOS (14 ops)** | **2,176 tok / 306 ms** | 2,434 tok / 531 ms | 129,010 tok / 3,200 ms | — |
 | **D. 3-Agent Multi-Cursor Swarm (25 ops)** | **1,510 tok / 256 ms** (2 turns) | 15,848 tok / 954 ms (6 turns) | 293,950 tok / 4,850 ms | 430,800 tok / 7,600 ms |
-| **E. Long-Horizon 30-Op + Window OCR** | **4,581 tok / 434 ms** (0 vision tok) | 8,352 tok / 858 ms | 400,725 tok / 6,100 ms | 620,535 tok / 9,200 ms |
+| **E. Long-Horizon 30-Op + Window OCR** | **4,581 tok / 443 ms** (0 vision tok) | 8,352 tok / 871 ms | 400,725 tok / 6,100 ms | 620,535 tok / 9,200 ms |
 
 ---
 
@@ -38,13 +38,13 @@ Most computer-use tools force a painful choice:
    - Concurrent, thread-safe Unix-domain socket daemon (`/tmp/fmu-ax.sock`, binary `bin/fmu-ax`) keeping a warm 4,000-element `AXUIElement` LRU cache, PID/window cache, per-agent `+/~/-` diff baselines, and per-agent virtual cursors (`VirtualCursorState`) across turns.
    - Batches accessibility attribute fetches with `AXUIElementCopyMultipleAttributeValues` and skips redundant pre-action walks when baseline state is already cached.
    - Lazy accessibility wakeup (`AXManualAccessibility = true` / `AXEnhancedUserInterface = true`) only for target background PIDs.
-   - Stable `@a1..@aN` UIDs (`CFHash` + structural fallback), `+/~/-` UID diffs, and zero-focus background actions (`AXPress` $\rightarrow$ `AXConfirm` $\rightarrow$ background `CGEvent.postToPid` click fallback, plus 16-char UTF-16 batched `CGEvent.postToPid` keystrokes).
+   - Stable `@a1..@aN` UIDs (`CFHash` + structural fallback), `+/~/-` UID diffs, and zero-focus background actions (`AXPress` → `AXConfirm` → background `CGEvent.postToPid` click fallback, plus 16-char UTF-16 batched `CGEvent.postToPid` keystrokes).
    - Built-in Apple Silicon **`Vision.framework` (`VNRecognizeTextRequest`) + `CGWindowListCreateImage`** OCR fallback (`op: "ocr"` / `app.ocr()`) for GPU/canvas windows with 0 LLM vision tokens.
 
 3. **Tier 3 — Unified Multi-Cursor / Multi-Agent Stateful REPL, Warm Daemon & Context Hygiene ([`FasterMacUseRuntime`](src/fmu/cua_runtime.py))**
    - Compact single-tool schema (**268 tokens**) supporting OpenAI Codex-style stateful `cua_repl` scripts (`cua.createBrowserTab`, `cua.getTab`, `cua.getApp`, `cua.getState`, `cua.getCursors`), 1-trip declarative `steps` batches, and concurrent multi-agent swarms (`{"parallel": [{"agent": "agent-1", "code": "..."}, ...]}`).
    - Per-agent isolated `AgentSession` (`agent` / `cursor` parameter) with independent REPL handle namespaces, independent `ContextWindowTracker` stale-snapshot masking, and independent virtual cursor `(x, y)` coordinates (`tab.moveCursor` / `app.moveCursor`).
-   - Concurrent persistent runtime daemon (`/tmp/fmu-runtime.sock`) keeps Playwright browser tabs, `WeakMap` UIDs, and `cua_repl` handles warm across parallel CLI/MCP invocations (~79–125 ms for a 10-action web workflow; ~256 ms for a 3-agent 25-action parallel swarm).
+   - Concurrent persistent runtime daemon (`/tmp/fmu-runtime.sock`) keeps Playwright browser tabs, `WeakMap` UIDs, and `cua_repl` handles warm across parallel CLI/MCP invocations (~81–118 ms for a 10-action web workflow; ~256 ms for a 3-agent 25-action parallel swarm).
    - [`BackgroundIntrusionGuard`](src/fmu/guard.py) polls CoreGraphics (`CGEventGetLocation` + `CGEventSourceSecondsSinceLastEventType`) and `lsappinfo front` at 50Hz to prove `0.0 px` cursor displacement and `0` automated focus changes.
 
 ---

@@ -13,29 +13,39 @@ DEFAULT_SOCK = "/tmp/fmu-ax.sock"
 
 
 def _resolve_ax_binary() -> Path:
-    candidates = [
-        ROOT / "bin" / "fmu-ax",
-        ROOT / "scripts" / "fmu-ax",
-        ROOT / "scripts" / "agy-ax",
-        Path.home() / "Project" / "faster-mac-use" / "bin" / "fmu-ax",
-        Path.home() / "Project" / "agent" / "scripts" / "agy-ax",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c
-    swift_src = ROOT / "src" / "native" / "fmu_ax.swift"
     target_bin = ROOT / "bin" / "fmu-ax"
+    swift_src = ROOT / "src" / "native" / "fmu_ax.swift"
+    if target_bin.is_file():
+        if not swift_src.is_file() or target_bin.stat().st_mtime >= swift_src.stat().st_mtime:
+            return target_bin
     if swift_src.is_file():
         target_bin.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["swiftc", "-O", str(swift_src), "-o", str(target_bin)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            subprocess.run(
+                ["swiftc", "-O", str(swift_src), "-o", str(target_bin)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            if target_bin.is_file():
+                return target_bin
+            raise RuntimeError(
+                f"Cannot compile {swift_src}: 'swiftc' not found. "
+                "Install Xcode Command Line Tools with: xcode-select --install"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            if target_bin.is_file():
+                return target_bin
+            err_detail = (exc.stderr or "").strip()
+            raise RuntimeError(
+                f"Failed to compile {swift_src} with swiftc: {err_detail}"
+            ) from exc
         if target_bin.is_file():
             return target_bin
-    return candidates[0]
+    return target_bin
+
 
 
 class MacNativeEngine:

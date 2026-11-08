@@ -23,7 +23,7 @@ benchmarks = [
 ]
 
 [project.urls]
-Homepage = "https://clifan.com/faster-mac-use/"
+Homepage = "https://lifan-builds.github.io/faster-mac-use/"
 Repository = "https://github.com/lifan-builds/faster-mac-use"
 Documentation = "https://github.com/lifan-builds/faster-mac-use/blob/main/docs/architecture_and_benchmarks.md"
 

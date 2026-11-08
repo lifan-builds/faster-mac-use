@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faster-mac-use"
+version = "0.1.0"
+description = "Background-first, multi-cursor browser and native macOS computer-use engine for AI agents"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Lifan Chen" }
+]
+keywords = ["mcp", "computer-use", "macos", "accessibility", "browser-automation", "cua", "ai-agents"]
+dependencies = [
+  "playwright>=1.40.0",
+]
+
+[project.optional-dependencies]
+benchmarks = [
+  "tiktoken>=0.7.0",
+]
+
+[project.urls]
+Homepage = "https://clifan.com/faster-mac-use/"
+Repository = "https://github.com/lifan-builds/faster-mac-use"
+Documentation = "https://github.com/lifan-builds/faster-mac-use/blob/main/docs/architecture_and_benchmarks.md"
+
+[project.scripts]
+fmu = "fmu.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

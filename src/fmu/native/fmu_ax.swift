@@ -973,10 +973,12 @@ func settleAndWalkAXTree(
     }
     var (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
     var curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
-    if shouldSettle && curCrc == prevCrc {
-        Thread.sleep(forTimeInterval: 0.018)
-        (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
-        curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
+    if shouldSettle {
+        for _ in 0..<4 where curCrc == prevCrc {
+            Thread.sleep(forTimeInterval: 0.025)
+            (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
+            curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
+        }
     }
     _ = state.consumeDirtyState(pid)
     state.windowSyncedSeq[winKey] = state.currentPidSeq(pid)
@@ -1046,7 +1048,7 @@ func executeRequest(_ req: BatchRequest) -> String {
 
     var currentNodes: [NodeRecord]
     var currentElements: [AXUIElement]
-    if !pidChanged && !hasQuery,
+    if !pidChanged && !hasQuery && (hasSteps || req.diff != false),
        let cachedNodes = state.latestWindowNodes[winKey] ?? state.windowBaselines[baselineKey],
        !cachedNodes.isEmpty {
         let cachedEls = state.latestWindowElements[winKey] ?? cachedNodes.compactMap { state.uidToElement[$0.uid] }
@@ -1108,6 +1110,20 @@ func executeRequest(_ req: BatchRequest) -> String {
     var didMutate = false
 
     if let steps = req.steps, !steps.isEmpty {
+        let appElForMain = AXUIElementCreateApplication(app.pid)
+        var prevMainRef: CFTypeRef?
+        let hadPrevMain = AXUIElementCopyAttributeValue(appElForMain, kAXMainWindowAttribute as CFString, &prevMainRef) == .success
+        if axString(root, kAXRoleAttribute) == kAXWindowRole {
+            _ = AXUIElementSetAttributeValue(root, kAXMainAttribute as CFString, kCFBooleanTrue)
+        }
+        defer {
+            if hadPrevMain, let pm = prevMainRef {
+                let pmEl = pm as! AXUIElement
+                if CFHash(pmEl) != CFHash(root) {
+                    _ = AXUIElementSetAttributeValue(pmEl, kAXMainAttribute as CFString, kCFBooleanTrue)
+                }
+            }
+        }
         for (i, step) in steps.enumerated() {
             let op = step.effectiveOp
             if op != "move" && op != "ocr" {
@@ -1247,12 +1263,18 @@ func executeRequest(_ req: BatchRequest) -> String {
                 if op == "move" {
                     continue
                 } else if op == "click" {
+                    if targetNode?.role == "textfield" || targetNode?.role == "textarea" {
+                        _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                    }
                     var err = AXUIElementPerformAction(el, kAXPressAction as CFString)
                     if err == .invalidUIElement || err == .cannotComplete {
                         (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
                         if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
                             el = refreshed
                             targetNode = state.uidToRecord[uid]
+                            if targetNode?.role == "textfield" || targetNode?.role == "textarea" {
+                                _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                            }
                             err = AXUIElementPerformAction(el, kAXPressAction as CFString)
                         }
                     }
@@ -1270,19 +1292,48 @@ func executeRequest(_ req: BatchRequest) -> String {
                         stepErrors.append("step \(i+1): AXPress failed (\(err.rawValue))")
                     }
                 } else {
-                    let val = (step.value ?? "") as CFTypeRef
-                    _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                    var err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
-                    if err == .invalidUIElement || err == .cannotComplete {
-                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
-                        if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
-                            el = refreshed
-                            _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                            err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                    let textStr = step.value ?? ""
+                    let val = textStr as CFTypeRef
+                    let isTextarea = (targetNode?.role == "textarea")
+                    var didStick = false
+                    if !isTextarea {
+                        _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                        var err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                        if err == .invalidUIElement || err == .cannotComplete {
+                            (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                            if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
+                                el = refreshed
+                                _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                                err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, val)
+                            }
                         }
+                        didStick = (err == .success) && (textStr.isEmpty || !axString(el, kAXValueAttribute).isEmpty)
                     }
-                    if err != .success {
-                        postBatchedUnicodeTextToPid(app.pid, text: step.value ?? "")
+                    if !didStick {
+                        _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                        _ = AXUIElementPerformAction(el, kAXPressAction as CFString)
+                        Thread.sleep(forTimeInterval: 0.025)
+                        _ = invokeMenuBar(app.pid, path: ["Edit", "Select All"])
+                        Thread.sleep(forTimeInterval: 0.015)
+                        if textStr.isEmpty {
+                            if !invokeMenuBar(app.pid, path: ["Edit", "Delete"]) {
+                                postKeyChordToPid(app.pid, chord: "backspace")
+                            }
+                        } else {
+                            let pb = NSPasteboard.general
+                            let oldStr = pb.string(forType: .string)
+                            pb.clearContents()
+                            pb.setString(textStr, forType: .string)
+                            if invokeMenuBar(app.pid, path: ["Edit", "Paste"]) {
+                                Thread.sleep(forTimeInterval: 0.050)
+                            } else {
+                                postBatchedUnicodeTextToPid(app.pid, text: textStr)
+                            }
+                            if let prev = oldStr {
+                                pb.clearContents()
+                                pb.setString(prev, forType: .string)
+                            }
+                        }
                     }
                 }
             default:

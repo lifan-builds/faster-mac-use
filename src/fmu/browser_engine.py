@@ -15,6 +15,8 @@ import time
 from urllib.parse import urlparse
 from typing import Any, Callable
 
+from fmu.telemetry import flush_telemetry, record_perf_event, sanitize_error, sanitize_url_target
+
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
   if (window.__fmu) return true;
@@ -709,6 +711,7 @@ IN_PAGE_RUNTIME_JS = r"""
   ]);
 
   async function executeBatch(req) {
+    const tBatchStart = performance.now();
     if (req.virtualTools) {
       registerVirtualTools(req.virtualTools);
     }
@@ -725,6 +728,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const hadBaseline = st.lastLinesByUid.size > 0 && !viewChanged;
 
     if (steps.length === 0 && req.diff === true && !forceFull && hadBaseline && mutationSeq === st.lastSnapSeq) {
+      const fastMs = +(performance.now() - tBatchStart).toFixed(2);
       return {
         unchanged: true,
         crc: st.lastCrc,
@@ -732,6 +736,7 @@ IN_PAGE_RUNTIME_JS = r"""
         count: st.lastLinesByUid.size,
         cursor: st.cursor,
         canvases: [],
+        timings: { execMs: 0, settleMs: 0, snapMs: fastMs, totalInPageMs: fastMs },
         lines: [`= unchanged (crc=${st.lastCrc}, seq=${mutationSeq})`]
       };
     }
@@ -748,6 +753,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const errors = [];
     const evalOutputs = [];
     const escalations = [];
+    const tExecStart = performance.now();
 
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i] || {};
@@ -959,14 +965,29 @@ IN_PAGE_RUNTIME_JS = r"""
       }
     }
 
+    const execMs = +(performance.now() - tExecStart).toFixed(2);
     if (req.skipSnapshot) {
-      return { url: location.href, title: document.title, errors, evalOutputs, escalations, cursor: st.cursor, canvases: [], lines: [] };
+      return {
+        url: location.href,
+        title: document.title,
+        errors,
+        evalOutputs,
+        escalations,
+        cursor: st.cursor,
+        canvases: [],
+        timings: { execMs, settleMs: 0, snapMs: 0, totalInPageMs: +(performance.now() - tBatchStart).toFixed(2) },
+        lines: []
+      };
     }
 
+    let settleMs = 0;
     if ((steps.length > 0 || req.hadPreSteps) && req.settle !== false) {
+      const tSettle0 = performance.now();
       await waitQuietDom(14, 100);
+      settleMs = +(performance.now() - tSettle0).toFixed(2);
     }
 
+    const tSnap0 = performance.now();
     const prevMap = st.lastLinesByUid;
     const prevCrc = st.lastCrc;
     st.preBatchLinesByUid = prevMap;
@@ -997,6 +1018,7 @@ IN_PAGE_RUNTIME_JS = r"""
     } else {
       outLines = snap.lines;
     }
+    const snapMs = +(performance.now() - tSnap0).toFixed(2);
 
     return {
       url: location.href,
@@ -1011,6 +1033,7 @@ IN_PAGE_RUNTIME_JS = r"""
       errors,
       evalOutputs,
       escalations,
+      timings: { execMs, settleMs, snapMs, totalInPageMs: +(performance.now() - tBatchStart).toFixed(2) },
       lines: outLines
     };
   }
@@ -2258,11 +2281,24 @@ class BrowserEngine:
         return self._run_sync(lambda: self._execute_batch_with_retry(req))
 
     def _execute_batch_with_retry(self, req: dict[str, Any]) -> str:
+        t0 = time.perf_counter()
         try:
             return self._execute_batch_inner(req)
         except Exception as exc:
             msg = str(exc)
             if "MV3 extension not connected on ws://" in msg:
+                record_perf_event(
+                    {
+                        "surface": "web",
+                        "bridge": "mv3",
+                        "agent": str(req.get("agent") or "default"),
+                        "target": sanitize_url_target(req.get("url")),
+                        "step_count": len(req.get("steps") or []),
+                        "error_count": 1,
+                        "errors": [sanitize_error(msg)],
+                        "timings_ms": {"total": round((time.perf_counter() - t0) * 1000.0, 2)},
+                    }
+                )
                 raise
             if any(
                 tok in msg
@@ -2281,6 +2317,18 @@ class BrowserEngine:
                 if not self._is_browser_alive():
                     self._evict_dead_browser()
                 return self._execute_batch_inner(req)
+            record_perf_event(
+                {
+                    "surface": "web",
+                    "bridge": str(req.get("mode") or "chrome"),
+                    "agent": str(req.get("agent") or "default"),
+                    "target": sanitize_url_target(req.get("url")),
+                    "step_count": len(req.get("steps") or []),
+                    "error_count": 1,
+                    "errors": [sanitize_error(msg)],
+                    "timings_ms": {"total": round((time.perf_counter() - t0) * 1000.0, 2)},
+                }
+            )
             raise
 
     def _execute_batch_inner(self, req: dict[str, Any]) -> str:
@@ -2394,6 +2442,29 @@ class BrowserEngine:
 
         sess.enable_background_focus_emulation()
         sess.ensure_runtime()
+        tab_attach_ms = (time.perf_counter() - t0) * 1000.0
+        in_page_wall_ms = 0.0
+        in_page_exec_ms = 0.0
+        in_page_settle_ms = 0.0
+        in_page_snap_ms = 0.0
+        in_page_total_js_ms = 0.0
+        escalation_ms = 0.0
+        ocr_ms = 0.0
+        all_escalations: list[str] = []
+
+        def _accum_in_page(r: Any, dt_ms: float) -> None:
+            nonlocal in_page_wall_ms, in_page_exec_ms, in_page_settle_ms, in_page_snap_ms, in_page_total_js_ms
+            in_page_wall_ms += dt_ms
+            if isinstance(r, dict):
+                tm = r.get("timings")
+                if isinstance(tm, dict):
+                    in_page_exec_ms += float(tm.get("execMs") or 0.0)
+                    in_page_settle_ms += float(tm.get("settleMs") or 0.0)
+                    in_page_snap_ms += float(tm.get("snapMs") or 0.0)
+                    in_page_total_js_ms += float(tm.get("totalInPageMs") or 0.0)
+                for esc_item in (r.get("escalations") or []):
+                    if isinstance(esc_item, dict) and esc_item.get("reason"):
+                        all_escalations.append(str(esc_item["reason"]))
 
         active_steps = [
             s for s in steps if (s.get("op") or s.get("action")) != "close"
@@ -2413,6 +2484,7 @@ class BrowserEngine:
         virtual_tools = self.get_macros_for_url(sess.last_url)
 
         if req.get("ocr") is not False and (not sess._ocr_populated or req.get("ocr") is True):
+            t_ocr0 = time.perf_counter()
             try:
                 has_canvas = bool(
                     sess._raw_page.evaluate("() => document.querySelectorAll('canvas').length > 0")
@@ -2421,6 +2493,7 @@ class BrowserEngine:
                 has_canvas = False
             if has_canvas:
                 self._sync_canvas_ocr(sess)
+            ocr_ms += (time.perf_counter() - t_ocr0) * 1000.0
 
         boundary_indices = [
             idx
@@ -2443,6 +2516,7 @@ class BrowserEngine:
                 if b_op in ("goto", "navigate", "open"):
                     pre_steps = active_steps[last_idx:b_idx]
                     if pre_steps:
+                        t_ip0 = time.perf_counter()
                         res = sess._raw_page.evaluate(
                             "req => window.__fmu.executeBatch(req)",
                             {
@@ -2456,6 +2530,8 @@ class BrowserEngine:
                                 "skipSnapshot": True,
                             },
                         )
+                        _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+                        t_esc0 = time.perf_counter()
                         self._handle_eval_escalations(
                             sess,
                             res,
@@ -2464,10 +2540,12 @@ class BrowserEngine:
                             full_table=bool(req.get("fullTable", False)),
                             skip_snapshot=True,
                         )
+                        escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
                         combined_errors.extend(res.get("errors") or [])
                         combined_evals.extend(res.get("evalOutputs") or [])
                     nav_url = str(b_step.get("url") or b_step.get("value") or "").strip()
                     if nav_url and nav_url != sess._raw_page.url:
+                        t_nav0 = time.perf_counter()
                         if not sess.is_extension and not self._is_cdp_chrome and mode == "chrome" and self._is_external_url(nav_url):
                             self._should_use_extension_bridge(mode, require_extension=require_ext, url=nav_url)
                         sess._raw_page.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
@@ -2477,10 +2555,12 @@ class BrowserEngine:
                         sess._ocr_populated = False
                         sess.enable_background_focus_emulation()
                         sess.ensure_runtime()
+                        tab_attach_ms += (time.perf_counter() - t_nav0) * 1000.0
                         virtual_tools = self.get_macros_for_url(sess.last_url)
                         had_pre_on_current_page = False
                 else:
                     pre_steps = active_steps[last_idx : b_idx + 1]
+                    t_ip0 = time.perf_counter()
                     res = sess._raw_page.evaluate(
                         "req => window.__fmu.executeBatch(req)",
                         {
@@ -2494,6 +2574,8 @@ class BrowserEngine:
                             "skipSnapshot": True,
                         },
                     )
+                    _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+                    t_esc0 = time.perf_counter()
                     self._handle_eval_escalations(
                         sess,
                         res,
@@ -2526,10 +2608,12 @@ class BrowserEngine:
                                     sess._raw_page.set_input_files(sel, file_list)
                             except Exception as upload_exc:
                                 combined_errors.append(str(upload_exc))
+                    escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
                     had_pre_on_current_page = True
                 last_idx = b_idx + 1
 
             post_steps = active_steps[last_idx:]
+            t_ip0 = time.perf_counter()
             res = sess._raw_page.evaluate(
                 "req => window.__fmu.executeBatch(req)",
                 {
@@ -2543,6 +2627,8 @@ class BrowserEngine:
                     "hadPreSteps": had_pre_on_current_page or bool(post_steps),
                 },
             )
+            _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+            t_esc0 = time.perf_counter()
             self._handle_eval_escalations(
                 sess,
                 res,
@@ -2551,9 +2637,11 @@ class BrowserEngine:
                 full_table=bool(req.get("fullTable", False)),
                 skip_snapshot=False,
             )
+            escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
             res["errors"] = combined_errors + (res.get("errors") or [])
             res["evalOutputs"] = combined_evals + (res.get("evalOutputs") or [])
         else:
+            t_ip0 = time.perf_counter()
             res = sess._raw_page.evaluate(
                 "req => window.__fmu.executeBatch(req)",
                 {
@@ -2566,6 +2654,8 @@ class BrowserEngine:
                     "settle": req.get("settle", True),
                 },
             )
+            _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+            t_esc0 = time.perf_counter()
             self._handle_eval_escalations(
                 sess,
                 res,
@@ -2574,12 +2664,14 @@ class BrowserEngine:
                 full_table=bool(req.get("fullTable", False)),
                 skip_snapshot=False,
             )
+            escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
 
         if (
             req.get("ocr") is not False
             and res.get("canvases")
             and (active_steps or not sess._ocr_populated or req.get("ocr") is True)
         ):
+            t_ocr1 = time.perf_counter()
             new_ocr = self._sync_canvas_ocr(sess, res.get("canvases"))
             try:
                 refreshed = sess._raw_page.evaluate(
@@ -2599,6 +2691,7 @@ class BrowserEngine:
                     res["lines"] = refreshed.get("lines", res.get("lines"))
             except Exception:
                 pass
+            ocr_ms += (time.perf_counter() - t_ocr1) * 1000.0
 
         if sess._raw_page and not sess._raw_page.is_closed() and sess._raw_page.url:
             sess.last_url = sess._raw_page.url
@@ -2654,7 +2747,52 @@ class BrowserEngine:
             for ev in res["evalOutputs"]:
                 out.append(f"> {ev}")
         out.extend(res.get("lines") or [])
-        return "\n".join(out)
+        final_out = "\n".join(out)
+
+        res_lines = res.get("lines") or []
+        if res.get("unchanged") or any(isinstance(l, str) and l.startswith("= unchanged") for l in res_lines):
+            mode_out = "unchanged"
+        elif res.get("useDiff"):
+            mode_out = "diff"
+        else:
+            mode_out = "snapshot"
+
+        bridge_kind = "mv3" if sess.is_extension else ("cdp" if self._is_cdp_chrome else "playwright")
+        bridge_overhead_ms = max(0.0, in_page_wall_ms - in_page_total_js_ms)
+        errs_list = res.get("errors") or []
+        record_perf_event(
+            {
+                "surface": "web",
+                "bridge": bridge_kind,
+                "agent": agent_id,
+                "session": sess.tab_id,
+                "target": sanitize_url_target(sess.last_url),
+                "ops": [
+                    str(s.get("op") or s.get("action") or "").lower()
+                    for s in active_steps
+                    if (s.get("op") or s.get("action"))
+                ],
+                "step_count": len(active_steps),
+                "els": int(res.get("count") or 0),
+                "mode_out": mode_out,
+                "out_chars": len(final_out),
+                "est_tokens": max(1, (len(final_out) + 3) // 4),
+                "escalations": all_escalations,
+                "error_count": len(errs_list),
+                "errors": [sanitize_error(e) for e in errs_list[:3]],
+                "timings_ms": {
+                    "total": round(elapsed_ms, 2),
+                    "tab_attach": round(tab_attach_ms, 2),
+                    "bridge_overhead": round(bridge_overhead_ms, 2),
+                    "in_page_exec": round(in_page_exec_ms, 2),
+                    "in_page_settle": round(in_page_settle_ms, 2),
+                    "in_page_snap": round(in_page_snap_ms, 2),
+                    "escalation": round(escalation_ms, 2),
+                    "ocr": round(ocr_ms, 2),
+                },
+            }
+        )
+        return final_out
 
     def reset(self, agent: str | None = None) -> None:
         self._run_sync(lambda: self._reset_inner(agent))
@@ -2697,5 +2835,6 @@ class BrowserEngine:
             if self._ext_bridge_inst is not None:
                 self._ext_bridge_inst.shutdown()
                 self._ext_bridge_inst = None
+        flush_telemetry()
 
 

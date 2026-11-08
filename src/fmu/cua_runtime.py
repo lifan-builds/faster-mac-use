@@ -496,6 +496,17 @@ class CuaNamespace:
     def reloadExtension(self) -> str:
         return self.runtime.browser.execute_batch({"reloadExtension": True})
 
+    def getPerfReport(self, options: dict[str, Any] | int | None = None) -> str:
+        from fmu.telemetry import build_perf_report
+
+        if isinstance(options, int):
+            return build_perf_report(days=options)
+        if isinstance(options, dict):
+            days = int(options.get("days", 7))
+            fmt = str(options.get("format", "markdown"))
+            return build_perf_report(days=days, fmt=fmt)
+        return build_perf_report()
+
     def getApp(self, identifier: str, window: str | None = None) -> AppHandle:
         key = f"app:{identifier}:{window or ''}"
         if key not in self.handles:
@@ -575,7 +586,7 @@ class FasterMacUseRuntime:
         self._threading = threading
         self._global_lock = threading.RLock()
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="fmu-agent")
-        self.mac = MacNativeEngine()
+        self.mac = MacNativeEngine(in_daemon=True)
         self.browser = BrowserEngine()
         self._agents: dict[str, AgentSession] = {}
         default_sess = self._get_agent_session("default")
@@ -775,6 +786,19 @@ class FasterMacUseRuntime:
         if req.get("reloadExtension"):
             return self.browser.execute_batch({"reloadExtension": True})
 
+        if "perfReport" in req and req["perfReport"]:
+            from fmu.telemetry import build_perf_report
+
+            pr = req["perfReport"]
+            if isinstance(pr, dict):
+                return build_perf_report(
+                    days=int(pr.get("days", 7)),
+                    fmt=str(pr.get("format", "markdown")),
+                )
+            if isinstance(pr, int) and not isinstance(pr, bool):
+                return build_perf_report(days=pr)
+            return build_perf_report()
+
         if "parallel" in req and isinstance(req["parallel"], list):
             return self.execute_parallel(req["parallel"])
 
@@ -824,8 +848,11 @@ class FasterMacUseRuntime:
             return out
 
     def shutdown(self) -> None:
+        from fmu.telemetry import flush_telemetry
+
         self.browser.shutdown()
         self.mac.shutdown()
+        flush_telemetry()
 
 
 def can_connect_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> bool:
@@ -938,6 +965,7 @@ def execute_via_daemon(
             fcntl.flock(spawn_lock_fp.fileno(), fcntl.LOCK_EX)
             try:
                 if not can_connect_runtime_daemon(socket_path):
+                    t_spawn0 = time.perf_counter()
                     proc = subprocess.Popen(
                         [sys.executable, str(fmu_bin_path), "--daemon", socket_path],
                         stdout=subprocess.DEVNULL,
@@ -951,6 +979,18 @@ def execute_via_daemon(
                         if can_connect_runtime_daemon(socket_path):
                             break
                         time.sleep(0.015)
+                    from fmu.telemetry import record_perf_event
+
+                    record_perf_event(
+                        {
+                            "surface": "daemon",
+                            "bridge": "unix_sock",
+                            "target": Path(socket_path).name,
+                            "cold_start": True,
+                            "timings_ms": {"total": round((time.perf_counter() - t_spawn0) * 1000.0, 2)},
+                        },
+                        sync=True,
+                    )
             finally:
                 try:
                     fcntl.flock(spawn_lock_fp.fileno(), fcntl.LOCK_UN)
@@ -1005,6 +1045,8 @@ MCP_TOOL_SCHEMA = {
             "requireExtension": {"type": "boolean"},
             "reuseExisting": {"type": "boolean"},
             "bridgeStatus": {"type": "boolean"},
+            "reloadExtension": {"type": "boolean"},
+            "perfReport": {"type": ["boolean", "object"]},
             "session": {"type": "string"},
             "query": {"type": "string"},
             "diff": {"type": "boolean"},

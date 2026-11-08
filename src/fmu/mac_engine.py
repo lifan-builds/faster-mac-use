@@ -4,11 +4,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
 import time
 from typing import Any
+
+from fmu.telemetry import record_perf_event, sanitize_error
 
 PKG_DIR = Path(__file__).resolve().parent
 ROOT = PKG_DIR.parents[1]
@@ -119,8 +122,9 @@ def _resolve_ax_binary(
 class MacNativeEngine:
     """Drives macOS apps, menus, and dialogs in the background without moving the cursor or stealing focus."""
 
-    def __init__(self, socket_path: str = DEFAULT_SOCK) -> None:
+    def __init__(self, socket_path: str = DEFAULT_SOCK, *, in_daemon: bool = False) -> None:
         self.socket_path = socket_path
+        self._in_daemon = in_daemon
         self._daemon_proc: subprocess.Popen[bytes] | None = None
 
     def ensure_daemon(self) -> None:
@@ -174,13 +178,17 @@ class MacNativeEngine:
             return False
 
     def execute(self, req: dict[str, Any]) -> str:
+        t0 = time.perf_counter()
         if "steps" in req and req["steps"] is not None:
             if not isinstance(req["steps"], list):
                 return "Error: 'steps' must be a JSON array of step objects"
             for idx, st in enumerate(req["steps"]):
                 if not isinstance(st, dict):
                     return f"Error: step {idx + 1} must be a JSON object"
+        was_cold = not self._can_connect()
+        t_boot0 = time.perf_counter()
         self.ensure_daemon()
+        daemon_boot_ms = (time.perf_counter() - t_boot0) * 1000.0
         payload = (json.dumps(req) + "\n").encode("utf-8")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -194,9 +202,59 @@ class MacNativeEngine:
                 if not buf:
                     break
                 chunks.append(buf)
-            return b"".join(chunks).decode("utf-8", errors="replace").strip()
+            out = b"".join(chunks).decode("utf-8", errors="replace").strip()
         finally:
             s.close()
+
+        if not req.get("reset"):
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            first_line = out.splitlines()[0] if out else ""
+            ms_m = re.search(r"\bms=([\d.]+)", first_line)
+            els_m = re.search(r"\bels=(\d+)", first_line)
+            native_ax_ms = float(ms_m.group(1)) if ms_m else 0.0
+            els_count = int(els_m.group(1)) if els_m else 0
+            ipc_overhead_ms = max(0.0, total_ms - daemon_boot_ms - native_ax_ms)
+            steps_list = req.get("steps") or []
+            if "= unchanged" in out:
+                mode_out = "unchanged"
+            elif req.get("diff") is True or any(l.startswith(("+ ", "~ ", "- ")) for l in out.splitlines()[1:6]):
+                mode_out = "diff"
+            else:
+                mode_out = "snapshot"
+            errs = [
+                sanitize_error(l[len("! errors: "):] if l.startswith("! errors: ") else l)
+                for l in out.splitlines()
+                if l.startswith(("! errors:", "Error:"))
+            ]
+            record_perf_event(
+                {
+                    "surface": "app",
+                    "bridge": "ax",
+                    "agent": str(req.get("agent") or "default"),
+                    "target": str(req.get("app") or ""),
+                    "ops": [
+                        str(st.get("op") or st.get("action") or "").lower()
+                        for st in steps_list
+                        if isinstance(st, dict) and (st.get("op") or st.get("action"))
+                    ],
+                    "step_count": len(steps_list),
+                    "els": els_count,
+                    "mode_out": mode_out,
+                    "out_chars": len(out),
+                    "est_tokens": max(1, (len(out) + 3) // 4),
+                    "cold_start": was_cold,
+                    "error_count": len(errs),
+                    "errors": errs[:3],
+                    "timings_ms": {
+                        "total": round(total_ms, 2),
+                        "daemon_boot": round(daemon_boot_ms, 2),
+                        "native_ax": round(native_ax_ms, 2),
+                        "ipc_overhead": round(ipc_overhead_ms, 2),
+                    },
+                },
+                sync=not self._in_daemon,
+            )
+        return out
 
     def reset(self) -> str:
         if not self._can_connect():

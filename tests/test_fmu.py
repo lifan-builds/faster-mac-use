@@ -25,9 +25,12 @@ from test_app_server import BenchWebServer  # noqa: E402
 class TestFasterMacUse(unittest.TestCase):
     server: BenchWebServer
     rt: FasterMacUseRuntime
+    _log_tmp: tempfile.TemporaryDirectory[str]
 
     @classmethod
     def setUpClass(cls) -> None:
+        cls._log_tmp = tempfile.TemporaryDirectory(prefix="fmu-test-logs-")
+        os.environ["FMU_LOG_DIR"] = cls._log_tmp.name
         cls.server = BenchWebServer().start()
         cls.rt = FasterMacUseRuntime()
 
@@ -35,6 +38,7 @@ class TestFasterMacUse(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.rt.shutdown()
         cls.server.stop()
+        cls._log_tmp.cleanup()
 
     def setUp(self) -> None:
         self.rt.execute({"reset": True})
@@ -1370,6 +1374,75 @@ setInterval(() => {{}}, 1000);
                 node_proc.wait(timeout=2.0)
             except Exception:
                 node_proc.kill()
+
+    def test_25_telemetry_perf_logging_privacy_sanitization_and_perf_report(self) -> None:
+        from fmu.telemetry import flush_telemetry, load_perf_events
+
+        with tempfile.TemporaryDirectory(prefix="fmu-perf-audit-") as tmp_logs:
+            prev_dir = os.environ.get("FMU_LOG_DIR")
+            os.environ["FMU_LOG_DIR"] = tmp_logs
+            try:
+                self.rt.execute({"reset": True})
+                secret_url = f"{self.server.base_url}/orders?api_key=TOP_SECRET_123#frag_secret"
+                self.rt.execute(
+                    {
+                        "surface": "web",
+                        "url": secret_url,
+                        "session": "t1",
+                    }
+                )
+                self.rt.execute(
+                    {
+                        "surface": "web",
+                        "session": "t1",
+                        "steps": [
+                            {"op": "fill", "target": "Search orders", "value": "SUPER_SECRET_PASSWORD_999"},
+                            {"op": "click", "target": "NonExistentButton"},
+                        ],
+                    }
+                )
+                self.rt.execute({"app": "Calculator", "steps": [{"op": "key", "name": "escape"}]})
+                flush_telemetry()
+
+                events = load_perf_events(days=7, log_dir=Path(tmp_logs))
+                self.assertGreaterEqual(len(events), 3)
+
+                raw_dump = "\n".join(p.read_text(encoding="utf-8") for p in Path(tmp_logs).glob("perf-*.jsonl"))
+                self.assertNotIn("TOP_SECRET_123", raw_dump)
+                self.assertNotIn("frag_secret", raw_dump)
+                self.assertNotIn("SUPER_SECRET_PASSWORD_999", raw_dump)
+
+                web_events = [e for e in events if e.get("surface") == "web"]
+                app_events = [e for e in events if e.get("surface") == "app"]
+                self.assertGreaterEqual(len(web_events), 2)
+                self.assertGreaterEqual(len(app_events), 1)
+                self.assertIn("in_page_snap", web_events[0]["timings_ms"])
+                self.assertIn("bridge_overhead", web_events[0]["timings_ms"])
+                self.assertIn("native_ax", app_events[0]["timings_ms"])
+
+                md_report = self.rt.execute({"code": "return await cua.getPerfReport({days: 7});"})
+                self.assertIn("# fmu-perf window=7d", md_report)
+                self.assertIn("## Latency by Surface (ms)", md_report)
+                self.assertIn("web:playwright:", md_report)
+                self.assertIn("app:ax:", md_report)
+
+                json_report_raw = self.rt.execute({"perfReport": {"days": 7, "format": "json"}})
+                json_report = json.loads(json_report_raw)
+                self.assertEqual(json_report["total_calls"], len(events))
+                self.assertGreater(json_report["tokens"]["avg"], 0)
+                self.assertEqual(json_report["error_calls"], 1)
+
+                cli_out = subprocess.check_output(
+                    [sys.executable, str(ROOT / "bin" / "fmu"), "--perf", "7"],
+                    env={**os.environ, "FMU_LOG_DIR": tmp_logs},
+                    text=True,
+                )
+                self.assertIn("# fmu-perf window=7d", cli_out)
+            finally:
+                if prev_dir is None:
+                    os.environ.pop("FMU_LOG_DIR", None)
+                else:
+                    os.environ["FMU_LOG_DIR"] = prev_dir
 
 
 if __name__ == "__main__":

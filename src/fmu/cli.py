@@ -75,6 +75,7 @@ def serve_mcp(bin_path: Path | None = None) -> None:
 USAGE_TEXT = """Usage:
   fmu '<json>'            Execute a web, macOS AX, REPL, or parallel CUA request
   fmu mcp                 Run as an MCP stdio server
+  fmu --perf [days]       Summarize recent fmu performance & error logs (~/.fmu/logs)
   fmu --reset             Reset warm browser & macOS AX daemon state
   fmu --shutdown          Stop background runtime daemon
   fmu --daemon [sock]     Run the warm runtime socket daemon
@@ -91,6 +92,16 @@ def main(bin_path: Path | None = None) -> None:
         from fmu import __version__
 
         sys.stdout.write(f"faster-mac-use {__version__}\n")
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--perf", "--stats", "perf", "stats"):
+        from fmu.telemetry import build_perf_report
+
+        days = 7
+        fmt = "json" if "--json" in sys.argv[2:] else "markdown"
+        for arg in sys.argv[2:]:
+            if arg.isdigit():
+                days = max(1, int(arg))
+        sys.stdout.write(build_perf_report(days=days, fmt=fmt) + "\n")
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("mcp", "--mcp"):
         serve_mcp(bin_path)

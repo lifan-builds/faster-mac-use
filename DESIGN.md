@@ -145,7 +145,7 @@ The palette pairs cool machined-metal neutrals with phosphor-emerald verificatio
 
 ## Layout
 
-Centered `1180px` maximum container (`calc(100% - 3rem)` on desktop, `calc(100% - 2.25rem)` under `600px`). The opening viewport splits `1.02fr / 0.98fr` between the thesis + specification ledger on the left and the interactive Live Trace & Virtual Cursor Inspector on the right, collapsing cleanly to a single column below `960px` with `min-width: 0` on all grid children to prevent horizontal overflow.
+Centered `1140px` maximum container (`calc(100% - 3.5rem)` on desktop, `calc(100% - 2.25rem)` under `600px`) structured into 4 breathable sections with generous vertical rhythm (`4.5rem` between sections). The opening viewport splits `1.02fr / 0.98fr` between the thesis + 1-click install bar on the left and the interactive 4-bar horizontal benchmark ledger on the right, collapsing cleanly to a single column below `960px` with `min-width: 0` on all grid children to prevent horizontal overflow.
 
 ## Elevation & Depth
 

@@ -3,7 +3,7 @@
 > **Confirmation Boundary (`/self-promoting`)**: All external social posts, forum threads, and directory PRs below are staged and ready for review. Nothing has been posted externally.
 
 - **GitHub Repository:** [https://github.com/lifan-builds/faster-mac-use](https://github.com/lifan-builds/faster-mac-use)
-- **Interactive Benchmark Site:** [https://lifan-builds.github.io/faster-mac-use/](https://lifan-builds.github.io/faster-mac-use/)
+- **Interactive Benchmark Site:** [https://clifan.com/faster-mac-use/](https://clifan.com/faster-mac-use/)
 - **Visual Showcase Asset:** [`docs/assets/swarm-vs-mcp-demo.svg`](assets/swarm-vs-mcp-demo.svg)
 
 ---
@@ -77,7 +77,7 @@ Every number in the repo is reproducible via `benchmarks/run_benchmarks.py` (`o2
 - Workload E (30-op Long-Horizon + Window OCR): `4,584` tok (`1,597` peak context via stale-snapshot masking) vs `620,535` (Pixel CUA)
 
 Works with Claude Code, OpenAI Codex CLI, Cursor, and Antigravity:
-- Interactive Explorer: https://lifan-builds.github.io/faster-mac-use/
+- Interactive Explorer: https://clifan.com/faster-mac-use/
 - GitHub (MIT): https://github.com/lifan-builds/faster-mac-use
 
 ---
@@ -145,7 +145,7 @@ Hi HN — I built `faster-mac-use` (`fmu`) because running browser and desktop t
 
 Every benchmark in [`benchmarks/run_benchmarks.py`](https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/run_benchmarks.py) runs a 50Hz CoreGraphics (`CGEventGetLocation`) + `lsappinfo front` intrusion guard verifying `0.0 px` physical cursor movement and `0` focus changes.
 
-Interactive benchmark explorer: https://lifan-builds.github.io/faster-mac-use/
+Interactive benchmark explorer: https://clifan.com/faster-mac-use/
 
 Happy to answer any questions about the Swift `AXObserver` daemon, Chrome 144 CDP changes, Draft.js/`NSOpenPanel` AX quirks, or the token math!
 
@@ -185,7 +185,7 @@ Add to `.mcp.json` / `claude_desktop_config.json`:
 ```
 
 - **GitHub & 5-Workload Benchmark Suite:** https://github.com/lifan-builds/faster-mac-use
-- **Interactive Benchmark Explorer:** https://lifan-builds.github.io/faster-mac-use/
+- **Interactive Benchmark Explorer:** https://clifan.com/faster-mac-use/
 
 ---
 
@@ -193,7 +193,7 @@ Add to `.mcp.json` / `claude_desktop_config.json`:
 **Title:** `faster-mac-use` (`fmu`): Single 268-token MCP server unifying Chrome "🤖 Agent" Tab Groups, push-based macOS `AXObserver`, Virtual WebMCP macros, and 3-cursor parallel swarms
 
 **Body:**
-Sharing an open-source MCP server and CLI I built for macOS agent workflows: **`faster-mac-use` (`fmu`)** ([GitHub](https://github.com/lifan-builds/faster-mac-use) | [Interactive Benchmarks](https://lifan-builds.github.io/faster-mac-use/)).
+Sharing an open-source MCP server and CLI I built for macOS agent workflows: **`faster-mac-use` (`fmu`)** ([GitHub](https://github.com/lifan-builds/faster-mac-use) | [Interactive Benchmarks](https://clifan.com/faster-mac-use/)).
 
 **What it solves for MCP hosts:**
 Instead of loading a 4,380-token browser MCP + a 1,508-token macOS MCP (`5,888` tokens of tool schemas before Turn 1 even starts), `fmu` exposes a single **268-token** `fmu` tool that unifies:
@@ -223,7 +223,7 @@ I open-sourced **`faster-mac-use` (`fmu`)**, a macOS browser + native desktop en
 - **On-device Apple Silicon `Vision.framework` (`VNRecognizeTextRequest`) OCR**: Extracts clickable `@ocr1..@ocrN` text + bounding boxes from `<canvas>`/WebGL elements and native macOS windows in `< 70 ms` using **0 vision tokens**.
 
 Repo (MIT, Python + universal2 Swift binary): https://github.com/lifan-builds/faster-mac-use
-Interactive benchmark data (`o200k_base`): https://lifan-builds.github.io/faster-mac-use/
+Interactive benchmark data (`o200k_base`): https://clifan.com/faster-mac-use/
 
 ---
 

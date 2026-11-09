@@ -2,7 +2,7 @@
   "$schema": "https://glama.ai/mcp/schemas/server.json",
   "name": "faster-mac-use",
   "description": "Background-first, multi-cursor browser and native macOS computer-use engine for AI agents. Drives unfocused Chrome tabs ('🤖 Agent' Tab Group) and background macOS apps via persistent @u1/@a1 UIDs, push-based AXObserver diffs, Virtual WebMCP macros, and 0-vision-token <canvas> OCR.",
-  "homepage": "https://lifan-builds.github.io/faster-mac-use/",
+  "homepage": "https://clifan.com/faster-mac-use/",
   "repository": "https://github.com/lifan-builds/faster-mac-use",
   "license": "MIT",
   "maintainers": [

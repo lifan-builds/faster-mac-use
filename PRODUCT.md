@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-delegated: Static HTML/CSS/JS (`docs/index.html` + `docs/site.css`, deployed via GitHub Pages at `https://lifan-builds.github.io/faster-mac-use/`). Inferred from the repository's existing `/docs` structure and `/self-promoting` static project-site workflow.
+delegated: Static HTML/CSS/JS (`docs/index.html` + `docs/site.css`, deployed at `https://clifan.com/faster-mac-use/` and mirrored via GitHub Pages at `https://lifan-builds.github.io/faster-mac-use/`). Inferred from the repository's existing `/docs` structure and `/self-promoting` static project-site workflow.
 
 ## Users
 

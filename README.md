@@ -2,7 +2,7 @@
 
 Background-first, multi-cursor browser and native macOS computer-use engine for AI agents, modeled after and extending OpenAI Codex's `cua_repl` architecture.
 
-- **Website & Interactive Benchmark Explorer:** [https://lifan-builds.github.io/faster-mac-use/](https://lifan-builds.github.io/faster-mac-use/) ([`docs/index.html`](docs/index.html))
+- **Website & Interactive Benchmark Explorer:** [https://clifan.com/faster-mac-use/](https://clifan.com/faster-mac-use/) (mirror: [lifan-builds.github.io/faster-mac-use](https://lifan-builds.github.io/faster-mac-use/) · [`docs/index.html`](docs/index.html))
 - **Architecture & 5-Workload Benchmark Report:** [`docs/architecture_and_benchmarks.md`](docs/architecture_and_benchmarks.md)
 - **Market Comparison & Positioning Brief:** [`docs/gtm.md`](docs/gtm.md)
 - **Ready-to-Publish Launch Kit (X, RedNote/小红书, Show HN, Reddit, MCP Directories):** [`docs/launch_kit.md`](docs/launch_kit.md)

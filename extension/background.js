@@ -6,6 +6,10 @@ let reconnectTimer = null;
 const sessionGroups = new Map();
 const sessionTabs = new Map();
 const attachedDebuggers = new Set();
+let activeScreencastTabId = null;
+let screencastIdleTimer = null;
+let lastScreencastPushAt = 0;
+let pendingPreviewTimer = null;
 
 function scheduleReconnect(delayMs = 500) {
   if (reconnectTimer) return;
@@ -165,8 +169,162 @@ async function sendDebuggerCommand(tabId, method, commandParams = {}) {
 
 if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
-    if (source.tabId) attachedDebuggers.delete(source.tabId);
+    if (source.tabId) {
+      attachedDebuggers.delete(source.tabId);
+      if (activeScreencastTabId === source.tabId) {
+        activeScreencastTabId = null;
+      }
+    }
   });
+}
+
+if (chrome.debugger && chrome.debugger.onEvent && typeof chrome.debugger.onEvent.addListener === "function") {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method !== "Page.screencastFrame" || !source || !source.tabId || !params) return;
+    const tabId = source.tabId;
+    if (params.sessionId !== undefined) {
+      chrome.debugger.sendCommand({ tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+    }
+    const now = Date.now();
+    if (!params.data || now - lastScreencastPushAt < 120) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    lastScreencastPushAt = now;
+    const meta = params.metadata || {};
+    try {
+      ws.send(JSON.stringify({
+        type: "screencastFrame",
+        tabId,
+        data: params.data,
+        vw: Math.round(Number(meta.deviceWidth || 0)),
+        vh: Math.round(Number(meta.deviceHeight || 0)),
+        ts: now
+      }));
+    } catch (_) {}
+  });
+}
+
+function stopLiveScreencast(tabId = undefined) {
+  if (screencastIdleTimer) {
+    clearTimeout(screencastIdleTimer);
+    screencastIdleTimer = null;
+  }
+  const targetId = tabId !== undefined ? tabId : activeScreencastTabId;
+  if (targetId && attachedDebuggers.has(targetId)) {
+    chrome.debugger.sendCommand({ tabId: targetId }, "Page.stopScreencast", {}).catch(() => {});
+  }
+  if (tabId === undefined || activeScreencastTabId === tabId) {
+    activeScreencastTabId = null;
+  }
+}
+
+async function startLiveScreencast(tabId) {
+  if (!tabId) return;
+  if (screencastIdleTimer) {
+    clearTimeout(screencastIdleTimer);
+  }
+  screencastIdleTimer = setTimeout(() => {
+    screencastIdleTimer = null;
+    stopLiveScreencast();
+  }, 12000);
+  if (activeScreencastTabId && activeScreencastTabId !== tabId) {
+    if (attachedDebuggers.has(activeScreencastTabId)) {
+      chrome.debugger.sendCommand({ tabId: activeScreencastTabId }, "Page.stopScreencast", {}).catch(() => {});
+    }
+    activeScreencastTabId = null;
+  }
+  if (activeScreencastTabId === tabId) return;
+  try {
+    await ensureDebuggerAndFocusEmulation(tabId);
+    activeScreencastTabId = tabId;
+    await chrome.debugger.sendCommand({ tabId }, "Page.startScreencast", {
+      format: "jpeg",
+      quality: 66,
+      maxWidth: 1440,
+      maxHeight: 900,
+      everyNthFrame: 1
+    });
+  } catch (_) {
+    activeScreencastTabId = null;
+  }
+}
+
+async function captureViewportPreview(tabId, maxWidth = 1440) {
+  if (!tabId) return null;
+  const work = (async () => {
+    await ensureDebuggerAndFocusEmulation(tabId);
+    let pageX = 0;
+    let pageY = 0;
+    let vw = 1280;
+    let vh = 800;
+    try {
+      const metrics = await sendDebuggerCommand(tabId, "Page.getLayoutMetrics", {});
+      const vp = (metrics && (metrics.cssVisualViewport || metrics.visualViewport)) || null;
+      if (vp && Number(vp.clientWidth) > 80 && Number(vp.clientHeight) > 60) {
+        pageX = Math.max(0, Number(vp.pageX || 0));
+        pageY = Math.max(0, Number(vp.pageY || 0));
+        vw = Math.round(Number(vp.clientWidth));
+        vh = Math.round(Number(vp.clientHeight));
+      }
+    } catch (_) {}
+    const scale = Math.min(1, Math.max(0.25, maxWidth / Math.max(320, vw)));
+    const shot = await sendDebuggerCommand(tabId, "Page.captureScreenshot", {
+      format: "jpeg",
+      quality: 68,
+      optimizeForSpeed: true,
+      clip: {
+        x: pageX,
+        y: pageY,
+        width: vw,
+        height: vh,
+        scale
+      }
+    });
+    if (shot && typeof shot.data === "string" && shot.data.length > 64) {
+      lastScreencastPushAt = Date.now();
+      return { jpeg: shot.data, vw, vh };
+    }
+    return null;
+  })();
+  const timeout = new Promise((resolve) => {
+    const t = setTimeout(() => resolve(null), 650);
+    if (t && typeof t.unref === "function") t.unref();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } catch (_) {
+    return null;
+  }
+}
+
+function clearPendingPreview() {
+  if (pendingPreviewTimer) {
+    clearTimeout(pendingPreviewTimer);
+    pendingPreviewTimer = null;
+  }
+}
+
+function scheduleAsyncPreviewPush(tabId, delayMs = 30) {
+  if (!tabId) return;
+  clearPendingPreview();
+  pendingPreviewTimer = setTimeout(async () => {
+    pendingPreviewTimer = null;
+    const prev = await captureViewportPreview(tabId);
+    if (prev && prev.jpeg && ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({
+          type: "screencastFrame",
+          tabId,
+          data: prev.jpeg,
+          vw: prev.vw,
+          vh: prev.vh,
+          ts: Date.now()
+        }));
+      } catch (_) {}
+    }
+  }, delayMs);
+  if (pendingPreviewTimer && typeof pendingPreviewTimer.unref === "function") {
+    pendingPreviewTimer.unref();
+  }
 }
 
 const UPLOAD_FILE_URL_ERR = 'upload failed: enable "Allow access to file URLs" for the fmu extension in chrome://extensions';
@@ -284,6 +442,7 @@ async function handleRpc(msg) {
       return { id, result: { reloading: true } };
     }
     if (method === "createBrowserTab") {
+      clearPendingPreview();
       const {
         url = "about:blank",
         sessionName = "🤖 Agent",
@@ -292,6 +451,7 @@ async function handleRpc(msg) {
         window: windowFilter,
         windowId: explicitWindowId,
         reuseExisting = false,
+        reattach = false,
         timeoutMs = 10000
       } = params;
 
@@ -300,6 +460,55 @@ async function handleRpc(msg) {
         : [];
       const wf = String(windowFilter || "").trim().toLowerCase();
       let filterMatchedWindowId = undefined;
+
+      if (reattach && (!url || url === "about:blank")) {
+        let reattachedTab = null;
+        if (sessionTabs.has(sessionId)) {
+          const savedId = sessionTabs.get(sessionId);
+          reattachedTab = allTabs.find(t => t.id === savedId) || null;
+          if (!reattachedTab && chrome.tabs && typeof chrome.tabs.get === "function") {
+            try { reattachedTab = await chrome.tabs.get(savedId); } catch (_) {}
+          }
+        }
+        if (!reattachedTab || String(reattachedTab.url || "") === "about:blank") {
+          const { groupId: existingGid } = await findGroupWindowId(sessionName, explicitWindowId);
+          if (existingGid !== undefined) {
+            const groupTabs = allTabs.filter(t => t.groupId === existingGid);
+            const nonBlank = groupTabs.filter(t => {
+              const u = String(t.url || t.pendingUrl || "");
+              return u && u !== "about:blank" && !u.startsWith("chrome://newtab");
+            });
+            if (nonBlank.length > 0) {
+              reattachedTab = nonBlank[nonBlank.length - 1];
+            } else if (!reattachedTab && groupTabs.length > 0) {
+              reattachedTab = groupTabs[groupTabs.length - 1];
+            }
+          }
+        }
+        if (reattachedTab && reattachedTab.id !== undefined) {
+          const groupId = await ensureAgentGroup(reattachedTab.id, sessionName, color, reattachedTab.windowId);
+          sessionTabs.set(sessionId, reattachedTab.id);
+          if (params.focusEmulation !== false) {
+            try { await ensureDebuggerAndFocusEmulation(reattachedTab.id); } catch (_) {}
+          }
+          if (params.skipPreview !== true) {
+            scheduleAsyncPreviewPush(reattachedTab.id);
+          }
+          return {
+            id,
+            result: {
+              tabId: reattachedTab.id,
+              windowId: reattachedTab.windowId,
+              groupId,
+              sessionName,
+              reused: true,
+              reattached: true,
+              url: reattachedTab.url || reattachedTab.pendingUrl || "about:blank",
+              title: reattachedTab.title || ""
+            }
+          };
+        }
+      }
 
       if (wf) {
         const wfTabs = allTabs.filter(t => {
@@ -325,6 +534,9 @@ async function handleRpc(msg) {
               if (params.focusEmulation !== false) {
                 try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
               }
+              if (params.skipPreview !== true) {
+                scheduleAsyncPreviewPush(match.id);
+              }
               return {
                 id,
                 result: {
@@ -341,16 +553,20 @@ async function handleRpc(msg) {
           }
         }
       } else if (reuseExisting && url && url !== "about:blank") {
+        const urlLower = String(url).toLowerCase();
         const match = allTabs.find(t => {
           if (explicitWindowId !== undefined && t.windowId !== explicitWindowId) return false;
           const tUrl = String(t.url || t.pendingUrl || "");
-          return tUrl.startsWith(url);
+          return tUrl.startsWith(url) || tUrl.toLowerCase().includes(urlLower);
         });
         if (match && match.id !== undefined) {
           const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
           sessionTabs.set(sessionId, match.id);
           if (params.focusEmulation !== false) {
             try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
+          }
+          if (params.skipPreview !== true) {
+            scheduleAsyncPreviewPush(match.id);
           }
           return {
             id,
@@ -386,8 +602,8 @@ async function handleRpc(msg) {
       if (targetWindowId === undefined && chrome.windows && typeof chrome.windows.getAll === "function") {
         try {
           const wins = await chrome.windows.getAll({ windowTypes: ["normal"] });
-          if (Array.isArray(wins) && wins.length > 1) {
-            const bgWin = wins.find(w => !w.focused);
+          if (Array.isArray(wins) && wins.length > 0) {
+            const bgWin = wins.find(w => !w.focused) || wins[0];
             if (bgWin && bgWin.id !== undefined) {
               targetWindowId = bgWin.id;
             }
@@ -395,19 +611,52 @@ async function handleRpc(msg) {
         } catch (_) {}
       }
 
-      const createOpts = { url, active: false };
+      const navUrl = (url && url !== "about:blank" && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(String(url)))
+        ? `https://${url}`
+        : url;
+      const createOpts = { url: navUrl, active: false };
       if (targetWindowId !== undefined) {
         createOpts.windowId = targetWindowId;
       }
-      const tab = await chrome.tabs.create(createOpts);
+      let tab;
+      try {
+        tab = await chrome.tabs.create(createOpts);
+      } catch (err) {
+        if (String(err && err.message || err).includes("No current window") && chrome.windows && typeof chrome.windows.create === "function") {
+          const win = await chrome.windows.create({ url: navUrl, focused: false });
+          tab = (win && Array.isArray(win.tabs) && win.tabs[0])
+            ? win.tabs[0]
+            : await chrome.tabs.create({ url: navUrl, active: false, windowId: win.id });
+        } else {
+          throw err;
+        }
+      }
       const effectiveWinId = tab.windowId !== undefined ? tab.windowId : targetWindowId;
       const groupId = await ensureAgentGroup(tab.id, sessionName, color, effectiveWinId);
       sessionTabs.set(sessionId, tab.id);
-      if (url && url !== "about:blank") {
-        await waitForTabLoad(tab.id, timeoutMs, url);
+      if (params.focusEmulation !== false && params.skipPreview !== true) {
+        startLiveScreencast(tab.id);
+      }
+      if (navUrl && navUrl !== "about:blank") {
+        await waitForTabLoad(tab.id, timeoutMs, navUrl);
       }
       if (params.focusEmulation !== false) {
         try { await ensureDebuggerAndFocusEmulation(tab.id); } catch (_) {}
+      }
+      let finalUrl = tab.pendingUrl || tab.url || url;
+      let finalTitle = tab.title || "";
+      if (chrome.tabs && typeof chrome.tabs.get === "function") {
+        try {
+          const refreshedTab = await chrome.tabs.get(tab.id);
+          if (refreshedTab) {
+            finalUrl = refreshedTab.url || refreshedTab.pendingUrl || finalUrl;
+            finalTitle = refreshedTab.title || finalTitle;
+          }
+        } catch (_) {}
+      }
+      stopLiveScreencast(tab.id);
+      if (params.skipPreview !== true) {
+        scheduleAsyncPreviewPush(tab.id);
       }
       return {
         id,
@@ -416,13 +665,17 @@ async function handleRpc(msg) {
           windowId: effectiveWinId,
           groupId,
           sessionName,
-          url: tab.pendingUrl || tab.url || url,
-          title: tab.title || ""
+          url: finalUrl,
+          title: finalTitle
         }
       };
     }
     if (method === "navigate" || method === "goto") {
-      const { tabId, url, timeoutMs = 10000 } = params;
+      clearPendingPreview();
+      const { tabId, url, timeoutMs = 10000, skipPreview = false } = params;
+      if (!skipPreview) {
+        startLiveScreencast(tabId);
+      }
       await chrome.tabs.update(tabId, { url, active: false });
       if (url && url !== "about:blank") {
         await waitForTabLoad(tabId, timeoutMs, url);
@@ -434,6 +687,10 @@ async function handleRpc(msg) {
           const t = await chrome.tabs.get(tabId);
           if (t && t.title) tabTitle = t.title;
         } catch (_) {}
+      }
+      stopLiveScreencast(tabId);
+      if (!skipPreview) {
+        scheduleAsyncPreviewPush(tabId);
       }
       return { id, result: { tabId, url, title: tabTitle } };
     }
@@ -466,11 +723,13 @@ async function handleRpc(msg) {
       return { id, result: val };
     }
     if (method === "executeBatch") {
+      clearPendingPreview();
       const { tabId, runtimeJs, batchReq, ...restParams } = params;
+      const reqPayload = batchReq || restParams;
+      stopLiveScreencast(tabId);
       if (runtimeJs) {
         await evalInTab(tabId, runtimeJs, false);
       }
-      const reqPayload = batchReq || restParams;
       const expr = `window.__fmu.executeBatch(${JSON.stringify(reqPayload || {})})`;
       let batchRes = await evalInTab(tabId, expr, true);
       if (batchRes && Array.isArray(batchRes.escalations) && batchRes.escalations.length > 0) {
@@ -527,7 +786,19 @@ async function handleRpc(msg) {
           } catch (_) {}
         }
       }
+      if (batchRes && typeof batchRes === "object" && (!reqPayload || reqPayload.skipPreview !== true)) {
+        scheduleAsyncPreviewPush(tabId);
+      }
       return { id, result: batchRes };
+    }
+    if (method === "capturePreview") {
+      const { tabId, maxWidth = 1440 } = params;
+      const preview = await captureViewportPreview(tabId, maxWidth);
+      return { id, result: preview };
+    }
+    if (method === "stopScreencast") {
+      stopLiveScreencast(params.tabId);
+      return { id, result: { stopped: true } };
     }
     if (method === "captureClip") {
       const { tabId, clip } = params;
@@ -537,9 +808,11 @@ async function handleRpc(msg) {
       return { id, result: shot };
     }
     if (method === "closeTab") {
+      clearPendingPreview();
       const { tabId, sessionId } = params;
       const targetId = tabId || (sessionId ? sessionTabs.get(sessionId) : undefined);
       if (targetId) {
+        stopLiveScreencast(targetId);
         try { await chrome.tabs.remove(targetId); } catch (_) {}
         attachedDebuggers.delete(targetId);
       }
@@ -584,7 +857,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.2.1" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.3.0" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

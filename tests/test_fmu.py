@@ -26,11 +26,25 @@ class TestFasterMacUse(unittest.TestCase):
     server: BenchWebServer
     rt: FasterMacUseRuntime
     _log_tmp: tempfile.TemporaryDirectory[str]
+    _port_guard: Any = None
 
     @classmethod
     def setUpClass(cls) -> None:
+        import socket
+
         cls._log_tmp = tempfile.TemporaryDirectory(prefix="fmu-test-logs-")
         os.environ["FMU_LOG_DIR"] = cls._log_tmp.name
+        # Hold 127.0.0.1:19222 during the unit test suite if not already held by warm daemon,
+        # so a live Chrome MV3 extension does not connect to the test suite's synthetic bridge.
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", 19222))
+            s.listen(1)
+            cls._port_guard = s
+        except OSError:
+            s.close()
+            cls._port_guard = None
         cls.server = BenchWebServer().start()
         cls.rt = FasterMacUseRuntime()
 
@@ -38,10 +52,15 @@ class TestFasterMacUse(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.rt.shutdown()
         cls.server.stop()
+        if cls._port_guard is not None:
+            try:
+                cls._port_guard.close()
+            except Exception:
+                pass
         cls._log_tmp.cleanup()
 
     def setUp(self) -> None:
-        self.rt.execute({"reset": True})
+        self.rt.execute({"reset": True, "resume": True})
 
     def test_01_web_uid_stability_and_top_banner_no_avalanche(self) -> None:
         url = f"{self.server.base_url}/orders"
@@ -535,6 +554,21 @@ class TestFasterMacUse(unittest.TestCase):
         self.assertIn("Error: Invalid JSON argument", bad_proc.stderr)
         self.assertNotIn("Traceback", bad_proc.stderr)
 
+        mcp_in = "\n".join(
+            json.dumps(r)
+            for r in [
+                {"jsonrpc": "2.0", "id": 0, "method": "server/discover"},
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            ]
+        ) + "\n"
+        mcp_proc = subprocess.run([fmu_bin, "mcp"], input=mcp_in, capture_output=True, text=True, check=False)
+        self.assertEqual(mcp_proc.returncode, 0)
+        mcp_replies = [json.loads(line) for line in mcp_proc.stdout.splitlines()]
+        self.assertEqual([r["id"] for r in mcp_replies], [0, 1, 2])
+        self.assertEqual(mcp_replies[0]["error"]["code"], -32601)
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
             (tmp_root / "src" / "native").mkdir(parents=True)
@@ -937,6 +971,9 @@ class TestFasterMacUse(unittest.TestCase):
         import subprocess
 
         self.rt.execute({"reset": True})
+        if self.rt.browser._ext_bridge_inst is not None:
+            self.rt.browser._ext_bridge_inst.shutdown()
+            self.rt.browser._ext_bridge_inst = None
 
         # 1. Bridge status when disconnected
         st_disc = self.rt.execute({"bridgeStatus": True})
@@ -1444,9 +1481,414 @@ setInterval(() => {{}}, 1000);
                 else:
                     os.environ["FMU_LOG_DIR"] = prev_dir
 
+    def test_26_macos_menubar_working_status_and_one_click_stop(self) -> None:
+        import threading
+
+        url = f"{self.server.base_url}/pricing"
+        with BackgroundIntrusionGuard() as guard:
+            # 1. Trigger a native macOS AX command + web command and verify menu bar working status & live PiP preview
+            self.rt.execute({"app": "Calculator", "steps": [{"op": "key", "name": "escape"}]})
+            st_app = self.rt.execute({"statusBar": True})
+            self.assertIn("# fmu-menubar", st_app)
+            self.assertIn("visible=true", st_app)
+            self.assertIn("hud=true", st_app)
+            self.assertIn("preview=true", st_app)
+            self.assertIn("stopped=false", st_app)
+            self.assertIn('state="working"', st_app)
+            self.assertIn('target="Calculator"', st_app)
+            self.assertIn("⏹ Stop", st_app)
+
+            # 1b. Trigger Click-to-Highlight Target Window on Screen and verify highlight=true
+            hl_out = self.rt.execute({"code": "return await cua.highlightWindow();"})
+            self.assertIn("highlight=true", hl_out)
+
+            # 1c. Verify 1-click Live Window Preview collapse/expand toggle and UI snapshot export
+            tog_off = self.rt.execute({"togglePreview": True})
+            self.assertIn("preview=false", tog_off)
+            tog_on = self.rt.execute({"togglePreview": True})
+            self.assertIn("preview=true", tog_on)
+            with tempfile.TemporaryDirectory() as ui_tmp:
+                dump_out = self.rt.execute({"dumpUiSnapshots": ui_tmp})
+                self.assertIn("fmu-ui-snapshots", dump_out)
+                self.assertTrue((Path(ui_tmp) / "hud-working.png").exists())
+
+            self.rt.execute({"surface": "web", "url": url, "session": "t1"})
+            # Wait briefly for async menubar status queue worker to flush
+            for _ in range(20):
+                st_web = self.rt.execute({"code": "return await cua.getStatus();"})
+                if 'surface="web"' in st_web:
+                    break
+                time.sleep(0.02)
+            self.assertIn('state="working"', st_web)
+            self.assertIn('surface="web"', st_web)
+            self.assertIn("preview=true", st_web)
+            self.assertIn("⏹ Stop", st_web)
+
+            # 2. Simulate 1-click on the top-right macOS menu bar item -> stops agent immediately
+            click_stop = self.rt.mac.execute({"clickStatusBar": True})
+            self.assertIn('state="stopped"', click_stop)
+            self.assertIn("stopped=true", click_stop)
+            st_stopped = self.rt.execute({"statusBar": True})
+            self.assertIn("stopped=true", st_stopped)
+            self.assertIn('state="stopped"', st_stopped)
+            self.assertIn("🛑 fmu Stopped  ▶ Resume", st_stopped)
+
+            # 3. Verify subsequent web, app, and REPL calls are blocked by the stop latch
+            blocked_web = self.rt.execute(
+                {"surface": "web", "session": "t1", "steps": [{"op": "click", "target": "Generate Quote Token"}]}
+            )
+            self.assertIn("Error: [USER_STOPPED]", blocked_web)
+
+            blocked_app = self.rt.execute({"app": "Calculator", "steps": [{"op": "click", "name": "7"}]})
+            self.assertIn("Error: [USER_STOPPED]", blocked_app)
+
+            blocked_repl = self.rt.execute({"code": 'let c = await cua.getApp("Calculator"); await c.click("7");'})
+            self.assertIn("Error: [USER_STOPPED]", blocked_repl)
+
+            # 4. Simulate 1-click on the menu bar item again (when stopped) -> resumes agent
+            click_resume = self.rt.mac.execute({"clickStatusBar": True})
+            self.assertIn("stopped=false", click_resume)
+            self.assertIn('state="idle"', click_resume)
+            self.assertIn("⚪ fmu Idle", click_resume)
+            self.assertNotIn("⏹ Stop", click_resume)
+            st_resumed = self.rt.execute({"statusBar": True})
+            self.assertIn("stopped=false", st_resumed)
+            self.assertIn('state="idle"', st_resumed)
+
+            # 5. Verify mid-flight interrupt of a long wait when user clicks Stop in menu bar
+            inflight_results: list[str] = []
+
+            def run_long_wait() -> None:
+                res = self.rt.execute(
+                    {
+                        "surface": "web",
+                        "session": "t1",
+                        "steps": [{"op": "wait", "ms": 3000}],
+                    }
+                )
+                inflight_results.append(res)
+
+            t0 = time.perf_counter()
+            worker = threading.Thread(target=run_long_wait, daemon=True)
+            worker.start()
+            time.sleep(0.12)
+            self.rt.mac.execute({"clickStatusBar": True})
+            worker.join(timeout=2.0)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.assertTrue(inflight_results, "In-flight wait thread did not finish")
+            self.assertIn("Error: [USER_STOPPED]", inflight_results[0])
+            self.assertLess(elapsed_ms, 800.0, f"Expected mid-flight stop in <800ms, took {elapsed_ms:.1f}ms")
+
+            # 6. Resume via cua.resume() and verify normal operation works again
+            res_out = self.rt.execute({"code": "return await cua.resume();"})
+            self.assertIn("stopped=false", res_out)
+            ok_after = self.rt.execute(
+                {"surface": "web", "session": "t1", "steps": [{"op": "click", "target": "Generate Quote Token"}]}
+            )
+            self.assertIn("ENT-1000-OK", ok_after)
+
+        rep = guard.stop()
+        self.assertTrue(rep.passed_background_invariant, f"Intrusion detected: {rep}")
+
+    def test_27_field_audit_fixes(self) -> None:
+        self.rt.execute({"reset": True})
+        orders_url = f"{self.server.base_url}/orders"
+        snap0 = self.rt.execute({"surface": "web", "url": orders_url, "session": "t1"})
+        inspect_uid = next(
+            (l.split()[0] for l in snap0.splitlines() if 'button "Inspect #ORD-401"' in l),
+            "",
+        )
+        self.assertTrue(inspect_uid.startswith("@u"), f"Missing Inspect #ORD-401 UID in: {snap0}")
+
+        # 1. SPA DOM re-render (replace the button node so old ref.deref().isConnected == false)
+        #    and custom element with closed shadow root (_sr) like <xhs-publish-btn>
+        spa_and_shadow = self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {
+                        "op": "eval",
+                        "code": (
+                            "const btns = Array.from(document.querySelectorAll('button')); "
+                            "const oldBtn = btns.find(b => b.textContent.includes('Inspect #ORD-401')); "
+                            "const clone = oldBtn.cloneNode(true); "
+                            "clone.setAttribute('onclick', oldBtn.getAttribute('onclick') || ''); "
+                            "oldBtn.replaceWith(clone); "
+                            "const host = document.createElement('xhs-publish-btn'); "
+                            "const sr = host.attachShadow({mode: 'closed'}); "
+                            "host._sr = sr; "
+                            "const sbtn = document.createElement('button'); "
+                            "sbtn.textContent = '发布笔记'; "
+                            "sbtn.style.width = '80px'; sbtn.style.height = '32px'; "
+                            "sbtn.onclick = () => { document.body.dataset.xhsPublished = 'YES_SHADOW'; }; "
+                            "sr.appendChild(sbtn); "
+                            "document.body.appendChild(host); "
+                            "return oldBtn.isConnected;"
+                        ),
+                    },
+                    {"op": "click", "uid": inspect_uid},
+                ],
+                "diff": False,
+            }
+        )
+        self.assertNotIn("! errors:", spa_and_shadow)
+        self.assertIn("> false", spa_and_shadow)
+        self.assertIn("Approve #ORD-401", spa_and_shadow)
+        self.assertIn('button "发布笔记"', spa_and_shadow)
+
+        # Click the button inside the closed shadow root (_sr) by text
+        shadow_click = self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {"op": "click", "target": "发布笔记"},
+                    {"op": "eval", "code": "document.body.dataset.xhsPublished"},
+                ],
+            }
+        )
+        self.assertNotIn("! errors:", shadow_click)
+        self.assertIn("> YES_SHADOW", shadow_click)
+
+        # 2. Folded table diff compactness: replacing 30 tbody rows does not emit 30+ individual -/+ folded lines
+        self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {
+                        "op": "eval",
+                        "code": (
+                            "const tb = document.querySelector('tbody'); "
+                            "let html = ''; "
+                            "for (let i = 1; i <= 30; i++) { "
+                            "  html += `<tr><td><a href='#r${i}'>Thread A-${i}</a></td><td><button>Archive A-${i}</button></td></tr>`; "
+                            "} "
+                            "tb.innerHTML = html;"
+                        ),
+                    }
+                ],
+                "diff": False,
+            }
+        )
+        table_diff = self.rt.execute(
+            {
+                "surface": "web",
+                "session": "t1",
+                "steps": [
+                    {
+                        "op": "eval",
+                        "code": (
+                            "const tb = document.querySelector('tbody'); "
+                            "let html = ''; "
+                            "for (let i = 1; i <= 30; i++) { "
+                            "  html += `<tr><td><a href='#n${i}'>Thread B-${i}</a></td><td><button>Archive B-${i}</button></td></tr>`; "
+                            "} "
+                            "tb.innerHTML = html;"
+                        ),
+                    }
+                ],
+                "diff": True,
+            }
+        )
+        self.assertIn("folded items", table_diff)
+        self.assertNotIn("Thread A-25", table_diff)
+        self.assertNotIn("Thread B-25", table_diff)
+        self.assertLess(len(table_diff.splitlines()), 35, f"Folded table diff too verbose: {table_diff}")
+
+        # 3. Native fmu-ax tolerant StepSpec: op="snapshot" in steps, string path="View > Basic", float ms
+        ax_out = self.rt.execute(
+            {
+                "surface": "app",
+                "app": "Calculator",
+                "steps": [
+                    {"op": "wait", "ms": 10.5},
+                    {"op": "menu", "path": "View > Basic"},
+                    {"op": "snapshot"},
+                ],
+            }
+        )
+        self.assertNotIn("! errors:", ax_out)
+        self.assertNotIn("Error: invalid request schema", ax_out)
+        self.assertIn('app="Calculator"', ax_out)
+
+    def test_28_live_pixel_view_screencast_fragmented_ws_and_zoom(self) -> None:
+        import base64
+        import hashlib
+        import socket
+        import struct
+        import threading
+
+        # Minimal valid 1x1 JPEG bytes + padding comment so base64 > 160 KB for RFC 6455 fragmentation test
+        tiny_jpeg = (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xfe\x00\x08fmu-test"
+            b"\xff\xdb\x00C\x00" + (b"\x08" * 64)
+            + b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+            b"\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"\xff\xda\x00\x08\x01\x01\x00\x00?\x00\x7f\xff\xd9"
+        )
+        tiny_b64 = base64.b64encode(tiny_jpeg).decode("ascii")
+
+        def send_masked_frame(sock: socket.socket, fin: int, opcode: int, payload: bytes) -> None:
+            mask_key = b"\x37\xfa\x21\x3d"
+            header = bytearray([((fin & 1) << 7) | (opcode & 0x0F)])
+            ln = len(payload)
+            if ln < 126:
+                header.append(0x80 | ln)
+            elif ln < 65536:
+                header.append(0x80 | 126)
+                header.extend(struct.pack("!H", ln))
+            else:
+                header.append(0x80 | 127)
+                header.extend(struct.pack("!Q", ln))
+            header.extend(mask_key)
+            masked = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+            sock.sendall(bytes(header) + masked)
+
+        def recv_server_text(sock: socket.socket) -> str:
+            b0, b1 = sock.recv(2)
+            ln = b1 & 0x7F
+            if ln == 126:
+                ln = struct.unpack("!H", sock.recv(2))[0]
+            elif ln == 127:
+                ln = struct.unpack("!Q", sock.recv(8))[0]
+            buf = bytearray()
+            while len(buf) < ln:
+                buf.extend(sock.recv(ln - len(buf)))
+            return bytes(buf).decode("utf-8")
+
+        # 1. Verify RFC 6455 multi-fragment (>150 KB) + interleaved Ping + live screencastFrame push
+        from fmu.browser_engine import ExtensionWebSocketBridge
+
+        received_events: list[dict] = []
+        bridge = ExtensionWebSocketBridge(preferred_port=0, on_event=lambda ev: received_events.append(ev))
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        stop_frag = threading.Event()
+        try:
+            client_sock.connect(("127.0.0.1", bridge.port))
+            ws_key = base64.b64encode(b"fragment-ws-test").decode("ascii")
+            client_sock.sendall(
+                (
+                    f"GET /ext HTTP/1.1\r\nHost: 127.0.0.1:{bridge.port}\r\n"
+                    f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                ).encode("ascii")
+            )
+            hs = client_sock.recv(1024).decode("latin1")
+            expected_accept = base64.b64encode(
+                hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+            ).decode("ascii")
+            self.assertIn(expected_accept, hs)
+            send_masked_frame(client_sock, 1, 0x1, b'{"type":"hello","version":"0.3.0"}')
+            self.assertTrue(bridge.wait_connected(timeout=2.0))
+
+            def frag_worker() -> None:
+                req_raw = recv_server_text(client_sock)
+                req_obj = json.loads(req_raw)
+                # Push a live screencastFrame event BEFORE the RPC response
+                ev_bytes = json.dumps(
+                    {
+                        "type": "screencastFrame",
+                        "tabId": 909,
+                        "data": tiny_b64,
+                        "vw": 1440,
+                        "vh": 900,
+                        "ts": 123456,
+                    }
+                ).encode("utf-8")
+                send_masked_frame(client_sock, 1, 0x1, ev_bytes)
+
+                # Send a >180 KB RPC response split across 3 fragments + an interleaved Ping control frame
+                big_pad = "A" * 190_000
+                resp_bytes = json.dumps(
+                    {
+                        "id": req_obj["id"],
+                        "result": {"ok": True, "padLen": len(big_pad), "pad": big_pad, "preview": {"jpeg": tiny_b64, "vw": 1440, "vh": 900}},
+                    }
+                ).encode("utf-8")
+                c1 = resp_bytes[:70_000]
+                c2 = resp_bytes[70_000:140_000]
+                c3 = resp_bytes[140_000:]
+                send_masked_frame(client_sock, 0, 0x1, c1)
+                send_masked_frame(client_sock, 1, 0x9, b"ping")  # Interleaved RFC 6455 Ping!
+                send_masked_frame(client_sock, 0, 0x0, c2)
+                send_masked_frame(client_sock, 1, 0x0, c3)
+
+            t_frag = threading.Thread(target=frag_worker, daemon=True)
+            t_frag.start()
+            rpc_res = bridge.call_rpc("capturePreview", {"tabId": 909}, timeout=3.0)
+            t_frag.join(timeout=2.0)
+            self.assertEqual(rpc_res["padLen"], 190_000)
+            self.assertEqual(len(rpc_res["pad"]), 190_000)
+            self.assertEqual(len(received_events), 1)
+            self.assertEqual(received_events[0]["type"], "screencastFrame")
+            self.assertEqual(received_events[0]["tabId"], 909)
+        finally:
+            stop_frag.set()
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+            bridge.shutdown()
+
+        # 2. Verify end-to-end real pixel Live View on headless web + HD Zoom toggle + native Calculator
+        with BackgroundIntrusionGuard() as guard:
+            self.rt.execute({"reset": True})
+            preview_jpg = Path("/tmp/fmu-preview-web.jpg")
+            preview_jpg.unlink(missing_ok=True)
+            pricing_url = f"{self.server.base_url}/pricing"
+            web_out = self.rt.execute(
+                {
+                    "surface": "web",
+                    "mode": "headless",
+                    "url": pricing_url,
+                    "session": "live1",
+                    "steps": [{"op": "click", "target": "Generate Quote Token"}],
+                }
+            )
+            self.assertIn("ENT-1000-OK", web_out)
+            for _ in range(35):
+                if preview_jpg.is_file():
+                    break
+                time.sleep(0.025)
+            self.assertTrue(preview_jpg.is_file(), "Expected real CDP JPEG viewport capture at /tmp/fmu-preview-web.jpg")
+            self.assertTrue(preview_jpg.read_bytes().startswith(b"\xff\xd8\xff"))
+
+            st_web = ""
+            for _ in range(35):
+                st_web = self.rt.execute({"statusBar": True})
+                if 'surface="web"' in st_web and "hasFrame=true" in st_web:
+                    break
+                time.sleep(0.025)
+            self.assertIn('surface="web"', st_web)
+            self.assertIn("hasFrame=true", st_web)
+            self.assertIn("zoomed=false", st_web)
+
+            # Toggle HD Zoom on and off
+            z_on = self.rt.execute({"code": "return await cua.toggleZoom();"})
+            self.assertIn("zoomed=true", z_on)
+            z_off = self.rt.execute({"toggleZoom": True})
+            self.assertIn("zoomed=false", z_off)
+
+            # Native Calculator live pixel capture + snapshot export
+            self.rt.execute({"app": "Calculator", "steps": [{"op": "click", "name": "8"}]})
+            with tempfile.TemporaryDirectory() as snap_dir:
+                snap_res = self.rt.execute({"dumpUiSnapshots": snap_dir})
+                self.assertIn("fmu-ui-snapshots", snap_res)
+                hud_png = Path(snap_dir) / "hud-working.png"
+                self.assertTrue(hud_png.is_file())
+                self.assertGreater(hud_png.stat().st_size, 4000)
+
+        rep = guard.stop()
+        self.assertTrue(rep.passed_background_invariant, f"Intrusion detected: {rep}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 

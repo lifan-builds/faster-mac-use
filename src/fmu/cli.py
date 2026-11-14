@@ -16,7 +16,13 @@ from fmu.cua_runtime import (
     execute_via_daemon,
     serve_runtime_daemon,
 )
-from fmu.mac_engine import MacNativeEngine
+from fmu.mac_engine import (
+    MacNativeEngine,
+    clear_user_stop,
+    engage_user_stop,
+    get_menubar_status,
+    highlight_target_window,
+)
 
 
 def serve_mcp(bin_path: Path | None = None) -> None:
@@ -59,7 +65,7 @@ def serve_mcp(bin_path: Path | None = None) -> None:
             args = params.get("arguments", {})
             try:
                 text = execute_via_daemon(args, entry)
-                is_err = False
+                is_err = text.startswith("Error: [USER_STOPPED]")
             except Exception as exc:
                 text = f"Error: {exc}"
                 is_err = True
@@ -70,11 +76,23 @@ def serve_mcp(bin_path: Path | None = None) -> None:
             }
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()
+        elif mid is not None:
+            resp = {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            }
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
 
 
 USAGE_TEXT = """Usage:
   fmu '<json>'            Execute a web, macOS AX, REPL, or parallel CUA request
   fmu mcp                 Run as an MCP stdio server
+  fmu --status            Show macOS menu bar & agent working/stopped status
+  fmu --highlight         Flash neon highlight border around active target window on screen
+  fmu --stop              Immediately stop active fmu agent work (same as menu bar ⏹ Stop)
+  fmu --resume            Clear user stop latch and resume fmu (same as menu bar ▶ Resume)
   fmu --perf [days]       Summarize recent fmu performance & error logs (~/.fmu/logs)
   fmu --reset             Reset warm browser & macOS AX daemon state
   fmu --shutdown          Stop background runtime daemon
@@ -92,6 +110,18 @@ def main(bin_path: Path | None = None) -> None:
         from fmu import __version__
 
         sys.stdout.write(f"faster-mac-use {__version__}\n")
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--status", "status", "--menubar"):
+        print(get_menubar_status())
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--highlight", "highlight"):
+        print(highlight_target_window())
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--stop", "stop"):
+        print(engage_user_stop())
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--resume", "resume"):
+        print(clear_user_stop())
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("--perf", "--stats", "perf", "stats"):
         from fmu.telemetry import build_perf_report
@@ -111,7 +141,8 @@ def main(bin_path: Path | None = None) -> None:
         serve_runtime_daemon(sock)
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("--reset", "reset"):
-        req: dict[str, object] = {"reset": True}
+        clear_user_stop()
+        req: dict[str, object] = {"reset": True, "resume": True}
     elif len(sys.argv) >= 2 and sys.argv[1] in ("--shutdown", "shutdown"):
         req = {"shutdown_daemon": True}
     elif len(sys.argv) >= 2:
@@ -145,6 +176,11 @@ def main(bin_path: Path | None = None) -> None:
         and "parallel" not in req
         and not req.get("getCursors")
         and not req.get("reset")
+        and not req.get("stop")
+        and not req.get("resume")
+        and not req.get("statusBar")
+        and not req.get("getStatus")
+        and not req.get("clickStatusBar")
         and not req.get("shutdown_daemon")
     ):
         print(MacNativeEngine().execute(req))

@@ -44,6 +44,7 @@ Most computer-use tools force a painful choice:
    - **Push-Based `AXObserver` Dirty-Subtree Tracking**: Subscribes to `kAXValueChangedNotification`, `kAXTitleChangedNotification`, `kAXCreatedNotification`, `kAXUIElementDestroyedNotification`, and window/layout notifications on a dedicated `CFRunLoop` thread (`fmu-ax-observer`). Turn 2+ unchanged or leaf-dirty snapshots short-circuit full AX tree walks in **`< 1 ms`** (`obs=` sequence telemetry).
    - **Batched Attribute Reads, Non-Destructive Clipboard Hygiene & Multi-Window Guards**: Batches reads via `AXUIElementCopyMultipleAttributeValues`, lazily wakes background Electron/Chromium AX trees (`AXManualAccessibility = true`), never overwrites `NSPasteboard.general` on `op: "set"` (verifying `AXTextArea` read-back and detecting `NSOpenPanel` TCC-disabled `Open` buttons), and guards `CGEvent.postToPid` key routing when targeting a non-main window of a multi-window process.
    - **0-Vision-Token Apple Silicon Window & Canvas OCR**: Built-in `CGWindowListCreateImage` + `ImageIO` + `VNRecognizeTextRequest` engine (`op: "ocr"` / `await app.ocr()`) extracts clickable text and bounding boxes in `< 70 ms`.
+   - **Real-Time Pixel `fmu Live View` HUD & One-Click Menu Bar Stop**: Streams live pixels of the actual controlled background Chrome tab (`Page.startScreencast` + async post-action `Page.captureScreenshot` over `ws://127.0.0.1:19222/ext`) or native macOS app window (`ScreenCaptureKit`) into a non-activating floating PiP monitor with target cursor reticles, `⤢` HD Zoom (`460px` / `740px`, `{"toggleZoom": true}`), `🎯 Highlight` (`fmu --highlight`), draggable positioning, and instant `⏹ Stop` / `▶ Resume` (`fmu --stop` / `fmu --resume`).
 
 3. **Tier 3 — Unified Multi-Cursor / Multi-Agent Stateful REPL, Warm Daemon & Context Hygiene ([`FasterMacUseRuntime`](src/fmu/cua_runtime.py))**
    - **268-Token Single-Tool Schema & Strict `steps` Validation**: Supports OpenAI Codex-style stateful `cua_repl` scripts (`cua.createBrowserTab`, `cua.getTab`, `cua.getApp`, `cua.getBridgeStatus`, `cua.saveMacro`, `cua.listMacros`, `cua.getState`, `cua.getCursors`), 1-trip declarative `steps` batches (with `op`/`uid` and `action`/`target`/`text` normalization plus explicit error reporting on missing or unsupported `"op"`), and concurrent multi-agent swarms (`{"parallel": [{"agent": "agent-1", "code": "..."}, ...]}`).
@@ -96,7 +97,7 @@ brew install --Formula ./Formula/faster-mac-use.rb
 ./bin/fmu --perf 7
 ```
 
-### 4. Run the 25-Test Unit & Integration Suite
+### 4. Run the 28-Test Unit & Integration Suite
 ```bash
 PYTHONPATH=src python3 tests/test_fmu.py
 ```

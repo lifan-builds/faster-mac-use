@@ -13,7 +13,16 @@ import time
 from typing import Any
 
 from .browser_engine import BrowserEngine
-from .mac_engine import MacNativeEngine
+from .mac_engine import (
+    USER_STOPPED_ERROR,
+    MacNativeEngine,
+    clear_user_stop,
+    engage_user_stop,
+    get_menubar_status,
+    highlight_target_window,
+    is_user_stopped,
+    notify_menubar_status,
+)
 
 try:
     import tiktoken as _tiktoken
@@ -549,6 +558,21 @@ class CuaNamespace:
     def getCursors(self) -> str:
         return self.runtime.get_cursors()
 
+    def getStatus(self) -> str:
+        return get_menubar_status(socket_path=self.runtime.mac.socket_path)
+
+    def highlightWindow(self) -> str:
+        return highlight_target_window(socket_path=self.runtime.mac.socket_path)
+
+    def toggleZoom(self) -> str:
+        return self.runtime.mac.execute({"toggleZoom": True})
+
+    def stop(self, reason: str = "User stopped fmu") -> str:
+        return engage_user_stop(reason=reason, socket_path=self.runtime.mac.socket_path)
+
+    def resume(self) -> str:
+        return clear_user_stop(socket_path=self.runtime.mac.socket_path)
+
     def getState(self) -> str:
         items = [f"{k}:{type(v).__name__}" for k, v in self.handles.items()]
         return f"# cua agent={self.agent_id} handles=[{', '.join(items)}]"
@@ -687,7 +711,7 @@ class FasterMacUseRuntime:
         masked = re.sub(r"\btrue\b", "True", masked)
         masked = re.sub(r"\bfalse\b", "False", masked)
         masked = re.sub(r"\bnull\b", "None", masked)
-        masked = re.sub(r"(\{\s*|,\s*)([a-zA-Z_]\w*)\s*:", r'\1"\2":', masked)
+        masked = re.sub(r"(\{\s*|,\s*)(?!__STR_\d+__)([a-zA-Z_]\w*)\s*:", r'\1"\2":', masked)
         for idx, s in enumerate(strings):
             masked = masked.replace(f"__STR_{idx}__", s)
         return masked.strip()
@@ -711,12 +735,17 @@ class FasterMacUseRuntime:
             sess.repl_env["JSON"] = json
 
             for stmt in lines:
+                stmt_allows_stopped = "cua.resume" in stmt or "cua.getStatus" in stmt or "cua.stop" in stmt
+                if not stmt_allows_stopped and is_user_stopped():
+                    return USER_STOPPED_ERROR
                 assign_m = re.match(r"^([a-zA-Z_]\w*)\s*=\s*(?!=)(.+)$", stmt, re.DOTALL)
                 if assign_m and not stmt.startswith(("if ", "assert ", "return ")):
                     var_name = assign_m.group(1).strip()
                     rhs = assign_m.group(2).strip()
                     if last_handle is not None and last_handle.has_pending():
                         outputs.append(last_handle.flush())
+                        if is_user_stopped():
+                            return USER_STOPPED_ERROR
                     val = eval(rhs, {"__builtins__": {}}, sess.repl_env)
                     sess.repl_env[var_name] = val
                     if isinstance(val, (AppHandle, TabHandle)):
@@ -727,6 +756,8 @@ class FasterMacUseRuntime:
                 elif stmt.startswith("return "):
                     if last_handle is not None and last_handle.has_pending():
                         outputs.append(last_handle.flush())
+                        if is_user_stopped():
+                            return USER_STOPPED_ERROR
                     val = eval(stmt[7:].strip(), {"__builtins__": {}}, sess.repl_env)
                     if isinstance(val, (AppHandle, TabHandle)):
                         outputs.append(val.flush())
@@ -741,11 +772,17 @@ class FasterMacUseRuntime:
                         last_handle = val
                     elif isinstance(val, str):
                         outputs.append(val)
+                if not stmt_allows_stopped and is_user_stopped():
+                    return USER_STOPPED_ERROR
 
             if last_handle is not None and last_handle.has_pending():
+                if is_user_stopped():
+                    return USER_STOPPED_ERROR
                 outputs.append(last_handle.flush())
             for h in list(sess.cua.handles.values()):
                 if isinstance(h, (AppHandle, TabHandle)) and h.has_pending():
+                    if is_user_stopped():
+                        return USER_STOPPED_ERROR
                     outputs.append(h.flush())
             if last_handle is not None and not outputs and last_handle._fresh:
                 last_handle._fresh = False
@@ -756,35 +793,74 @@ class FasterMacUseRuntime:
             return result
 
     def execute_parallel(self, tasks: list[dict[str, Any]]) -> str:
+        if is_user_stopped():
+            return USER_STOPPED_ERROR
         if not tasks:
             return "# parallel tasks=0"
-        futures = []
-        for idx, sub_req in enumerate(tasks):
-            req_copy = dict(sub_req)
-            if not req_copy.get("agent") and not req_copy.get("cursor"):
-                req_copy["agent"] = f"agent-{idx + 1}"
-            futures.append((req_copy["agent"], self._pool.submit(self.execute, req_copy)))
-        parts: list[str] = []
-        for aid, fut in futures:
-            try:
-                res = fut.result()
-            except Exception as exc:
-                res = f"! error: {type(exc).__name__}: {exc}"
-            parts.append(f"=== [{aid}] ===\n{res}")
-        return "\n".join(parts)
+        notify_menubar_status(
+            "working",
+            surface="parallel",
+            target=f"{len(tasks)} agents",
+            op="swarm",
+            agent="parallel",
+            step_count=len(tasks),
+        )
+        try:
+            futures = []
+            for idx, sub_req in enumerate(tasks):
+                req_copy = dict(sub_req)
+                if not req_copy.get("agent") and not req_copy.get("cursor"):
+                    req_copy["agent"] = f"agent-{idx + 1}"
+                futures.append((req_copy["agent"], self._pool.submit(self.execute, req_copy)))
+            parts: list[str] = []
+            for aid, fut in futures:
+                try:
+                    res = fut.result()
+                except Exception as exc:
+                    res = f"! error: {type(exc).__name__}: {exc}"
+                parts.append(f"=== [{aid}] ===\n{res}")
+            return "\n".join(parts)
+        finally:
+            notify_menubar_status(
+                "done",
+                surface="parallel",
+                target=f"{len(tasks)} agents",
+                op="swarm",
+                agent="parallel",
+            )
 
     def execute(self, req: dict[str, Any]) -> str:
         if getattr(self, "_is_mcp_stdio", False):
             return execute_via_daemon(req, Path(__file__).resolve().parent / "cli.py")
 
-        if req.get("getCursors"):
-            return self.get_cursors()
+        if req.get("clickStatusBar"):
+            return self.mac.execute({"clickStatusBar": True})
+
+        if req.get("stop"):
+            return engage_user_stop(socket_path=self.mac.socket_path)
+
+        if req.get("resume"):
+            res_out = clear_user_stop(socket_path=self.mac.socket_path)
+            if not req.get("reset") and not req.get("app") and not req.get("url") and not req.get("code"):
+                return res_out
+
+        if req.get("statusBar") or req.get("getStatus"):
+            return get_menubar_status(socket_path=self.mac.socket_path)
+
+        if req.get("highlightWindow"):
+            return highlight_target_window(socket_path=self.mac.socket_path)
+
+        if req.get("togglePreview"):
+            return self.mac.execute({"togglePreview": True})
+
+        if req.get("toggleZoom"):
+            return self.mac.execute({"toggleZoom": True})
+
+        if req.get("dumpUiSnapshots"):
+            return self.mac.execute({"dumpUiSnapshots": str(req["dumpUiSnapshots"])})
 
         if req.get("bridgeStatus"):
             return self.browser.execute_batch({"bridgeStatus": True})
-
-        if req.get("reloadExtension"):
-            return self.browser.execute_batch({"reloadExtension": True})
 
         if "perfReport" in req and req["perfReport"]:
             from fmu.telemetry import build_perf_report
@@ -798,6 +874,17 @@ class FasterMacUseRuntime:
             if isinstance(pr, int) and not isinstance(pr, bool):
                 return build_perf_report(days=pr)
             return build_perf_report()
+
+        if is_user_stopped():
+            code_str = str(req.get("code") or "")
+            if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
+                return USER_STOPPED_ERROR
+
+        if req.get("getCursors"):
+            return self.get_cursors()
+
+        if req.get("reloadExtension"):
+            return self.browser.execute_batch({"reloadExtension": True})
 
         if "parallel" in req and isinstance(req["parallel"], list):
             return self.execute_parallel(req["parallel"])
@@ -952,10 +1039,48 @@ def execute_via_daemon(
     fmu_bin_path: str | Path,
     socket_path: str = DEFAULT_RUNTIME_SOCK,
 ) -> str:
+    is_control = any(
+        req.get(k)
+        for k in (
+            "stop",
+            "resume",
+            "statusBar",
+            "getStatus",
+            "clickStatusBar",
+            "highlightWindow",
+            "togglePreview",
+            "dumpUiSnapshots",
+            "shutdown_daemon",
+            "perfReport",
+            "bridgeStatus",
+        )
+    )
+    if not is_control and is_user_stopped():
+        code_str = str(req.get("code") or "")
+        if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
+            return USER_STOPPED_ERROR
+
+    if req.get("clickStatusBar"):
+        return MacNativeEngine().execute({"clickStatusBar": True})
+    if req.get("highlightWindow"):
+        return highlight_target_window()
+    if req.get("togglePreview"):
+        return MacNativeEngine().execute({"togglePreview": True})
+    if req.get("dumpUiSnapshots"):
+        return MacNativeEngine().execute({"dumpUiSnapshots": str(req["dumpUiSnapshots"])})
+    if req.get("stop"):
+        return engage_user_stop()
+    if req.get("resume") and not req.get("reset") and not req.get("app") and not req.get("url") and not req.get("code"):
+        return clear_user_stop()
+    if req.get("statusBar") or req.get("getStatus"):
+        return get_menubar_status()
+
     if not can_connect_runtime_daemon(socket_path):
         if req.get("shutdown_daemon"):
             return "# fmu daemon stopped"
-        if req.get("reset") and len(req) == 1:
+        if req.get("reset") and len(req) == 1 or (req.get("reset") and req.get("resume") and len(req) == 2):
+            if req.get("resume"):
+                clear_user_stop()
             MacNativeEngine().reset()
             return "# fmu runtime reset"
         import fcntl
@@ -1000,13 +1125,24 @@ def execute_via_daemon(
     payload = (json.dumps(req) + "\n").encode("utf-8")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(30.0)
+        s.settimeout(1.0)
         s.connect(socket_path)
         s.sendall(payload)
         s.shutdown(socket.SHUT_WR)
         chunks: list[bytes] = []
+        s.settimeout(0.05)
+        deadline = time.perf_counter() + 30.0
         while True:
-            buf = s.recv(16384)
+            if not is_control and is_user_stopped():
+                code_str = str(req.get("code") or "")
+                if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
+                    return USER_STOPPED_ERROR
+            try:
+                buf = s.recv(16384)
+            except socket.timeout:
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("Timed out waiting for fmu runtime daemon")
+                continue
             if not buf:
                 break
             chunks.append(buf)
@@ -1047,6 +1183,11 @@ MCP_TOOL_SCHEMA = {
             "bridgeStatus": {"type": "boolean"},
             "reloadExtension": {"type": "boolean"},
             "perfReport": {"type": ["boolean", "object"]},
+            "statusBar": {"type": "boolean"},
+            "highlightWindow": {"type": "boolean"},
+            "toggleZoom": {"type": "boolean"},
+            "stop": {"type": "boolean"},
+            "resume": {"type": "boolean"},
             "session": {"type": "string"},
             "query": {"type": "string"},
             "diff": {"type": "boolean"},

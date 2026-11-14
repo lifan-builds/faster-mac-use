@@ -15,20 +15,115 @@ import time
 from urllib.parse import urlparse
 from typing import Any, Callable
 
+from fmu.mac_engine import (
+    USER_STOPPED_ERROR,
+    interruptible_sleep,
+    is_user_stopped,
+    notify_menubar_status,
+)
 from fmu.telemetry import flush_telemetry, record_perf_event, sanitize_error, sanitize_url_target
+
+
+def _short_menubar_target(raw_url: str | None) -> str:
+    if not raw_url or raw_url in ("about:blank", "*"):
+        return "Chrome"
+    try:
+        parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if not host:
+            return "Chrome"
+        if host in ("127.0.0.1", "localhost") and parsed.path and parsed.path != "/":
+            return f"{host}{parsed.path}"[:18]
+        return host[:18]
+    except Exception:
+        return "Chrome"
+
+_PREVIEW_FILE_LOCK = threading.Lock()
+_PREVIEW_SEQ = 0
+
+
+def _preview_enabled() -> bool:
+    return os.environ.get("FMU_PREVIEW") != "0" and os.environ.get("FMU_MENUBAR") != "0"
+
+
+def _write_web_preview_b64(b64_data: str | None) -> str | None:
+    global _PREVIEW_SEQ
+    if not b64_data or len(b64_data) < 64 or not _preview_enabled():
+        return None
+    try:
+        raw = base64.b64decode(b64_data)
+        if len(raw) < 48:
+            return None
+        with _PREVIEW_FILE_LOCK:
+            _PREVIEW_SEQ = (_PREVIEW_SEQ + 1) % 1_000_000
+            tmp_path = Path(f"/tmp/fmu-preview-web-{os.getpid()}-{_PREVIEW_SEQ & 3}.tmp.jpg")
+            final_path = Path("/tmp/fmu-preview-web.jpg")
+            tmp_path.write_bytes(raw)
+            os.replace(tmp_path, final_path)
+            return str(final_path)
+    except Exception:
+        return None
+
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  if (window.__fmu) return true;
+  const FMU_RUNTIME_VERSION = "0.2.3";
+  if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
-  const elToUid = new WeakMap();
-  const elToStableLabel = new WeakMap();
-  const uidToRef = new Map();
-  const agentStates = new Map();
-  const virtualTools = new Map();
-  const ocrTargets = new Map();
-  let nextUid = 1;
-  let mutationSeq = 1;
+  const store = window.__fmuStore || (window.__fmuStore = {
+    elToUid: new WeakMap(),
+    elToStableLabel: new WeakMap(),
+    uidToRef: new Map(),
+    uidToMeta: new Map(),
+    agentStates: new Map(),
+    virtualTools: new Map(),
+    ocrTargets: new Map(),
+    nextUid: 1,
+    mutationSeq: 1,
+    observerAttached: false
+  });
+  const elToUid = store.elToUid;
+  const elToStableLabel = store.elToStableLabel;
+  const uidToRef = store.uidToRef;
+  const uidToMeta = store.uidToMeta || (store.uidToMeta = new Map());
+  const agentStates = store.agentStates;
+  const virtualTools = store.virtualTools;
+  const ocrTargets = store.ocrTargets;
+
+  function getShadowRoot(el) {
+    return (el && (el.shadowRoot || el._sr || el._shadowRoot || el.__shadowRoot)) || null;
+  }
+
+  function queryAllDeep(sel, root = document) {
+    const base = root.querySelectorAll(sel);
+    const all = root.querySelectorAll("*");
+    let extra = null;
+    for (let i = 0; i < all.length; i++) {
+      const sr = getShadowRoot(all[i]);
+      if (sr && sr.querySelectorAll) {
+        if (!extra) extra = Array.from(base);
+        const sub = queryAllDeep(sel, sr);
+        for (let j = 0; j < sub.length; j++) extra.push(sub[j]);
+      }
+    }
+    return extra || base;
+  }
+
+  function queryOneDeep(sel, root = document) {
+    const hit = root.querySelector(sel);
+    if (hit) return hit;
+    const all = root.querySelectorAll("*");
+    for (let i = 0; i < all.length; i++) {
+      const sr = getShadowRoot(all[i]);
+      if (sr && sr.querySelector) {
+        const sub = queryOneDeep(sel, sr);
+        if (sub) return sub;
+      }
+    }
+    return null;
+  }
 
   function getAgentState(agentId = "default") {
     const key = String(agentId || "default");
@@ -90,7 +185,7 @@ IN_PAGE_RUNTIME_JS = r"""
         });
       }
     }
-    mutationSeq++;
+    store.mutationSeq++;
     return ocrTargets.size;
   }
 
@@ -134,21 +229,24 @@ IN_PAGE_RUNTIME_JS = r"""
     try { targetEl.dispatchEvent(new PointerEvent("pointerup", evInit)); } catch (_) {}
     targetEl.dispatchEvent(new MouseEvent("mouseup", evInit));
     targetEl.dispatchEvent(new MouseEvent("click", evInit));
-    mutationSeq++;
+    store.mutationSeq++;
     return true;
   }
 
-  const observer = new MutationObserver(() => { mutationSeq++; });
-  if (document.documentElement) {
-    observer.observe(document.documentElement, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      characterData: true
-    });
+  if (!store.observerAttached) {
+    const observer = new MutationObserver(() => { store.mutationSeq++; });
+    if (document.documentElement) {
+      observer.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true
+      });
+    }
+    window.addEventListener("input", () => { store.mutationSeq++; }, true);
+    window.addEventListener("change", () => { store.mutationSeq++; }, true);
+    store.observerAttached = true;
   }
-  window.addEventListener("input", () => { mutationSeq++; }, true);
-  window.addEventListener("change", () => { mutationSeq++; }, true);
 
   function crc32(str) {
     let crc = 0xFFFFFFFF;
@@ -164,7 +262,7 @@ IN_PAGE_RUNTIME_JS = r"""
   function getUid(el) {
     let uid = elToUid.get(el);
     if (!uid) {
-      uid = "@u" + (nextUid++);
+      uid = "@u" + (store.nextUid++);
       elToUid.set(el, uid);
     }
     uidToRef.set(uid, new WeakRef(el));
@@ -202,6 +300,8 @@ IN_PAGE_RUNTIME_JS = r"""
     return aliases.filter(Boolean).map(s => s.toLowerCase());
   }
 
+  const CANDIDATE_SEL = "button, a, input, select, textarea, canvas, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], [role], label, h1, h2, h3, [data-testid], [data-placeholder], [aria-placeholder]";
+
   function resolveEl(target) {
     if (!target) return null;
     const t = String(target).trim();
@@ -213,15 +313,39 @@ IN_PAGE_RUNTIME_JS = r"""
         const el = ref.deref();
         if (el && el.isConnected) return el;
       }
+      const meta = uidToMeta.get(norm);
+      if (meta && meta.label) {
+        const targetLbl = meta.label.toLowerCase();
+        const candidates = queryAllDeep(CANDIDATE_SEL);
+        let fallbackMatch = null;
+        for (const c of candidates) {
+          if (!isVisible(c)) continue;
+          const cLbl = getLabel(c).toLowerCase();
+          const aliases = getCandidateAliases(c);
+          if (cLbl === targetLbl || aliases.includes(targetLbl)) {
+            if (!meta.role || getRole(c) === meta.role) {
+              elToUid.set(c, norm);
+              uidToRef.set(norm, new WeakRef(c));
+              return c;
+            }
+            if (!fallbackMatch) fallbackMatch = c;
+          }
+        }
+        if (fallbackMatch) {
+          elToUid.set(fallbackMatch, norm);
+          uidToRef.set(norm, new WeakRef(fallbackMatch));
+          return fallbackMatch;
+        }
+      }
     }
     try {
-      const bySel = document.querySelector(t);
+      const bySel = queryOneDeep(t);
       if (bySel) return bySel;
     } catch (_) {}
     const byId = document.getElementById(t);
     if (byId) return byId;
     const lower = t.toLowerCase();
-    const candidates = document.querySelectorAll("button, a, input, select, textarea, canvas, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], [role], label, h1, h2, h3, [data-testid], [data-placeholder], [aria-placeholder]");
+    const candidates = queryAllDeep(CANDIDATE_SEL);
     for (const el of candidates) {
       const aliases = getCandidateAliases(el);
       if (aliases.includes(lower)) return el;
@@ -345,7 +469,7 @@ IN_PAGE_RUNTIME_JS = r"""
   function collectSnapshot(query = "", maxItems = 180, foldTables = true) {
     const q = String(query || "").toLowerCase();
     const sel = "button, a[href], input, select, textarea, canvas, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='switch'], [role='option'], [role='textbox'], [role='searchbox'], [role='combobox'], [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], h1, h2, h3, [data-status], [role='status'], [role='alert'], output, .result, #result, #status";
-    const nodes = document.querySelectorAll(sel);
+    const nodes = queryAllDeep(sel);
     const currentMap = new Map();
     const lines = [];
     const canvases = [];
@@ -370,6 +494,7 @@ IN_PAGE_RUNTIME_JS = r"""
       const val = getValue(el);
       if (role === "canvas") {
         const uid = getUid(el);
+        uidToMeta.set(uid, { role: "canvas", label });
         const rect = el.getBoundingClientRect();
         const cx = Math.round(rect.left);
         const cy = Math.round(rect.top);
@@ -381,7 +506,7 @@ IN_PAGE_RUNTIME_JS = r"""
         const body = `canvas "${label}" (${cx},${cy}) [${cw}x${ch}]`;
         const fullLine = `${uid} ${body}`;
         if (!q || label.toLowerCase().includes(q) || "canvas".includes(q)) {
-          currentMap.set(uid, { uid, role: "canvas", label, val: "", body, fullLine });
+          currentMap.set(uid, { uid, role: "canvas", label, val: "", body, fullLine, folded: false });
           lines.push(fullLine);
         }
         continue;
@@ -390,13 +515,14 @@ IN_PAGE_RUNTIME_JS = r"""
       if (q && !label.toLowerCase().includes(q) && !val.toLowerCase().includes(q) && !role.includes(q)) continue;
 
       const uid = getUid(el);
+      uidToMeta.set(uid, { role, label });
       let body = role;
       if (label) body += ` "${label}"`;
       if (val && val !== label) body += ` val="${val}"`;
       if (el.disabled) body += " [disabled]";
       const fullLine = `${uid} ${body}`;
-      currentMap.set(uid, { uid, role, label, val, body, fullLine });
 
+      let isFoldedRow = false;
       if (foldTables && !q) {
         const tr = el.closest ? el.closest("tbody tr") : null;
         const tbody = tr ? tr.parentElement : null;
@@ -416,10 +542,12 @@ IN_PAGE_RUNTIME_JS = r"""
             st.rows.add(tr);
             st.count += 1;
             st.lastUid = uid;
-            continue;
+            isFoldedRow = true;
           }
         }
       }
+      currentMap.set(uid, { uid, role, label, val, body, fullLine, folded: isFoldedRow });
+      if (isFoldedRow) continue;
       lines.push(fullLine);
     }
 
@@ -429,7 +557,7 @@ IN_PAGE_RUNTIME_JS = r"""
       }
       const body = `canvas-text "${oItem.label}" (${oItem.x},${oItem.y})`;
       const fullLine = `${oUid} ${body}`;
-      currentMap.set(oUid, { uid: oUid, role: "canvas-text", label: oItem.label, val: "", body, fullLine });
+      currentMap.set(oUid, { uid: oUid, role: "canvas-text", label: oItem.label, val: "", body, fullLine, folded: false });
       lines.push(fullLine);
     }
 
@@ -447,15 +575,26 @@ IN_PAGE_RUNTIME_JS = r"""
 
   function computeDiff(prevMap, curMap) {
     const delta = [];
+    let foldedAdded = null;
     for (const [uid, oldItem] of prevMap.entries()) {
       if (!curMap.has(uid)) {
-        delta.push(`- ${oldItem.fullLine}`);
+        if (!oldItem.folded) {
+          delta.push(`- ${oldItem.fullLine}`);
+        }
       }
     }
     for (const [uid, curItem] of curMap.entries()) {
       const oldItem = prevMap.get(uid);
       if (!oldItem) {
-        delta.push(`+ ${curItem.fullLine}`);
+        if (curItem.folded) {
+          if (!foldedAdded) {
+            foldedAdded = { count: 0, firstUid: uid, lastUid: uid };
+          }
+          foldedAdded.count += 1;
+          foldedAdded.lastUid = uid;
+        } else {
+          delta.push(`+ ${curItem.fullLine}`);
+        }
       } else if (oldItem.body !== curItem.body) {
         if (oldItem.val !== curItem.val) {
           delta.push(`~ ${uid} ${curItem.role} "${curItem.label}" val="${oldItem.val}" -> val="${curItem.val}"`);
@@ -465,6 +604,9 @@ IN_PAGE_RUNTIME_JS = r"""
           delta.push(`~ ${curItem.fullLine}`);
         }
       }
+    }
+    if (foldedAdded) {
+      delta.push(`# ... +${foldedAdded.count} folded items (${foldedAdded.firstUid}..${foldedAdded.lastUid} indexed; target by label/UID)`);
     }
     return delta;
   }
@@ -542,7 +684,7 @@ IN_PAGE_RUNTIME_JS = r"""
           const afterPasteNorm = normWs(target.innerText || target.textContent || "");
           if (pasteHandled || afterPasteNorm.length > baseLen) {
             target.dispatchEvent(new Event("change", { bubbles: true }));
-            mutationSeq++;
+            store.mutationSeq++;
             return;
           }
         }
@@ -579,7 +721,7 @@ IN_PAGE_RUNTIME_JS = r"""
         }
       }
       target.dispatchEvent(new Event("change", { bubbles: true }));
-      mutationSeq++;
+      store.mutationSeq++;
       return;
     }
 
@@ -596,17 +738,17 @@ IN_PAGE_RUNTIME_JS = r"""
     }
     target.dispatchEvent(new InputEvent("input", { bubbles: true, data: finalVal }));
     target.dispatchEvent(new Event("change", { bubbles: true }));
-    mutationSeq++;
+    store.mutationSeq++;
   }
 
   async function waitQuietDom(quietMs = 15, maxWaitMs = 110) {
     const start = performance.now();
-    let lastSeenSeq = mutationSeq;
+    let lastSeenSeq = store.mutationSeq;
     let lastChangeTime = start;
     while (performance.now() - start < maxWaitMs) {
       await new Promise(r => setTimeout(r, 6));
-      if (mutationSeq !== lastSeenSeq) {
-        lastSeenSeq = mutationSeq;
+      if (store.mutationSeq !== lastSeenSeq) {
+        lastSeenSeq = store.mutationSeq;
         lastChangeTime = performance.now();
       } else if (performance.now() - lastChangeTime >= quietMs) {
         break;
@@ -693,12 +835,15 @@ IN_PAGE_RUNTIME_JS = r"""
     }
     if (el) {
       const rect = el.getBoundingClientRect();
+      const uid = getUid(el);
+      const label = getLabel(el);
+      uidToMeta.set(uid, { role: getRole(el), label });
       st.cursor = {
         agent: st.agent,
         x: Math.round(rect.left + rect.width / 2),
         y: Math.round(rect.top + rect.height / 2),
-        uid: getUid(el),
-        label: getLabel(el),
+        uid,
+        label,
         op
       };
     }
@@ -727,25 +872,25 @@ IN_PAGE_RUNTIME_JS = r"""
     const forceFull = req.diff === false || req.fullTable === true || viewChanged;
     const hadBaseline = st.lastLinesByUid.size > 0 && !viewChanged;
 
-    if (steps.length === 0 && req.diff === true && !forceFull && hadBaseline && mutationSeq === st.lastSnapSeq) {
+    if (steps.length === 0 && req.diff === true && !forceFull && hadBaseline && store.mutationSeq === st.lastSnapSeq) {
       const fastMs = +(performance.now() - tBatchStart).toFixed(2);
       return {
         unchanged: true,
         crc: st.lastCrc,
-        seq: mutationSeq,
+        seq: store.mutationSeq,
         count: st.lastLinesByUid.size,
         cursor: st.cursor,
         canvases: [],
         timings: { execMs: 0, settleMs: 0, snapMs: fastMs, totalInPageMs: fastMs },
-        lines: [`= unchanged (crc=${st.lastCrc}, seq=${mutationSeq})`]
+        lines: [`= unchanged (crc=${st.lastCrc}, seq=${store.mutationSeq})`]
       };
     }
 
-    if (!hadBaseline && !query) {
+    if (!hadBaseline && !query && steps.length > 0) {
       const base = collectSnapshot("", 180, foldTables);
       st.lastLinesByUid = base.currentMap;
       st.lastCrc = base.newCrc;
-      st.lastSnapSeq = mutationSeq;
+      st.lastSnapSeq = store.mutationSeq;
       st.lastQuery = "";
       st.lastFoldTables = foldTables;
     }
@@ -820,7 +965,7 @@ IN_PAGE_RUNTIME_JS = r"""
         if (op === "webmcp" || op === "calltool") {
           const tName = s.tool || s.name || s.target;
           const res = await invokeWebMcp(tName, s.args || stepValue || {});
-          mutationSeq++;
+          store.mutationSeq++;
           if (res !== undefined) {
             evalOutputs.push(`webmcp(${tName}): ${typeof res === "string" ? res : JSON.stringify(res)}`);
           }
@@ -996,7 +1141,7 @@ IN_PAGE_RUNTIME_JS = r"""
     if (!query) {
       st.lastLinesByUid = snap.currentMap;
       st.lastCrc = snap.newCrc;
-      st.lastSnapSeq = mutationSeq;
+      st.lastSnapSeq = store.mutationSeq;
     }
     st.lastQuery = query;
     st.lastFoldTables = foldTables;
@@ -1006,14 +1151,21 @@ IN_PAGE_RUNTIME_JS = r"""
       : [];
     const webMcpTools = Array.from(new Set([...nativeTools, ...virtualTools.keys()]));
 
-    const useDiff = !forceFull && !query && (hadBaseline || steps.length > 0 || req.hadPreSteps) && (req.diff === true || ((steps.length > 0 || req.hadPreSteps) && hadBaseline));
+    let useDiff = !forceFull && !query && (hadBaseline || steps.length > 0 || req.hadPreSteps) && (req.diff === true || ((steps.length > 0 || req.hadPreSteps) && hadBaseline));
     let outLines = [];
     if (useDiff) {
       if (prevCrc === snap.newCrc) {
-        outLines = [`= unchanged (crc=${snap.newCrc}, seq=${mutationSeq})`];
+        outLines = [`= unchanged (crc=${snap.newCrc}, seq=${store.mutationSeq})`];
       } else {
         const delta = computeDiff(prevMap, snap.currentMap);
-        outLines = delta.length > 0 ? delta : [`= unchanged (crc=${snap.newCrc}, seq=${mutationSeq})`];
+        if (delta.length === 0) {
+          outLines = [`= unchanged (crc=${snap.newCrc}, seq=${store.mutationSeq})`];
+        } else if (req.diff !== true && delta.length > 24 && delta.join("\n").length > snap.lines.join("\n").length) {
+          outLines = snap.lines;
+          useDiff = false;
+        } else {
+          outLines = delta;
+        }
       }
     } else {
       outLines = snap.lines;
@@ -1023,8 +1175,10 @@ IN_PAGE_RUNTIME_JS = r"""
     return {
       url: location.href,
       title: document.title,
+      vw: window.innerWidth || 1280,
+      vh: window.innerHeight || 800,
       crc: snap.newCrc,
-      seq: mutationSeq,
+      seq: store.mutationSeq,
       count: snap.totalCount,
       cursor: st.cursor,
       webMcpTools,
@@ -1053,28 +1207,29 @@ IN_PAGE_RUNTIME_JS = r"""
     if (!query) {
       st.lastLinesByUid = snap.currentMap;
       st.lastCrc = snap.newCrc;
-      st.lastSnapSeq = mutationSeq;
+      st.lastSnapSeq = store.mutationSeq;
     }
     let outLines = [];
     if (useDiff) {
       if (prevCrc === snap.newCrc) {
-        outLines = [`= unchanged (crc=${snap.newCrc}, seq=${mutationSeq})`];
+        outLines = [`= unchanged (crc=${snap.newCrc}, seq=${store.mutationSeq})`];
       } else {
         const delta = computeDiff(prevMap, snap.currentMap);
-        outLines = delta.length > 0 ? delta : [`= unchanged (crc=${snap.newCrc}, seq=${mutationSeq})`];
+        outLines = delta.length > 0 ? delta : [`= unchanged (crc=${snap.newCrc}, seq=${store.mutationSeq})`];
       }
     } else {
       outLines = snap.lines;
     }
     return {
       crc: snap.newCrc,
-      seq: mutationSeq,
+      seq: store.mutationSeq,
       count: snap.totalCount,
       lines: outLines
     };
   }
 
   window.__fmu = {
+    version: FMU_RUNTIME_VERSION,
     executeBatch,
     collectSnapshot,
     resolveEl,
@@ -1100,12 +1255,17 @@ _OCR_LINE_RE = re.compile(
 class ExtensionWebSocketBridge:
     """RFC 6455 localhost WebSocket server for the outbound MV3 extension bridge (0 Chrome 144 modal popups)."""
 
-    def __init__(self, preferred_port: int | None = None) -> None:
+    def __init__(
+        self,
+        preferred_port: int | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         if preferred_port is None:
             preferred_port = int(os.environ.get("FMU_BRIDGE_PORT", "19222"))
         self.preferred_port = preferred_port
         self.port: int = 0
         self.port_fallback_reason: str | None = None
+        self.on_event = on_event
         self._srv_sock: socket.socket | None = None
         self._client_sock: socket.socket | None = None
         self._client_lock = threading.Lock()
@@ -1142,7 +1302,7 @@ class ExtensionWebSocketBridge:
         t.start()
 
     def ensure_preferred_port(self) -> None:
-        if self._stopped or self.port == self.preferred_port or self.is_connected():
+        if self._stopped or self.preferred_port == 0 or self.port == self.preferred_port or self.is_connected():
             return
         test_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -1203,8 +1363,9 @@ class ExtensionWebSocketBridge:
             buf.extend(chunk)
         return bytes(buf)
 
-    def _read_ws_frame(self, sock: socket.socket) -> tuple[int, bytes]:
+    def _read_ws_frame_raw(self, sock: socket.socket) -> tuple[bool, int, bytes]:
         hdr = self._recv_exact(sock, 2)
+        fin = (hdr[0] & 0x80) != 0
         opcode = hdr[0] & 0x0F
         masked = (hdr[1] & 0x80) != 0
         length = hdr[1] & 0x7F
@@ -1213,11 +1374,36 @@ class ExtensionWebSocketBridge:
         elif length == 127:
             length = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
         mask_key = self._recv_exact(sock, 4) if masked else b""
-        payload = bytearray(self._recv_exact(sock, length)) if length > 0 else bytearray()
-        if masked and mask_key:
-            for i in range(len(payload)):
-                payload[i] ^= mask_key[i & 3]
-        return opcode, bytes(payload)
+        raw_payload = self._recv_exact(sock, length) if length > 0 else b""
+        if masked and mask_key and length > 0:
+            mask_rep = (mask_key * ((length + 3) // 4))[:length]
+            raw_payload = (
+                int.from_bytes(raw_payload, "big") ^ int.from_bytes(mask_rep, "big")
+            ).to_bytes(length, "big")
+        return fin, opcode, raw_payload
+
+    def _read_ws_message(self, sock: socket.socket) -> tuple[int, bytes]:
+        msg_opcode: int | None = None
+        fragments: list[bytes] = []
+        while True:
+            fin, opcode, payload = self._read_ws_frame_raw(sock)
+            if opcode >= 0x8:
+                if opcode == 0x8:
+                    return 0x8, b""
+                if opcode == 0x9:
+                    self._send_ws_frame(sock, payload, opcode=0xA)
+                continue
+            if opcode in (0x1, 0x2):
+                if fin and not fragments:
+                    return opcode, payload
+                msg_opcode = opcode
+                fragments = [payload]
+                if fin:
+                    return msg_opcode, b"".join(fragments)
+            elif opcode == 0x0:
+                fragments.append(payload)
+                if fin:
+                    return (msg_opcode if msg_opcode is not None else 0x1), b"".join(fragments)
 
     def _send_ws_frame(self, sock: socket.socket, payload: bytes, opcode: int = 0x1) -> None:
         header = bytearray([0x80 | (opcode & 0x0F)])
@@ -1271,17 +1457,26 @@ class ExtensionWebSocketBridge:
                 self._ready_event.set()
 
             while not self._stopped:
-                opcode, data = self._read_ws_frame(conn)
+                opcode, data = self._read_ws_message(conn)
                 if opcode == 0x8:  # Close
                     break
-                if opcode == 0x9:  # Ping
-                    self._send_ws_frame(conn, data, opcode=0xA)
-                    continue
                 if opcode == 0x1:  # Text
-                    msg = json.loads(data.decode("utf-8", errors="replace"))
-                    if msg.get("type") == "hello":
+                    try:
+                        msg = json.loads(data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    msg_type = msg.get("type")
+                    if msg_type == "hello":
                         self._hello_info = msg
                         self._ready_event.set()
+                        continue
+                    if msg_type and self.on_event is not None:
+                        try:
+                            self.on_event(msg)
+                        except Exception:
+                            pass
                         continue
                     req_id = msg.get("id")
                     if req_id is not None:
@@ -1328,10 +1523,19 @@ class ExtensionWebSocketBridge:
             with self._pending_lock:
                 self._pending.pop(req_id, None)
             raise ConnectionError(f"Failed sending to extension bridge: {exc}") from exc
-        if not ev.wait(timeout=timeout):
-            with self._pending_lock:
-                self._pending.pop(req_id, None)
-            raise TimeoutError(f"Extension bridge RPC '{method}' timed out after {timeout}s")
+        deadline = time.monotonic() + timeout
+        while True:
+            if is_user_stopped():
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
+                raise RuntimeError(USER_STOPPED_ERROR)
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
+                raise TimeoutError(f"Extension bridge RPC '{method}' timed out after {timeout}s")
+            if ev.wait(timeout=min(0.05, rem)):
+                break
         if len(box) >= 2 and box[1]:
             raise RuntimeError(str(box[1]))
         return box[0] if box else None
@@ -1380,12 +1584,14 @@ class _ExtensionPageAdapter:
         initial_url: str = "about:blank",
         initial_title: str = "",
         window_id: int | None = None,
+        on_preview: Callable[[dict[str, Any], str], None] | None = None,
     ) -> None:
         self._bridge = bridge
         self.chrome_tab_id = chrome_tab_id
         self.url = initial_url
         self.title = initial_title
         self.window_id = window_id
+        self._on_preview = on_preview
         self._closed = False
 
     def is_closed(self) -> bool:
@@ -1394,7 +1600,12 @@ class _ExtensionPageAdapter:
     def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = 15000) -> dict[str, Any]:
         res = self._bridge.call_rpc(
             "navigate",
-            {"tabId": self.chrome_tab_id, "url": url, "timeoutMs": timeout},
+            {
+                "tabId": self.chrome_tab_id,
+                "url": url,
+                "timeoutMs": timeout,
+                "skipPreview": not _preview_enabled(),
+            },
             timeout=max(5.0, timeout / 1000.0 + 2.0),
         )
         if isinstance(res, dict) and res.get("url"):
@@ -1403,6 +1614,11 @@ class _ExtensionPageAdapter:
             self.url = url
         if isinstance(res, dict) and "title" in res:
             self.title = str(res.get("title") or "")
+        if isinstance(res, dict) and isinstance(res.get("preview"), dict) and self._on_preview is not None:
+            try:
+                self._on_preview(res["preview"], self.url)
+            except Exception:
+                pass
         return res or {"url": self.url}
 
     def set_input_files(self, selector: str, files: str | list[str]) -> dict[str, Any]:
@@ -1422,15 +1638,23 @@ class _ExtensionPageAdapter:
                 {"tabId": self.chrome_tab_id, "expression": expr_str, "runtimeInit": True},
             )
         if "window.__fmu.executeBatch" in expr_str and isinstance(arg, dict):
+            batch_arg = dict(arg)
+            if not _preview_enabled():
+                batch_arg["skipPreview"] = True
             res = self._bridge.call_rpc(
                 "executeBatch",
-                {**arg, "tabId": self.chrome_tab_id, "runtimeJs": IN_PAGE_RUNTIME_JS},
+                {**batch_arg, "tabId": self.chrome_tab_id, "runtimeJs": IN_PAGE_RUNTIME_JS},
             )
             if isinstance(res, dict):
                 if res.get("url"):
                     self.url = str(res["url"])
                 if "title" in res:
                     self.title = str(res.get("title") or "")
+                if isinstance(res.get("preview"), dict) and self._on_preview is not None:
+                    try:
+                        self._on_preview(res["preview"], self.url)
+                    except Exception:
+                        pass
             return res
         return self._bridge.call_rpc(
             "evaluate",
@@ -1508,6 +1732,12 @@ class BrowserTabSession:
         self._focus_emulated = False
         self._ocr_populated = False
         self._last_ocr_items: list[dict[str, Any]] = []
+        self._screencast_attached = False
+        self._screencast_running = False
+        self._last_preview_push_mono = 0.0
+        self.last_preview_path: str | None = None
+        self.last_vw: int = 1280
+        self.last_vh: int = 800
 
     def enable_background_focus_emulation(self) -> None:
         if self._focus_emulated:
@@ -1524,6 +1754,80 @@ class BrowserTabSession:
         except Exception:
             pass
         self._focus_emulated = True
+
+    def start_playwright_screencast(self) -> None:
+        # Playwright Python sync_api uses greenlet fiber switching; calling cdp.send()
+        # inside a cdp.on("Page.screencastFrame") callback is re-entrant and leaves frames
+        # unacknowledged during page.evaluate(), backpressuring Chromium's compositor
+        # requestAnimationFrame(). On Playwright tabs we push crisp Page.captureScreenshot
+        # frames on navigation, mid-batch boundaries, and post-batch completion instead.
+        return
+
+    def stop_playwright_screencast(self) -> None:
+        return
+
+    def capture_viewport_preview(self) -> str | None:
+        if not _preview_enabled():
+            return None
+        try:
+            if self.is_extension:
+                chrome_tid = getattr(self._raw_page, "chrome_tab_id", None)
+                if not chrome_tid:
+                    return self.last_preview_path
+                prev = self._engine._ext_bridge.call_rpc(
+                    "capturePreview", {"tabId": chrome_tid, "maxWidth": 1440}, timeout=1.5
+                )
+                if isinstance(prev, dict) and isinstance(prev.get("jpeg"), str):
+                    p_path = _write_web_preview_b64(prev["jpeg"])
+                    if p_path:
+                        self.last_preview_path = p_path
+                        if prev.get("vw"):
+                            self.last_vw = int(prev["vw"])
+                        if prev.get("vh"):
+                            self.last_vh = int(prev["vh"])
+                        return p_path
+                return self.last_preview_path
+
+            page_x = 0.0
+            page_y = 0.0
+            vw = self.last_vw or 1280
+            vh = self.last_vh or 800
+            try:
+                metrics = self._raw_cdp.send("Page.getLayoutMetrics", {})
+                vp = (metrics or {}).get("cssVisualViewport") or (metrics or {}).get("visualViewport") or {}
+                if float(vp.get("clientWidth") or 0) > 80 and float(vp.get("clientHeight") or 0) > 60:
+                    page_x = max(0.0, float(vp.get("pageX") or 0.0))
+                    page_y = max(0.0, float(vp.get("pageY") or 0.0))
+                    vw = int(round(float(vp["clientWidth"])))
+                    vh = int(round(float(vp["clientHeight"])))
+            except Exception:
+                pass
+            scale = min(1.0, max(0.25, 1440.0 / max(320, vw)))
+            shot = self._raw_cdp.send(
+                "Page.captureScreenshot",
+                {
+                    "format": "jpeg",
+                    "quality": 68,
+                    "optimizeForSpeed": True,
+                    "clip": {
+                        "x": page_x,
+                        "y": page_y,
+                        "width": vw,
+                        "height": vh,
+                        "scale": scale,
+                    },
+                },
+            )
+            b64_data = shot.get("data") if isinstance(shot, dict) else None
+            p_path = _write_web_preview_b64(b64_data)
+            if p_path:
+                self.last_preview_path = p_path
+                self.last_vw = vw
+                self.last_vh = vh
+                return p_path
+        except Exception:
+            pass
+        return self.last_preview_path
 
     def ensure_runtime(self) -> None:
         self._raw_page.evaluate(IN_PAGE_RUNTIME_JS)
@@ -1544,20 +1848,159 @@ class BrowserEngine:
         self._agent_colors: dict[str, str] = {}
         self._ext_bridge_inst: ExtensionWebSocketBridge | None = None
         self._bridge_lock = threading.Lock()
+        self._init_mono: float = time.monotonic()
+        self._preview_lock = threading.Lock()
+        self._preview_seq: int = 0
+        self._preview_timer: threading.Timer | None = None
 
-        self._cmd_q: queue.Queue[tuple[Callable[[], Any], threading.Event, list[Any]] | None] = queue.Queue()
+        self._cmd_q: queue.Queue[tuple[Callable[[], Any], threading.Event | None, list[Any] | None] | None] = queue.Queue()
         self._worker_tid: int = 0
         self._worker = threading.Thread(target=self._worker_loop, name="fmu-pw-worker", daemon=True)
         self._worker.start()
+
+    def _cancel_pending_preview(self) -> int:
+        with self._preview_lock:
+            self._preview_seq += 1
+            if self._preview_timer is not None:
+                self._preview_timer.cancel()
+                self._preview_timer = None
+            return self._preview_seq
+
+    def _schedule_async_preview(
+        self,
+        sess: BrowserTabSession,
+        *,
+        target: str,
+        op: str,
+        cur_info: dict[str, Any] | None = None,
+        is_headless: bool = False,
+        delay_s: float = 0.035,
+    ) -> None:
+        if not _preview_enabled() or sess.is_extension:
+            return
+        cx = int(cur_info["x"]) if cur_info and cur_info.get("x") is not None else None
+        cy = int(cur_info["y"]) if cur_info and cur_info.get("y") is not None else None
+        cl = str(cur_info.get("label") or cur_info.get("uid") or "") if cur_info else None
+
+        def _capture_on_worker() -> None:
+            with self._preview_lock:
+                if seq != self._preview_seq:
+                    return
+            if not self._cmd_q.empty() or is_user_stopped():
+                return
+            if sess not in self._tabs.values() or not self._is_session_alive(sess):
+                return
+            p_path = sess.capture_viewport_preview()
+            if p_path:
+                notify_menubar_status(
+                    "frame",
+                    surface="web",
+                    target=target,
+                    op=op,
+                    cursor_x=cx,
+                    cursor_y=cy,
+                    cursor_label=cl,
+                    win_w=sess.last_vw,
+                    win_h=sess.last_vh,
+                    preview_path=p_path,
+                    is_headless=is_headless,
+                )
+
+        def _enqueue_if_current() -> None:
+            with self._preview_lock:
+                if seq != self._preview_seq:
+                    return
+                self._preview_timer = None
+            if self._cmd_q.empty() and not is_user_stopped():
+                self._cmd_q.put((_capture_on_worker, None, None))
+
+        with self._preview_lock:
+            self._preview_seq += 1
+            seq = self._preview_seq
+            if self._preview_timer is not None:
+                self._preview_timer.cancel()
+            tmr = threading.Timer(delay_s, _enqueue_if_current)
+            tmr.daemon = True
+            self._preview_timer = tmr
+            tmr.start()
 
     @property
     def _ext_bridge(self) -> ExtensionWebSocketBridge:
         with self._bridge_lock:
             if self._ext_bridge_inst is None:
-                self._ext_bridge_inst = ExtensionWebSocketBridge()
+                self._ext_bridge_inst = ExtensionWebSocketBridge(on_event=self._on_extension_event)
             else:
+                self._ext_bridge_inst.on_event = self._on_extension_event
                 self._ext_bridge_inst.ensure_preferred_port()
             return self._ext_bridge_inst
+
+    def _on_extension_event(self, msg: dict[str, Any]) -> None:
+        if msg.get("type") != "screencastFrame":
+            return
+        b64_data = msg.get("data")
+        if not isinstance(b64_data, str) or len(b64_data) < 64:
+            return
+        p_path = _write_web_preview_b64(b64_data)
+        if not p_path:
+            return
+        chrome_tid = msg.get("tabId")
+        matched_sess: BrowserTabSession | None = None
+        for s in list(self._tabs.values()):
+            if s.is_extension and getattr(s._raw_page, "chrome_tab_id", None) == chrome_tid:
+                matched_sess = s
+                break
+        vw = int(msg.get("vw") or (matched_sess.last_vw if matched_sess else 1280) or 1280)
+        vh = int(msg.get("vh") or (matched_sess.last_vh if matched_sess else 800) or 800)
+        if matched_sess is not None:
+            matched_sess.last_preview_path = p_path
+            if vw > 80:
+                matched_sess.last_vw = vw
+            if vh > 60:
+                matched_sess.last_vh = vh
+            target_label = _short_menubar_target(matched_sess.last_url)
+        else:
+            target_label = "Chrome"
+        notify_menubar_status(
+            "frame",
+            surface="web",
+            target=target_label,
+            preview_path=p_path,
+            win_w=vw,
+            win_h=vh,
+            is_headless=False,
+        )
+
+    def _apply_inline_preview(
+        self,
+        sess: BrowserTabSession,
+        preview_dict: Any,
+        url_hint: str | None = None,
+        push_frame: bool = True,
+    ) -> str | None:
+        if not isinstance(preview_dict, dict):
+            return sess.last_preview_path
+        b64_data = preview_dict.get("jpeg") or preview_dict.get("data")
+        p_path = _write_web_preview_b64(b64_data if isinstance(b64_data, str) else None)
+        if not p_path:
+            return sess.last_preview_path
+        sess.last_preview_path = p_path
+        vw = int(preview_dict.get("vw") or sess.last_vw or 1280)
+        vh = int(preview_dict.get("vh") or sess.last_vh or 800)
+        if vw > 80:
+            sess.last_vw = vw
+        if vh > 60:
+            sess.last_vh = vh
+        if push_frame:
+            notify_menubar_status(
+                "frame",
+                surface="web",
+                target=_short_menubar_target(url_hint or sess.last_url),
+                preview_path=p_path,
+                win_w=vw,
+                win_h=vh,
+                is_headless=False,
+            )
+        return p_path
 
     def ensure_bridge(self) -> ExtensionWebSocketBridge:
         return self._ext_bridge
@@ -1806,6 +2249,14 @@ class BrowserEngine:
             if item is None:
                 break
             fn, ev, box = item
+            if ev is None or box is None:
+                if not self._cmd_q.empty():
+                    continue
+                try:
+                    fn()
+                except Exception:
+                    pass
+                continue
             try:
                 box.append(fn())
                 box.append(None)
@@ -2020,6 +2471,7 @@ class BrowserEngine:
         window: str | None = None,
         window_id: int | None = None,
         reuse_existing: bool = False,
+        reattach: bool = False,
     ) -> bool:
         explicit_ext = mode in ("extension", "chrome-extension", "live") or require_extension
         if mode == "headless" and not explicit_ext:
@@ -2042,6 +2494,15 @@ class BrowserEngine:
             if not self._ext_bridge.is_connected():
                 raise RuntimeError(self._extension_diagnostic_error())
             return True
+        if (
+            reattach
+            and mode == "chrome"
+            and use_ext_env
+            and self._ext_bridge_inst is not None
+            and not self._ext_bridge.is_connected()
+            and (time.monotonic() - self._init_mono) < 5.0
+        ):
+            self._ext_bridge.wait_connected(timeout=0.45)
         if not use_ext_env or self._ext_bridge_inst is None or not self._ext_bridge.is_connected():
             return False
         return True
@@ -2057,7 +2518,10 @@ class BrowserEngine:
         window_id: int | None = None,
         reuse_existing: bool = False,
         require_extension: bool = False,
+        reattach: bool = False,
+        schedule_preview: bool = True,
     ) -> BrowserTabSession:
+        self._cancel_pending_preview()
         tid = tab_id or f"t{self._next_tab_num}"
         effective_url = url or self._tab_last_urls.get(tid) or "about:blank"
         must_use_ext = (
@@ -2096,6 +2560,7 @@ class BrowserEngine:
             window=window,
             window_id=window_id,
             reuse_existing=reuse_existing,
+            reattach=reattach,
         ):
             try:
                 rpc_params: dict[str, Any] = {
@@ -2103,6 +2568,7 @@ class BrowserEngine:
                     "sessionId": tid,
                     "sessionName": session_name,
                     "color": group_color,
+                    "skipPreview": not _preview_enabled(),
                 }
                 if window:
                     rpc_params["window"] = str(window)
@@ -2110,18 +2576,27 @@ class BrowserEngine:
                     rpc_params["windowId"] = int(window_id)
                 if reuse_existing:
                     rpc_params["reuseExisting"] = True
+                if reattach:
+                    rpc_params["reattach"] = True
                 ext_res = self._ext_bridge.call_rpc("createBrowserTab", rpc_params)
                 chrome_tab_id = int(ext_res.get("tabId", 1))
                 chrome_win_id = ext_res.get("windowId")
                 actual_url = str(ext_res.get("url") or effective_url)
                 actual_title = str(ext_res.get("title") or "")
                 self._next_tab_num += 1
+                sess_holder: list[BrowserTabSession] = []
+
+                def _handle_ext_preview(prev_obj: dict[str, Any], u_hint: str) -> None:
+                    if sess_holder:
+                        self._apply_inline_preview(sess_holder[0], prev_obj, url_hint=u_hint, push_frame=True)
+
                 ext_page = _ExtensionPageAdapter(
                     self._ext_bridge,
                     chrome_tab_id,
                     initial_url=actual_url,
                     initial_title=actual_title,
                     window_id=int(chrome_win_id) if chrome_win_id is not None else None,
+                    on_preview=_handle_ext_preview,
                 )
                 ext_cdp = _ExtensionCdpAdapter(self._ext_bridge, chrome_tab_id)
                 sess = BrowserTabSession(
@@ -2135,14 +2610,17 @@ class BrowserEngine:
                     last_title=actual_title,
                     is_extension=True,
                 )
+                sess_holder.append(sess)
                 self._tabs[tid] = sess
                 self._tab_last_urls[tid] = actual_url
                 if actual_title:
                     self._tab_last_titles[tid] = actual_title
+                if isinstance(ext_res.get("preview"), dict):
+                    self._apply_inline_preview(sess, ext_res["preview"], url_hint=actual_url, push_frame=True)
                 sess.ensure_runtime()
                 return sess
-            except Exception:
-                if must_use_ext:
+            except Exception as exc:
+                if USER_STOPPED_ERROR in str(exc) or is_user_stopped() or must_use_ext:
                     raise
 
         self._ensure_browser_inner(mode=mode)
@@ -2160,12 +2638,21 @@ class BrowserEngine:
             is_extension=False,
         )
         sess.enable_background_focus_emulation()
+        sess.start_playwright_screencast()
         self._tabs[tid] = sess
 
         if effective_url and effective_url != "about:blank":
             page.goto(effective_url, wait_until="domcontentloaded", timeout=15000)
             self._tab_last_urls[tid] = effective_url
             self._try_assign_chrome_tab_group(page.url, session_name, color=group_color)
+            if schedule_preview:
+                self._schedule_async_preview(
+                    sess,
+                    target=_short_menubar_target(page.url),
+                    op="goto",
+                    cur_info=None,
+                    is_headless=(not self._is_cdp_chrome),
+                )
         sess.ensure_runtime()
         return sess
 
@@ -2185,6 +2672,7 @@ class BrowserEngine:
         return self._run_sync(lambda: self._close_tab_inner(tab_id))
 
     def _close_tab_inner(self, tab_id: str) -> str:
+        self._cancel_pending_preview()
         sess = self._tabs.pop(tab_id, None)
         self._tab_last_urls.pop(tab_id, None)
         self._tab_last_titles.pop(tab_id, None)
@@ -2278,6 +2766,8 @@ class BrowserEngine:
                 pass
 
     def execute_batch(self, req: dict[str, Any]) -> str:
+        if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension")) and is_user_stopped():
+            return USER_STOPPED_ERROR
         return self._run_sync(lambda: self._execute_batch_with_retry(req))
 
     def _execute_batch_with_retry(self, req: dict[str, Any]) -> str:
@@ -2286,6 +2776,8 @@ class BrowserEngine:
             return self._execute_batch_inner(req)
         except Exception as exc:
             msg = str(exc)
+            if USER_STOPPED_ERROR in msg or is_user_stopped():
+                return USER_STOPPED_ERROR
             if "MV3 extension not connected on ws://" in msg:
                 record_perf_event(
                     {
@@ -2391,6 +2883,92 @@ class BrowserEngine:
             steps = steps[1:]
 
         restore_url = url or self._tab_last_urls.get(tab_id) or "about:blank"
+        if is_user_stopped():
+            return USER_STOPPED_ERROR
+        mb_target = _short_menubar_target(restore_url)
+        mb_op = (
+            str((steps[0].get("op") or steps[0].get("action") or "")).strip().lower()
+            if steps and isinstance(steps[0], dict)
+            else ("diff" if req.get("diff") else "snap")
+        ) or "work"
+        existing_sess = self._tabs.get(tab_id)
+        initial_prev = existing_sess.last_preview_path if existing_sess is not None else None
+        initial_vw = existing_sess.last_vw if existing_sess is not None else None
+        initial_vh = existing_sess.last_vh if existing_sess is not None else None
+        initial_hl = (
+            (not existing_sess.is_extension and not self._is_cdp_chrome)
+            if existing_sess is not None
+            else (mode == "headless")
+        )
+        notify_menubar_status(
+            "working",
+            surface="web",
+            target=mb_target,
+            op=mb_op,
+            agent=agent_id,
+            step_count=len(steps),
+            preview_path=initial_prev,
+            win_w=initial_vw,
+            win_h=initial_vh,
+            is_headless=initial_hl,
+        )
+        done_payload: dict[str, Any] = {
+            "surface": "web",
+            "target": mb_target,
+            "op": mb_op,
+            "agent": agent_id,
+            "step_count": len(steps),
+            "preview_path": initial_prev,
+            "win_w": initial_vw,
+            "win_h": initial_vh,
+            "is_headless": initial_hl,
+        }
+        try:
+            return self._execute_batch_core(
+                req=req,
+                t0=t0,
+                agent_id=agent_id,
+                tab_id=tab_id,
+                group_name=group_name,
+                group_color=group_color,
+                mode=mode,
+                require_ext=require_ext,
+                window_filter=window_filter,
+                window_id=window_id,
+                reuse_existing=reuse_existing,
+                url=url,
+                steps=steps,
+                restore_url=restore_url,
+                mb_op=mb_op,
+                done_payload=done_payload,
+            )
+        finally:
+            cur_sess = self._tabs.get(tab_id)
+            if cur_sess is not None and not cur_sess.is_extension:
+                cur_sess.stop_playwright_screencast()
+            notify_menubar_status("done", **done_payload)
+
+    def _execute_batch_core(
+        self,
+        *,
+        req: dict[str, Any],
+        t0: float,
+        agent_id: str,
+        tab_id: str,
+        group_name: str,
+        group_color: str,
+        mode: str,
+        require_ext: bool,
+        window_filter: str | None,
+        window_id: int | None,
+        reuse_existing: bool,
+        url: Any,
+        steps: list[dict[str, Any]],
+        restore_url: str,
+        mb_op: str,
+        done_payload: dict[str, Any],
+    ) -> str:
+        self._cancel_pending_preview()
         needs_ext_for_req = (
             require_ext
             or (
@@ -2406,6 +2984,12 @@ class BrowserEngine:
             )
         )
 
+        reattach_candidate = bool(
+            url is None
+            and tab_id not in self._tabs
+            and tab_id not in self._tab_last_urls
+            and (steps or req.get("diff") is not None or req.get("query"))
+        )
         if (
             tab_id not in self._tabs
             or not self._is_session_alive(self._tabs[tab_id])
@@ -2427,9 +3011,12 @@ class BrowserEngine:
                 window_id=window_id,
                 reuse_existing=reuse_existing,
                 require_extension=require_ext,
+                reattach=reattach_candidate,
+                schedule_preview=False,
             )
         else:
             sess = self._tabs[tab_id]
+            sess.start_playwright_screencast()
             if url and url != sess._raw_page.url:
                 sess._raw_page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 sess.last_url = url
@@ -2441,6 +3028,7 @@ class BrowserEngine:
                 self._last_tab_steps.pop(tab_id, None)
 
         sess.enable_background_focus_emulation()
+        sess.start_playwright_screencast()
         sess.ensure_runtime()
         tab_attach_ms = (time.perf_counter() - t0) * 1000.0
         in_page_wall_ms = 0.0
@@ -2501,6 +3089,11 @@ class BrowserEngine:
             if (
                 s.get("files")
                 or (s.get("op") or s.get("action")) in ("upload", "goto", "navigate", "open")
+                or (
+                    str(s.get("op") or s.get("action") or "").lower()
+                    in ("wait", "sleep", "delay", "settle")
+                    and int(s.get("ms") or 0) >= 80
+                )
             )
         ]
 
@@ -2511,9 +3104,45 @@ class BrowserEngine:
             res: dict[str, Any] = {}
             had_pre_on_current_page = False
             for b_idx in boundary_indices:
+                if is_user_stopped():
+                    return USER_STOPPED_ERROR
                 b_step = active_steps[b_idx]
                 b_op = str(b_step.get("op") or b_step.get("action") or "").lower()
-                if b_op in ("goto", "navigate", "open"):
+                if b_op in ("wait", "sleep", "delay", "settle"):
+                    pre_steps = active_steps[last_idx:b_idx]
+                    if pre_steps:
+                        t_ip0 = time.perf_counter()
+                        res = sess._raw_page.evaluate(
+                            "req => window.__fmu.executeBatch(req)",
+                            {
+                                "agent": agent_id,
+                                "steps": pre_steps,
+                                "virtualTools": virtual_tools,
+                                "query": req.get("query") or "",
+                                "diff": req.get("diff"),
+                                "fullTable": req.get("fullTable", False),
+                                "settle": False,
+                                "skipSnapshot": True,
+                            },
+                        )
+                        _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+                        t_esc0 = time.perf_counter()
+                        self._handle_eval_escalations(
+                            sess,
+                            res,
+                            agent_id=agent_id,
+                            query=req.get("query") or "",
+                            full_table=bool(req.get("fullTable", False)),
+                            skip_snapshot=True,
+                        )
+                        escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
+                        combined_errors.extend(res.get("errors") or [])
+                        combined_evals.extend(res.get("evalOutputs") or [])
+                        had_pre_on_current_page = True
+                    wait_ms = int(b_step.get("ms") or 30)
+                    if not interruptible_sleep(wait_ms / 1000.0):
+                        return USER_STOPPED_ERROR
+                elif b_op in ("goto", "navigate", "open"):
                     pre_steps = active_steps[last_idx:b_idx]
                     if pre_steps:
                         t_ip0 = time.perf_counter()
@@ -2612,6 +3241,8 @@ class BrowserEngine:
                     had_pre_on_current_page = True
                 last_idx = b_idx + 1
 
+            if is_user_stopped():
+                return USER_STOPPED_ERROR
             post_steps = active_steps[last_idx:]
             t_ip0 = time.perf_counter()
             res = sess._raw_page.evaluate(
@@ -2641,6 +3272,8 @@ class BrowserEngine:
             res["errors"] = combined_errors + (res.get("errors") or [])
             res["evalOutputs"] = combined_evals + (res.get("evalOutputs") or [])
         else:
+            if is_user_stopped():
+                return USER_STOPPED_ERROR
             t_ip0 = time.perf_counter()
             res = sess._raw_page.evaluate(
                 "req => window.__fmu.executeBatch(req)",
@@ -2665,6 +3298,9 @@ class BrowserEngine:
                 skip_snapshot=False,
             )
             escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
+
+        if is_user_stopped():
+            return USER_STOPPED_ERROR
 
         if (
             req.get("ocr") is not False
@@ -2792,12 +3428,59 @@ class BrowserEngine:
                 },
             }
         )
+        is_headless_tab = not sess.is_extension and not self._is_cdp_chrome
+        preview_file: str | None = sess.last_preview_path
+        if _preview_enabled() and sess in self._tabs.values():
+            if sess.is_extension and isinstance(res.get("preview"), dict):
+                preview_file = self._apply_inline_preview(
+                    sess, res["preview"], url_hint=sess.last_url, push_frame=False
+                )
+
+        final_op = (
+            str(cur_info.get("op") or "")
+            or (
+                str((active_steps[-1].get("op") or active_steps[-1].get("action") or "")).strip().lower()
+                if active_steps and isinstance(active_steps[-1], dict)
+                else mb_op
+            )
+        )
+        vw = int(res.get("vw") or sess.last_vw or 1280)
+        vh = int(res.get("vh") or sess.last_vh or 800)
+        sess.last_vw = vw
+        sess.last_vh = vh
+
+        target_short = _short_menubar_target(sess.last_url)
+        done_payload.update(
+            {
+                "surface": "web",
+                "target": target_short,
+                "op": final_op,
+                "agent": agent_id,
+                "step_count": len(active_steps),
+                "cursor_x": int(cur_info["x"]) if cur_info and cur_info.get("x") is not None else None,
+                "cursor_y": int(cur_info["y"]) if cur_info and cur_info.get("y") is not None else None,
+                "cursor_label": str(cur_info.get("label") or cur_info.get("uid") or "") if cur_info else None,
+                "win_w": vw,
+                "win_h": vh,
+                "preview_path": preview_file,
+                "is_headless": is_headless_tab,
+            }
+        )
+        if _preview_enabled() and not sess.is_extension and sess in self._tabs.values():
+            self._schedule_async_preview(
+                sess,
+                target=target_short,
+                op=final_op,
+                cur_info=cur_info,
+                is_headless=is_headless_tab,
+            )
         return final_out
 
     def reset(self, agent: str | None = None) -> None:
         self._run_sync(lambda: self._reset_inner(agent))
 
     def _reset_inner(self, agent: str | None = None) -> None:
+        self._cancel_pending_preview()
         if agent and agent not in ("default", "all"):
             prefix = f"{agent}:"
             for tid in [k for k in self._tabs if k.startswith(prefix) or k == agent]:
@@ -2829,7 +3512,14 @@ class BrowserEngine:
         self._run_sync(self._shutdown_inner)
 
     def _shutdown_inner(self) -> None:
-        self._reset_inner()
+        self._cancel_pending_preview()
+        for sess in list(self._tabs.values()):
+            if not sess.is_extension:
+                try:
+                    sess._raw_page.close()
+                except Exception:
+                    pass
+        self._tabs.clear()
         self._evict_dead_browser()
         with self._bridge_lock:
             if self._ext_bridge_inst is not None:

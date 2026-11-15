@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import socket
 import threading
 
 ORDERS_HTML = """<!doctype html>
@@ -701,11 +700,8 @@ class _BenchHandler(BaseHTTPRequestHandler):
 
 class BenchWebServer:
     def __init__(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", 0))
-        self.port = sock.getsockname()[1]
-        sock.close()
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), _BenchHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _BenchHandler)
+        self.port = int(self.server.server_address[1])
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     @property

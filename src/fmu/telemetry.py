@@ -21,6 +21,19 @@ from typing import Any
 from urllib.parse import urlparse
 
 DEFAULT_RETENTION_DAYS = 30
+REDACTED_URL_TARGET = "<redacted-url>"
+_SUPPORTED_URL_SCHEMES = {"http", "https", "ws", "wss"}
+_NON_NETWORK_SCHEMES = {
+    "about",
+    "blob",
+    "chrome",
+    "chrome-extension",
+    "data",
+    "javascript",
+    "mailto",
+    "vbscript",
+}
+_SCHEME_PREFIX_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 _PATH_TOKEN_RE = re.compile(r"/(?:Users|private|var|tmp)/[^\s\"';)]+")
 
 _log_queue: queue.SimpleQueue[tuple[Path, str]] = queue.SimpleQueue()
@@ -50,20 +63,68 @@ def sanitize_url_target(raw_url: str | None) -> str:
     if not raw_url:
         return ""
     s = str(raw_url).strip()
+    if not s:
+        return ""
     if s in ("about:blank", "*"):
         return s
-    if s.startswith("file://"):
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in s):
+        return REDACTED_URL_TARGET
+    if s.lower().startswith("file:"):
         return "file://<local>"
+    pre_query = s.split("?", 1)[0].split("#", 1)[0]
+    if "\\" in pre_query:
+        return REDACTED_URL_TARGET
+
+    if s.startswith("//"):
+        candidate = f"https:{s}"
+    elif "://" in s:
+        candidate = s
+    else:
+        m = _SCHEME_PREFIX_RE.match(s)
+        if m:
+            scheme_cand = m.group(1).lower()
+            if scheme_cand in _NON_NETWORK_SCHEMES:
+                return REDACTED_URL_TARGET
+            authority_part = pre_query.split("/", 1)[0]
+            if "@" not in authority_part:
+                port_part = s[m.end() :].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+                if not port_part.isdigit():
+                    return REDACTED_URL_TARGET
+        candidate = f"https://{s}"
+
     try:
-        parsed = urlparse(s if "://" in s else f"https://{s}")
-        host = (parsed.hostname or "").lower()
-        port = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+        parsed = urlparse(candidate)
+        if parsed.scheme.lower() not in _SUPPORTED_URL_SCHEMES:
+            return REDACTED_URL_TARGET
+        netloc = parsed.netloc or ""
+        if "\\" in netloc:
+            return REDACTED_URL_TARGET
+        host = (parsed.hostname or "").lower().strip()
+        if not host:
+            return REDACTED_URL_TARGET
+        hostport = netloc.rsplit("@", 1)[-1]
+        if hostport.startswith("["):
+            bracket_end = hostport.find("]")
+            if bracket_end == -1:
+                return REDACTED_URL_TARGET
+            raw_port_suffix = hostport[bracket_end + 1 :]
+        else:
+            raw_port_suffix = f":{hostport.split(':', 1)[1]}" if ":" in hostport else ""
+        if raw_port_suffix == ":":
+            return REDACTED_URL_TARGET
+        port_num = parsed.port
+        if port_num is not None and not (1 <= port_num <= 65535):
+            return REDACTED_URL_TARGET
+        host_fmt = f"[{host}]" if ":" in host else host
+        port_fmt = f":{port_num}" if port_num is not None and port_num not in (80, 443) else ""
         path = parsed.path or "/"
+        if not path.startswith("/"):
+            path = f"/{path}"
         if len(path) > 64:
             path = path[:61] + "..."
-        return f"{host}{port}{path}" if host else s[:64]
-    except Exception:
-        return s[:64]
+        return f"{host_fmt}{port_fmt}{path}"
+    except ValueError:
+        return REDACTED_URL_TARGET
 
 
 def sanitize_error(err: Any) -> str:

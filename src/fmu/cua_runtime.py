@@ -58,14 +58,25 @@ class ContextWindowTracker:
     turns: list[TurnRecord] = field(default_factory=list)
     mask_stale_snapshots: bool = True
 
+    @staticmethod
+    def _format_masked_output(raw_output: str) -> str:
+        hdr = raw_output.splitlines()[0] if raw_output else "# snapshot"
+        return f"{hdr} [stale snapshot masked]"
+
+    def _should_mask_turn(self, turn_idx: int, up_to_idx: int) -> bool:
+        if not self.mask_stale_snapshots or turn_idx >= up_to_idx:
+            return False
+        target = self.turns[turn_idx]
+        if not target.is_full_snapshot:
+            return False
+        return any(
+            self.turns[later_idx].surface == target.surface
+            for later_idx in range(turn_idx + 1, up_to_idx + 1)
+        )
+
     def record_turn(self, surface: str, output: str) -> TurnRecord:
         lines = output.splitlines()
         is_full = any(l.startswith("@u") or l.startswith("@a") or l.startswith("[") for l in lines[1:])
-        if self.mask_stale_snapshots and len(self.turns) >= 1:
-            for prev in self.turns:
-                if prev.surface == surface and prev.is_full_snapshot and prev.masked_output is None:
-                    hdr = prev.raw_output.splitlines()[0] if prev.raw_output else "# snapshot"
-                    prev.masked_output = f"{hdr} [stale snapshot masked]"
         rec = TurnRecord(
             turn_id=len(self.turns) + 1,
             surface=surface,
@@ -73,6 +84,11 @@ class ContextWindowTracker:
             raw_output=output,
         )
         self.turns.append(rec)
+        last_idx = len(self.turns) - 1
+        for prev_idx in range(last_idx):
+            prev = self.turns[prev_idx]
+            if prev.masked_output is None and self._should_mask_turn(prev_idx, last_idx):
+                prev.masked_output = self._format_masked_output(prev.raw_output)
         return rec
 
     def metrics(self) -> dict[str, int]:
@@ -84,11 +100,12 @@ class ContextWindowTracker:
             unmasked.append(running_u)
             cur_m = self.schema_tokens
             for j in range(idx + 1):
-                if j < idx and self.turns[j].is_full_snapshot:
-                    hdr = self.turns[j].raw_output.splitlines()[0] if self.turns[j].raw_output else ""
-                    cur_m += estimate_tokens(f"{hdr} [masked]")
+                turn_j = self.turns[j]
+                if self._should_mask_turn(j, idx):
+                    rendered = turn_j.masked_output or self._format_masked_output(turn_j.raw_output)
                 else:
-                    cur_m += estimate_tokens(self.turns[j].raw_output)
+                    rendered = turn_j.raw_output
+                cur_m += estimate_tokens(rendered)
             masked.append(cur_m)
         return {
             "turns": len(self.turns),

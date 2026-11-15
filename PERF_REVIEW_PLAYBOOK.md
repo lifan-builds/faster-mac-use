@@ -42,6 +42,7 @@ Or inside `cua` / `agy-cua`:
 
 ## 4. Verification & Sync Checklist After Any Optimization
 
-1. Run the full test suite (`PYTHONPATH=src pytest -q` in `/Users/lfan/Project/faster-mac-use`) — synthetic unit tests automatically isolate `FMU_LOG_DIR` so `~/.fmu/logs/` stays pure field data.
-2. Sync updated runtime files to `/Users/lfan/Project/agent/scripts/fmu/` (`cp src/fmu/*.py /Users/lfan/Project/agent/scripts/fmu/` and `extension/*` if touched), restart the warm daemon (`./bin/fmu --shutdown && ./bin/fmu '{"bridgeStatus": true}'`), and hot-reload the MV3 extension (`./bin/fmu '{"reloadExtension": true}'`) if `extension/` changed.
-3. Run `/Users/lfan/Project/agent/scripts/harness-sync.py snapshot` + `verify`, and write a concise summary of measured before/after latency & token deltas to `/Users/lfan/Project/faster-mac-use/reports/perf/latest.md`.
+1. Run the full test suite (`python3 tests/test_fmu.py` in `/Users/lfan/Project/faster-mac-use`) — synthetic unit tests automatically isolate `FMU_LOG_DIR` so `~/.fmu/logs/` stays pure field data.
+2. Sync updated runtime files to `/Users/lfan/Project/agent/scripts/fmu/` (`cp src/fmu/*.py /Users/lfan/Project/agent/scripts/fmu/` and `extension/*` if touched), hot-reload the MV3 extension (`./bin/fmu '{"reloadExtension": true}'`), restart the warm daemon (`./bin/fmu --shutdown`), and confirm `./bin/fmu '{"code": "return await cua.getBridgeStatus();"}'` reports `connected=true` on the updated `version`.
+3. Run a quick non-destructive live `agy-cua` smoke check over the Chrome MV3 bridge on real pages relevant to the change (closing temporary tabs via `await tab.close()` afterward) rather than relying solely on synthetic local fixtures.
+4. Run `/Users/lfan/Project/agent/scripts/harness-sync.py snapshot` + `verify`, and write a concise summary of measured before/after latency & token deltas to `/Users/lfan/Project/faster-mac-use/reports/perf/latest.md`.

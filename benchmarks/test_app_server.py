@@ -413,9 +413,253 @@ STRICT_CSP_HTML = """<!doctype html>
 """
 
 
+CHECKOUT_HTML_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hosted PCI Checkout</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; margin: 24px; }}
+    .field-row {{ margin-bottom: 12px; }}
+    .pci-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; max-width: 680px; margin: 12px 0; }}
+    .pci-frame {{ width: 310px; height: 42px; border: 1px solid #94a3b8; border-radius: 6px; display: block; }}
+  </style>
+</head>
+<body>
+  <h1>Checkout Payment &amp; Shipping</h1>
+  <div class="field-row">
+    <input id="checkout-email" name="email" placeholder="Email address" aria-label="Email address" value="">
+  </div>
+
+  <div class="pci-grid" id="paymentjs-container">
+    <div id="cc-name-wrap">
+      <label for="cc-name-wrap">Name on Card</label>
+      <iframe id="first-data-payment-field-name" name="first-data-payment-field-name" title="Cardholder Name" class="pci-frame" src="{pci_origin}/pci-frame?field=name"></iframe>
+    </div>
+    <div id="cc-card-wrap">
+      <iframe id="first-data-payment-field-card" name="first-data-payment-field-card" title="Card Number" class="pci-frame" src="{pci_origin}/pci-frame?field=card"></iframe>
+    </div>
+    <div id="cc-exp-wrap">
+      <iframe id="first-data-payment-field-exp" role="presentation" name="first-data-payment-field-exp" title="Expiration Date" class="pci-frame" src="{pci_origin}/pci-frame?field=exp"></iframe>
+    </div>
+    <div id="cc-cvv-wrap">
+      <iframe id="first-data-payment-field-cvv" name="first-data-payment-field-cvv" title="Security Code" class="pci-frame" src="{pci_origin}/pci-frame?field=cvv"></iframe>
+    </div>
+  </div>
+
+  <!-- Non-actionable iframes that must NOT clutter snapshot (even with role="presentation") -->
+  <iframe id="tracking-pixel" role="presentation" title="Stripe Metrics" src="{pci_origin}/pci-frame?pixel=1" style="width:3440px;height:1px;border:0;"></iframe>
+  <iframe id="hidden-beacon" src="{pci_origin}/pci-frame?beacon=1" style="display:none;width:200px;height:40px;"></iframe>
+  <iframe id="same-origin-blank" src="about:blank" style="width:120px;height:30px;border:0;"></iframe>
+
+  <!-- CSS display:contents button like Hertz recent-search card -->
+  <button id="recent-search-btn" type="button" aria-label="Recent search card" style="display:contents;" onclick="document.getElementById('shipping-address').value='YYC Pickup'">
+    <div style="padding:10px;border:1px solid #94a3b8;width:260px;">Calgary International Airport</div>
+  </button>
+
+  <div class="field-row">
+    <input id="shipping-address" name="shippingAddress" placeholder="Shipping Address" aria-label="Shipping Address" value="">
+  </div>
+
+  <button id="place-order-btn" type="button" onclick="window.location.href='/confirmation?order=ORD-991'">Continue to Confirmation</button>
+  <a id="express-nav-link" href="/confirmation?order=ORD-992">Express Checkout Link</a>
+</body>
+</html>
+"""
+
+
+CONFIRMATION_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Order Confirmation</title>
+</head>
+<body>
+  <h1>Booking Confirmed</h1>
+  <div id="confirm-status" role="status">CONFIRMED_READY</div>
+  <a id="back-checkout" href="/checkout">Back to Checkout</a>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    document.getElementById("confirm-status").textContent = "CONFIRMED:" + (params.get("order") || "NONE");
+  </script>
+</body>
+</html>
+"""
+
+
+VEHICLES_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Select a Vehicle — Rental Booking</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    .filters { display: flex; gap: 16px; margin-bottom: 16px; }
+    .vehicle-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; max-width: 920px; }
+    .MuiCard-root {
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      padding: 14px;
+      cursor: pointer;
+      background: #ffffff;
+    }
+    .vehicle-title { font-weight: 700; font-size: 15px; display: block; }
+    .vehicle-meta { color: #475569; font-size: 13px; display: block; margin-top: 4px; }
+    .rate-pill { color: #0f172a; font-weight: 600; margin-top: 8px; display: inline-block; }
+  </style>
+</head>
+<body>
+  <h1>Choose Your Vehicle</h1>
+  <div id="selected-vehicle" role="status">VEHICLE_NONE</div>
+  <div class="filters">
+    <label><input type="checkbox" id="flt-suv" aria-label="SUV"> SUV</label>
+    <label><input type="checkbox" id="flt-ev" aria-label="Electric"> Electric</label>
+  </div>
+  <div id="vehicles-grid" class="vehicle-grid"></div>
+  <footer style="margin-top: 20px;">
+    <a href="#rental-terms">Rental Terms</a>
+  </footer>
+  <script>
+    const FLEET = [
+      ["Economy", "Kia Rio or similar", 42],
+      ["Compact", "Nissan Versa or similar", 45],
+      ["Midsize", "Toyota Corolla or similar", 48],
+      ["Standard", "Volkswagen Jetta or similar", 51],
+      ["Fullsize", "Chevrolet Malibu or similar", 54],
+      ["Compact SUV", "Chevrolet Trax or similar", 57],
+      ["Midsize SUV", "Nissan Rogue or similar", 62],
+      ["Standard SUV", "Ford Edge or similar", 68],
+      ["Fullsize SUV", "Chevrolet Tahoe or similar", 89],
+      ["Luxury Sedan", " Chrysler 300 or similar", 79],
+      ["Electric", "Tesla Model 3 or similar", 66],
+      ["Electric SUV", "Polestar 2 or similar", 72],
+      ["Minivan", "Chrysler Pacifica or similar", 84],
+      ["Convertible", "Ford Mustang or similar", 92],
+      ["Pickup Truck", "RAM 1500 or similar", 76],
+      ["Premium SUV", "GMC Yukon or similar", 109]
+    ];
+
+    function renderVehicles(selectedIdx) {
+      const grid = document.getElementById("vehicles-grid");
+      grid.innerHTML = "";
+      FLEET.forEach(([cat, model, rate], idx) => {
+        const card = document.createElement("div");
+        card.className = "MuiPaper-root MuiCard-root vehicle-card";
+        card.innerHTML = `
+          <div class="MuiCardContent-root">
+            <span class="vehicle-title">${cat} - ${model.trim()}</span>
+            <span class="vehicle-meta">5 Seats · Automatic · Unlimited Miles</span>
+            <div class="rate-pill">Pay Later $${rate}/day${selectedIdx === idx ? " (Selected)" : ""}</div>
+          </div>
+        `;
+        const onSelect = () => {
+          document.getElementById("selected-vehicle").textContent = `SELECTED:${idx + 1}:${cat}:${rate}`;
+          renderVehicles(idx);
+        };
+        card.__reactProps$99fmu = { onClick: onSelect };
+        card.addEventListener("click", onSelect);
+        grid.appendChild(card);
+      });
+    }
+    renderVehicles(-1);
+  </script>
+</body>
+</html>
+"""
+
+RENTAL_BOOKING_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>YYC Rental Reservation Summary</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; margin: 0; padding: 0; }
+    header, main, footer { padding: 14px 20px; }
+    .summary-box { border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+    th, td { border: 1px solid #e2e8f0; padding: 6px 10px; text-align: left; }
+    footer { background: #f8fafc; border-top: 1px solid #e2e8f0; margin-top: 24px; }
+    footer a { display: inline-block; margin-right: 12px; margin-bottom: 6px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Calgary Intl Airport (YYC) Rental</h1>
+  </header>
+  <main>
+    <section id="booking-summary" class="summary-box">
+      <h2>Reservation Confirmed</h2>
+      <p>Confirmation Number: MOCK9042XYZ</p>
+      <p>Estimated Total: CAD 76.29 (Taxes &amp; Airport Concession Included)</p>
+      <div id="promo-banner">No promo code applied</div>
+      <div id="spinner-slot"></div>
+      <div id="breakdown-panel" style="display:none;">Base Rate CAD 54.00 + Concession CAD 22.29</div>
+      <div id="filter-state">Showing: All Vehicles</div>
+    </section>
+
+    <div class="actions">
+      <button id="apply-promo-btn" type="button">Apply Promo</button>
+      <button id="toggle-breakdown-btn" type="button">Toggle Breakdown</button>
+      <button id="pushstate-suv-btn" type="button">Filter SUVs</button>
+    </div>
+
+    <table id="offers-ledger">
+      <thead>
+        <tr><th>Card ID</th><th>Merchant</th><th>Status</th><th>Cashback</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>#mock1001</td><td>Hertz</td><td>Activated</td><td>10% Back</td></tr>
+        <tr><td>#mock1002</td><td>Avis</td><td>Available</td><td>8% Back</td></tr>
+      </tbody>
+    </table>
+  </main>
+
+  <footer role="contentinfo">
+    <a href="#f1" onclick="document.getElementById('filter-state').textContent='FOOTER:Privacy'; return false;">Privacy Policy</a>
+    <a href="#f2">Terms of Use</a>
+    <a href="#f3">Cookie Settings</a>
+    <a href="#f4">Accessibility</a>
+    <a href="#f5">Gold Plus Rewards</a>
+    <a href="#f6">Best Rate Guarantee</a>
+    <a href="#f7">Roadside Assistance</a>
+    <a href="#f8">Travel Agents</a>
+    <a href="#f9">Affiliate Program</a>
+    <a href="#f10">Corporate Fleet</a>
+    <a href="#f11">Sitemap</a>
+    <a href="#f12">Press Room</a>
+    <a href="#f13">Sustainability</a>
+    <a href="#f14">Careers</a>
+    <a href="#f15">Help Center</a>
+    <a href="#f16" onclick="document.getElementById('filter-state').textContent='FOOTER:InvestorRelations'; return false;">Investor Relations</a>
+  </footer>
+
+  <script>
+    document.getElementById("apply-promo-btn").addEventListener("click", () => {
+      const slot = document.getElementById("spinner-slot");
+      slot.innerHTML = '<span class="loading-spinner">Validating CDP 200692...</span>';
+      setTimeout(() => {
+        slot.innerHTML = "";
+        document.getElementById("promo-banner").textContent = "Promo 200692 Applied (-15%)";
+      }, 90);
+    });
+    document.getElementById("toggle-breakdown-btn").addEventListener("click", () => {
+      const p = document.getElementById("breakdown-panel");
+      p.style.display = p.style.display === "none" ? "block" : "none";
+    });
+    document.getElementById("pushstate-suv-btn").addEventListener("click", () => {
+      history.pushState({ vehicle: "suv" }, "", "/rental-booking?vehicle=suv");
+      document.getElementById("filter-state").textContent = "Showing: Midsize SUV";
+    });
+  </script>
+</body>
+</html>
+"""
+
+
 class _BenchHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         strict_csp = False
+        port = self.server.server_address[1]
         if self.path.startswith("/pricing"):
             body = PRICING_HTML
         elif self.path.startswith("/canvas"):
@@ -425,6 +669,21 @@ class _BenchHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/strict-csp"):
             body = STRICT_CSP_HTML
             strict_csp = True
+        elif self.path.startswith("/checkout"):
+            pci_origin = (
+                "https://lib.paymentjs.firstdata.com"
+                if "origin=firstdata" in self.path
+                else f"http://localhost:{port}"
+            )
+            body = CHECKOUT_HTML_TEMPLATE.format(pci_origin=pci_origin)
+        elif self.path.startswith("/pci-frame"):
+            body = "<!doctype html><html><body><input aria-label='Secret PAN'></body></html>"
+        elif self.path.startswith("/confirmation"):
+            body = CONFIRMATION_HTML
+        elif self.path.startswith("/vehicles"):
+            body = VEHICLES_HTML
+        elif self.path.startswith("/rental-booking"):
+            body = RENTAL_BOOKING_HTML
         else:
             body = ORDERS_HTML
         raw = body.encode("utf-8")

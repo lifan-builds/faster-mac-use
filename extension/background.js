@@ -6,6 +6,9 @@ let reconnectTimer = null;
 const sessionGroups = new Map();
 const sessionTabs = new Map();
 const attachedDebuggers = new Set();
+const initializedRuntimeTabs = new Map();
+let cachedRuntimeJs = "";
+let cachedRuntimeVersion = "";
 let activeScreencastTabId = null;
 let screencastIdleTimer = null;
 let lastScreencastPushAt = 0;
@@ -36,11 +39,21 @@ if (chrome.runtime && chrome.runtime.onInstalled) {
 
 function getHostname(rawUrl) {
   try {
-    const u = new URL(String(rawUrl || ""));
+    const u = new URL(normalizeNavUrl(rawUrl));
     return (u.hostname || "").toLowerCase();
   } catch (_) {
     return "";
   }
+}
+
+function hasUrlScheme(rawUrl) {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(String(rawUrl || "").trim());
+}
+
+function normalizeNavUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (!s || s === "about:blank") return s || "about:blank";
+  return hasUrlScheme(s) ? s : `https://${s}`;
 }
 
 async function findGroupWindowId(sessionName = "🤖 Agent", targetWindowId = undefined) {
@@ -171,9 +184,18 @@ if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
       attachedDebuggers.delete(source.tabId);
+      initializedRuntimeTabs.delete(source.tabId);
       if (activeScreencastTabId === source.tabId) {
         activeScreencastTabId = null;
       }
+    }
+  });
+}
+
+if (chrome.tabs && chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addListener === "function") {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo && changeInfo.status === "loading") {
+      initializedRuntimeTabs.delete(tabId);
     }
   });
 }
@@ -329,6 +351,190 @@ function scheduleAsyncPreviewPush(tabId, delayMs = 30) {
 
 const UPLOAD_FILE_URL_ERR = 'upload failed: enable "Allow access to file URLs" for the fmu extension in chrome://extensions';
 
+const NON_EXPR_STMT_RE = /^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b/;
+
+function isNavigationError(err) {
+  const msg = String((err && err.message) || err || "").toLowerCase();
+  if (
+    msg.includes("inspected target navigated or closed")
+    || msg.includes("inspected target navigated")
+    || msg.includes("execution context was destroyed")
+    || msg.includes("most likely because of a navigation")
+    || msg.includes("cannot find context with specified id")
+    || msg.includes("frame with the given id was not found")
+    || msg.includes("frame was detached")
+    || msg.includes("navigating frame was detached")
+  ) {
+    return true;
+  }
+  return msg.includes("-32000") && msg.includes("navigat");
+}
+
+async function waitForNavigationSettlement(tabId, prevUrl = "", timeoutMs = 10000) {
+  if (!chrome.tabs || typeof chrome.tabs.get !== "function") {
+    await new Promise(r => setTimeout(r, 80));
+    try { await ensureDebuggerAndFocusEmulation(tabId); } catch (_) {}
+    return { alive: true, url: "", title: "" };
+  }
+  const commitDeadline = Date.now() + 180;
+  while (Date.now() < commitDeadline) {
+    let t = null;
+    try {
+      t = await chrome.tabs.get(tabId);
+    } catch (_) {
+      return { alive: false, url: "", title: "" };
+    }
+    if (!t) return { alive: false, url: "", title: "" };
+    const curUrl = String(t.url || "");
+    const pendingUrl = String(t.pendingUrl || "");
+    if (t.status === "loading" || pendingUrl || (prevUrl && curUrl && curUrl !== prevUrl)) {
+      break;
+    }
+    await new Promise(r => setTimeout(r, 20));
+  }
+  await waitForTabLoad(tabId, timeoutMs);
+  let finalTab = null;
+  try {
+    finalTab = await chrome.tabs.get(tabId);
+  } catch (_) {
+    return { alive: false, url: "", title: "" };
+  }
+  if (!finalTab) return { alive: false, url: "", title: "" };
+  attachedDebuggers.delete(tabId);
+  try { await ensureDebuggerAndFocusEmulation(tabId); } catch (_) {}
+  return {
+    alive: true,
+    url: String(finalTab.url || finalTab.pendingUrl || ""),
+    title: String(finalTab.title || "")
+  };
+}
+
+function scanJsTopLevel(rawCode) {
+  const src = String(rawCode || "").trim();
+  const n = src.length;
+  let inStr = null;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let escape = false;
+  let depth = 0;
+  let hasTopReturn = false;
+  const semiPositions = [];
+
+  for (let i = 0; i < n; i++) {
+    const ch = src[i];
+    const nxt = i + 1 < n ? src[i + 1] : "";
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && nxt === "/") {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (inStr !== null) {
+      if (ch === "\\") escape = true;
+      else if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === "/" && nxt === "/") {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "/" && nxt === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      inStr = ch;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") {
+      depth++;
+      continue;
+    }
+    if (ch === ")" || ch === "]" || ch === "}") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth === 0) {
+      if (ch === ";") {
+        semiPositions.push(i);
+      } else if (
+        ch === "r"
+        && src.slice(i, i + 6) === "return"
+        && (i === 0 || !/[a-zA-Z0-9_$.]/.test(src[i - 1]))
+        && (i + 6 >= n || !/[a-zA-Z0-9_$]/.test(src[i + 6]))
+      ) {
+        hasTopReturn = true;
+      }
+    }
+  }
+
+  let trimmed = src;
+  while (trimmed.endsWith(";")) {
+    trimmed = trimmed.slice(0, -1).trimEnd();
+  }
+  let lastSemi = -1;
+  for (let i = 0; i < semiPositions.length; i++) {
+    const pos = semiPositions[i];
+    if (pos < trimmed.length && trimmed.slice(pos + 1).trim().length > 0) {
+      lastSemi = pos;
+    }
+  }
+  const tailStmt = lastSemi >= 0 ? trimmed.slice(lastSemi + 1).trim() : trimmed;
+  let tailHasAssign = false;
+  if (tailStmt) {
+    let tStr = null;
+    let tEsc = false;
+    let tDepth = 0;
+    for (let i = 0; i < tailStmt.length; i++) {
+      const ch = tailStmt[i];
+      if (tEsc) { tEsc = false; continue; }
+      if (tStr !== null) {
+        if (ch === "\\") tEsc = true;
+        else if (ch === tStr) tStr = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") { tStr = ch; continue; }
+      if (ch === "(" || ch === "[" || ch === "{") tDepth++;
+      else if (ch === ")" || ch === "]" || ch === "}") tDepth = Math.max(0, tDepth - 1);
+      else if (ch === "=" && tDepth === 0) {
+        const prev = i > 0 ? tailStmt[i - 1] : "";
+        const next = i + 1 < tailStmt.length ? tailStmt[i + 1] : "";
+        if (prev !== "=" && prev !== "!" && prev !== "<" && prev !== ">" && next !== "=" && next !== ">") {
+          tailHasAssign = true;
+          break;
+        }
+      }
+    }
+  }
+  return { code: String(rawCode || ""), trimmed, hasTopReturn, lastSemi, tailHasAssign };
+}
+
+function buildEvalCandidates(rawCode) {
+  const info = scanJsTopLevel(rawCode);
+  if (!info.trimmed || info.hasTopReturn) return [info.code];
+  const out = [`return (\n${info.trimmed}\n)`];
+  if (info.lastSemi >= 0) {
+    const prefix = info.trimmed.slice(0, info.lastSemi + 1);
+    const lastStmt = info.trimmed.slice(info.lastSemi + 1).trim();
+    if (lastStmt && !NON_EXPR_STMT_RE.test(lastStmt) && !info.tailHasAssign) {
+      out.push(`${prefix}\nreturn (\n${lastStmt}\n);`);
+    }
+  }
+  out.push(info.code);
+  return out;
+}
+
 async function evalInTab(tabId, expression, awaitPromise = true) {
   const res = await sendDebuggerCommand(tabId, "Runtime.evaluate", {
     expression,
@@ -343,17 +549,32 @@ async function evalInTab(tabId, expression, awaitPromise = true) {
 }
 
 async function evalStepCodeOnTab(tabId, rawCode) {
-  const code = String(rawCode || "");
-  const body = code.includes("return ") ? code : `return (${code}\n)`;
-  try {
-    return await evalInTab(tabId, `(async () => {\n${body}\n})()`, true);
-  } catch (err) {
-    const msg = String((err && err.message) || err || "");
-    if (!code.includes("return ") && msg.includes("SyntaxError")) {
-      return await evalInTab(tabId, `(async () => {\n${code}\n})()`, true);
+  const candidates = buildEvalCandidates(rawCode);
+  let lastErr = null;
+  for (let i = 0; i < candidates.length; i++) {
+    const body = candidates[i];
+    const expr = `(async () => {\n  const __fmuRun = async () => {\n${body}\n  };\n  const __val = await __fmuRun();\n  if (__val === undefined) return { __fmuEvalBox: true, hasValue: false, text: "", raw: null };\n  if (typeof __val === "string") return { __fmuEvalBox: true, hasValue: true, text: __val, raw: __val };\n  if (__val === null || typeof __val === "number" || typeof __val === "boolean") return { __fmuEvalBox: true, hasValue: true, text: String(__val), raw: __val };\n  if (typeof __val === "bigint") return { __fmuEvalBox: true, hasValue: true, text: String(__val), raw: String(__val) };\n  try {\n    const __seen = new WeakSet();\n    const __s = JSON.stringify(__val, (_k, v) => {\n      if (typeof v === "bigint") return String(v);\n      if (v && typeof v === "object") { if (__seen.has(v)) return "[Circular]"; __seen.add(v); }\n      return v;\n    });\n    if (__s !== undefined) return { __fmuEvalBox: true, hasValue: true, text: __s, raw: JSON.parse(__s) };\n  } catch (_) {}\n  const __fallback = String(__val);\n  return { __fmuEvalBox: true, hasValue: true, text: __fallback, raw: __fallback };\n})()`;
+    try {
+      const val = await evalInTab(tabId, expr, true);
+      if (val && typeof val === "object" && val.__fmuEvalBox === true) {
+        return val;
+      }
+      if (val === undefined) {
+        return { __fmuEvalBox: true, hasValue: false, text: "", raw: null };
+      }
+      const txt = typeof val === "string" ? val : JSON.stringify(val);
+      return { __fmuEvalBox: true, hasValue: true, text: txt, raw: val };
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err && err.message) || err || "");
+      if (i + 1 < candidates.length && msg.includes("SyntaxError")) {
+        continue;
+      }
+      throw err;
     }
-    throw err;
   }
+  if (lastErr) throw lastErr;
+  return { __fmuEvalBox: true, hasValue: false, text: "", raw: null };
 }
 
 async function setInputFilesOnTab(tabId, selector, files) {
@@ -450,8 +671,10 @@ async function handleRpc(msg) {
         color = "blue",
         window: windowFilter,
         windowId: explicitWindowId,
+        chromeTabId: explicitChromeTabId,
         reuseExisting = false,
         reattach = false,
+        navigateIfReused = false,
         timeoutMs = 10000
       } = params;
 
@@ -460,6 +683,39 @@ async function handleRpc(msg) {
         : [];
       const wf = String(windowFilter || "").trim().toLowerCase();
       let filterMatchedWindowId = undefined;
+
+      if (explicitChromeTabId !== undefined && explicitChromeTabId !== null) {
+        const targetCid = Number(explicitChromeTabId);
+        let directTab = allTabs.find(t => t.id === targetCid) || null;
+        if (!directTab && chrome.tabs && typeof chrome.tabs.get === "function") {
+          try { directTab = await chrome.tabs.get(targetCid); } catch (_) {}
+        }
+        if (!directTab || directTab.id === undefined) {
+          throw new Error(`No Chrome tab found with tabId=${targetCid}`);
+        }
+        const groupId = params.assignGroup === false
+          ? directTab.groupId
+          : await ensureAgentGroup(directTab.id, sessionName, color, directTab.windowId);
+        sessionTabs.set(sessionId, directTab.id);
+        if (params.focusEmulation !== false) {
+          try { await ensureDebuggerAndFocusEmulation(directTab.id); } catch (_) {}
+        }
+        if (params.skipPreview !== true) {
+          scheduleAsyncPreviewPush(directTab.id);
+        }
+        return {
+          id,
+          result: {
+            tabId: directTab.id,
+            windowId: directTab.windowId,
+            groupId,
+            sessionName,
+            reused: true,
+            url: directTab.url || directTab.pendingUrl || "about:blank",
+            title: directTab.title || ""
+          }
+        };
+      }
 
       if (reattach && (!url || url === "about:blank")) {
         let reattachedTab = null;
@@ -520,16 +776,43 @@ async function handleRpc(msg) {
         if (wfTabs.length > 0) {
           filterMatchedWindowId = wfTabs[0].windowId;
           if (reuseExisting) {
-            const exactUrlMatch = (url && url !== "about:blank")
-              ? wfTabs.find(t => String(t.url || t.pendingUrl || "").startsWith(url))
+            const urlStr = String(url || "").trim();
+            const urlLower = urlStr.toLowerCase();
+            const exactUrlMatch = (urlStr && urlStr !== "about:blank")
+              ? wfTabs.find(t => {
+                  const tu = String(t.url || t.pendingUrl || "");
+                  return tu.startsWith(urlStr) || tu.toLowerCase().includes(urlLower);
+                })
               : null;
             const match = exactUrlMatch || wfTabs[0];
             if (match && match.id !== undefined) {
               const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
               sessionTabs.set(sessionId, match.id);
-              if (url && url !== "about:blank" && match.url !== url) {
-                await chrome.tabs.update(match.id, { url, active: false });
-                await waitForTabLoad(match.id, timeoutMs, url);
+              const curMatchUrl = String(match.url || match.pendingUrl || "");
+              const alreadyMatchesUrl = !urlStr
+                || urlStr === "about:blank"
+                || !hasUrlScheme(urlStr)
+                || curMatchUrl === urlStr
+                || curMatchUrl.startsWith(urlStr)
+                || curMatchUrl.toLowerCase().includes(urlLower)
+                || (getHostname(curMatchUrl) && getHostname(curMatchUrl) === getHostname(urlStr) && !navigateIfReused);
+              let finalReusedUrl = curMatchUrl || urlStr;
+              let finalReusedTitle = match.title || "";
+              if (navigateIfReused || (!alreadyMatchesUrl && hasUrlScheme(urlStr))) {
+                const targetNavUrl = normalizeNavUrl(urlStr);
+                initializedRuntimeTabs.delete(match.id);
+                await chrome.tabs.update(match.id, { url: targetNavUrl, active: false });
+                await waitForTabLoad(match.id, timeoutMs, targetNavUrl);
+                finalReusedUrl = targetNavUrl;
+                if (chrome.tabs && typeof chrome.tabs.get === "function") {
+                  try {
+                    const rt = await chrome.tabs.get(match.id);
+                    if (rt) {
+                      finalReusedUrl = rt.url || rt.pendingUrl || finalReusedUrl;
+                      finalReusedTitle = rt.title || finalReusedTitle;
+                    }
+                  } catch (_) {}
+                }
               }
               if (params.focusEmulation !== false) {
                 try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
@@ -545,8 +828,8 @@ async function handleRpc(msg) {
                   groupId,
                   sessionName,
                   reused: true,
-                  url: url !== "about:blank" ? url : (match.url || match.pendingUrl || url),
-                  title: match.title || ""
+                  url: finalReusedUrl,
+                  title: finalReusedTitle
                 }
               };
             }
@@ -554,10 +837,13 @@ async function handleRpc(msg) {
         }
       } else if (reuseExisting && url && url !== "about:blank") {
         const urlLower = String(url).toLowerCase();
+        const wantHost = getHostname(url);
         const match = allTabs.find(t => {
           if (explicitWindowId !== undefined && t.windowId !== explicitWindowId) return false;
           const tUrl = String(t.url || t.pendingUrl || "");
-          return tUrl.startsWith(url) || tUrl.toLowerCase().includes(urlLower);
+          if (tUrl.startsWith(url) || tUrl.toLowerCase().includes(urlLower)) return true;
+          if (!hasUrlScheme(url) && wantHost && getHostname(tUrl) === wantHost) return true;
+          return false;
         });
         if (match && match.id !== undefined) {
           const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
@@ -576,10 +862,44 @@ async function handleRpc(msg) {
               groupId,
               sessionName,
               reused: true,
-              url: match.url || match.pendingUrl || url,
+              url: match.url || match.pendingUrl || normalizeNavUrl(url),
               title: match.title || ""
             }
           };
+        }
+      } else if (reuseExisting && (!url || url === "about:blank")) {
+        const { groupId: existingGid } = await findGroupWindowId(sessionName, explicitWindowId);
+        if (existingGid !== undefined) {
+          const groupTabs = allTabs.filter(t => t.groupId === existingGid);
+          const nonBlank = groupTabs.filter(t => {
+            const u = String(t.url || t.pendingUrl || "");
+            return u && u !== "about:blank" && !u.startsWith("chrome://newtab");
+          });
+          const match = nonBlank.length > 0
+            ? nonBlank[nonBlank.length - 1]
+            : (groupTabs.length > 0 ? groupTabs[groupTabs.length - 1] : null);
+          if (match && match.id !== undefined) {
+            const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
+            sessionTabs.set(sessionId, match.id);
+            if (params.focusEmulation !== false) {
+              try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
+            }
+            if (params.skipPreview !== true) {
+              scheduleAsyncPreviewPush(match.id);
+            }
+            return {
+              id,
+              result: {
+                tabId: match.id,
+                windowId: match.windowId,
+                groupId,
+                sessionName,
+                reused: true,
+                url: match.url || match.pendingUrl || "about:blank",
+                title: match.title || ""
+              }
+            };
+          }
         }
       }
 
@@ -673,41 +993,165 @@ async function handleRpc(msg) {
     if (method === "navigate" || method === "goto") {
       clearPendingPreview();
       const { tabId, url, timeoutMs = 10000, skipPreview = false } = params;
+      const navUrl = normalizeNavUrl(url);
+      initializedRuntimeTabs.delete(tabId);
       if (!skipPreview) {
         startLiveScreencast(tabId);
       }
-      await chrome.tabs.update(tabId, { url, active: false });
-      if (url && url !== "about:blank") {
-        await waitForTabLoad(tabId, timeoutMs, url);
+      await chrome.tabs.update(tabId, { url: navUrl, active: false });
+      if (navUrl && navUrl !== "about:blank") {
+        await waitForTabLoad(tabId, timeoutMs, navUrl);
       }
       await ensureDebuggerAndFocusEmulation(tabId);
+      let finalUrl = navUrl;
       let tabTitle = "";
       if (chrome.tabs && typeof chrome.tabs.get === "function") {
         try {
           const t = await chrome.tabs.get(tabId);
-          if (t && t.title) tabTitle = t.title;
+          if (t) {
+            if (t.url || t.pendingUrl) finalUrl = t.url || t.pendingUrl;
+            if (t.title) tabTitle = t.title;
+          }
         } catch (_) {}
       }
       stopLiveScreencast(tabId);
       if (!skipPreview) {
         scheduleAsyncPreviewPush(tabId);
       }
-      return { id, result: { tabId, url, title: tabTitle } };
+      return { id, result: { tabId, url: finalUrl, title: tabTitle } };
+    }
+    if (method === "listTabs") {
+      const {
+        query: rawQuery = "",
+        urlPattern = "",
+        window: windowFilter = "",
+        windowId: explicitWindowId,
+        sessionName = "",
+        includeInternal = false
+      } = params;
+      const allTabs = (chrome.tabs && typeof chrome.tabs.query === "function")
+        ? (await chrome.tabs.query({})) || []
+        : [];
+      const groupTitleById = new Map();
+      if (chrome.tabGroups && typeof chrome.tabGroups.query === "function") {
+        try {
+          const groups = (await chrome.tabGroups.query({})) || [];
+          for (const g of groups) {
+            if (g && g.id !== undefined) groupTitleById.set(g.id, String(g.title || ""));
+          }
+        } catch (_) {}
+      }
+      const q = String(rawQuery || urlPattern || windowFilter || "").trim().toLowerCase();
+      const sn = String(sessionName || "").trim();
+      const outTabs = [];
+      for (const t of allTabs) {
+        if (!t || t.id === undefined) continue;
+        if (explicitWindowId !== undefined && t.windowId !== explicitWindowId) continue;
+        const u = String(t.url || t.pendingUrl || "");
+        const title = String(t.title || "");
+        if (!includeInternal && (u.startsWith("chrome://") || u.startsWith("devtools://") || u.startsWith("chrome-extension://"))) {
+          continue;
+        }
+        const gTitle = (t.groupId !== undefined && t.groupId >= 0) ? (groupTitleById.get(t.groupId) || "") : "";
+        if (sn && gTitle !== sn) continue;
+        if (q && !u.toLowerCase().includes(q) && !title.toLowerCase().includes(q) && !gTitle.toLowerCase().includes(q) && String(t.id) !== q) {
+          continue;
+        }
+        outTabs.push({
+          tabId: t.id,
+          windowId: t.windowId,
+          groupId: t.groupId !== undefined ? t.groupId : -1,
+          groupTitle: gTitle,
+          active: Boolean(t.active),
+          status: String(t.status || ""),
+          url: u,
+          title
+        });
+      }
+      return { id, result: { tabs: outTabs } };
     }
     if (method === "getTab") {
-      const { sessionId = "default", urlPattern, window: windowFilter, tabId } = params;
-      if (tabId) return { id, result: { tabId } };
-      if (!urlPattern && !windowFilter && sessionTabs.has(sessionId)) {
-        return { id, result: { tabId: sessionTabs.get(sessionId) } };
+      const {
+        sessionId = "default",
+        urlPattern,
+        query: queryFilter,
+        window: windowFilter,
+        windowId: explicitWindowId,
+        sessionName,
+        tabId,
+        chromeTabId,
+        allowMissing = false
+      } = params;
+      const allTabs = (chrome.tabs && typeof chrome.tabs.query === "function")
+        ? (await chrome.tabs.query({})) || []
+        : [];
+      const explicitId = chromeTabId !== undefined ? Number(chromeTabId) : (tabId !== undefined ? Number(tabId) : undefined);
+      let match = null;
+      if (explicitId !== undefined && !Number.isNaN(explicitId)) {
+        match = allTabs.find(t => t.id === explicitId) || null;
+        if (!match && chrome.tabs && typeof chrome.tabs.get === "function") {
+          try { match = await chrome.tabs.get(explicitId); } catch (_) {}
+        }
       }
-      const tabs = await chrome.tabs.query({});
-      const pat = String(urlPattern || windowFilter || "").toLowerCase();
-      const match = pat
-        ? tabs.find(t => String(t.url || "").toLowerCase().includes(pat) || String(t.title || "").toLowerCase().includes(pat))
-        : tabs[0];
-      if (!match) throw new Error(`No matching Chrome tab found for '${urlPattern || windowFilter || sessionId}'`);
+      const pat = String(urlPattern || queryFilter || windowFilter || "").trim().toLowerCase();
+      if (!match && !pat && explicitWindowId === undefined && !sessionName && sessionTabs.has(sessionId)) {
+        const savedId = sessionTabs.get(sessionId);
+        const cand = allTabs.find(t => t.id === savedId) || null;
+        if (cand && String(cand.url || cand.pendingUrl || "") !== "about:blank") {
+          match = cand;
+        }
+      }
+      if (!match && sessionName) {
+        const { groupId: gid } = await findGroupWindowId(sessionName, explicitWindowId);
+        if (gid !== undefined) {
+          const gTabs = allTabs.filter(t => t.groupId === gid && (explicitWindowId === undefined || t.windowId === explicitWindowId));
+          const filtered = pat
+            ? gTabs.filter(t => String(t.url || t.pendingUrl || "").toLowerCase().includes(pat) || String(t.title || "").toLowerCase().includes(pat))
+            : gTabs.filter(t => {
+                const u = String(t.url || t.pendingUrl || "");
+                return u && u !== "about:blank" && !u.startsWith("chrome://newtab");
+              });
+          if (filtered.length > 0) match = filtered[filtered.length - 1];
+        }
+      }
+      if (!match) {
+        const candidates = allTabs.filter(t => {
+          if (!t || t.id === undefined) return false;
+          if (explicitWindowId !== undefined && t.windowId !== explicitWindowId) return false;
+          const u = String(t.url || t.pendingUrl || "");
+          if (u.startsWith("chrome://") || u.startsWith("devtools://") || u.startsWith("chrome-extension://") || u.startsWith("chrome-error://")) {
+            return false;
+          }
+          if (!pat) return u !== "" && u !== "about:blank";
+          return u.toLowerCase().includes(pat) || String(t.title || "").toLowerCase().includes(pat);
+        });
+        if (candidates.length > 0) {
+          match = candidates.find(t => t.active) || candidates[candidates.length - 1];
+        }
+      }
+      if (!match) {
+        if (allowMissing) return { id, result: { found: false } };
+        throw new Error(`No matching Chrome tab found for '${urlPattern || queryFilter || windowFilter || sessionName || sessionId}'`);
+      }
       sessionTabs.set(sessionId, match.id);
-      return { id, result: { tabId: match.id, windowId: match.windowId, url: match.url, title: match.title } };
+      if (params.assignGroup === true && sessionName) {
+        try { await ensureAgentGroup(match.id, sessionName, params.color || "blue", match.windowId); } catch (_) {}
+      }
+      if (params.focusEmulation !== false) {
+        try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
+      }
+      return {
+        id,
+        result: {
+          found: true,
+          reused: true,
+          tabId: match.id,
+          windowId: match.windowId,
+          groupId: match.groupId,
+          url: match.url || match.pendingUrl || "",
+          title: match.title || ""
+        }
+      };
     }
     if (method === "setInputFiles") {
       const { tabId, selector = "input[type='file']", files = [] } = params;
@@ -719,22 +1163,160 @@ async function handleRpc(msg) {
       const wrappedExpr = runtimeInit
         ? expression
         : `((__fn, __arg) => (typeof __fn === "function" ? __fn(__arg) : __fn))((${expression}), ${JSON.stringify(arg === undefined ? null : arg)})`;
-      const val = await evalInTab(tabId, wrappedExpr, awaitPromise);
+      let val;
+      try {
+        val = await evalInTab(tabId, wrappedExpr, awaitPromise);
+      } catch (evalErr) {
+        if (!isNavigationError(evalErr)) throw evalErr;
+        const navSt = await waitForNavigationSettlement(tabId, "", 10000);
+        if (!navSt.alive) throw evalErr;
+        val = await evalInTab(tabId, wrappedExpr, awaitPromise);
+      }
       return { id, result: val };
     }
     if (method === "executeBatch") {
       clearPendingPreview();
-      const { tabId, runtimeJs, batchReq, ...restParams } = params;
-      const reqPayload = batchReq || restParams;
-      stopLiveScreencast(tabId);
+      const { tabId, runtimeJs, runtimeVersion, batchReq, ...restParams } = params;
+      const reqPayload = batchReq || restParams || {};
       if (runtimeJs) {
-        await evalInTab(tabId, runtimeJs, false);
+        cachedRuntimeJs = runtimeJs;
       }
-      const expr = `window.__fmu.executeBatch(${JSON.stringify(reqPayload || {})})`;
-      let batchRes = await evalInTab(tabId, expr, true);
+      if (runtimeVersion) {
+        cachedRuntimeVersion = String(runtimeVersion);
+      }
+      const effectiveRuntimeJs = runtimeJs || cachedRuntimeJs;
+      const effectiveRuntimeVer = String(runtimeVersion || cachedRuntimeVersion || "init");
+      stopLiveScreencast(tabId);
+
+      if (chrome.tabs && typeof chrome.tabs.get === "function") {
+        try {
+          const curTab = await chrome.tabs.get(tabId);
+          if (curTab && (curTab.status === "loading" || curTab.pendingUrl)) {
+            initializedRuntimeTabs.delete(tabId);
+            await waitForTabLoad(tabId, 10000);
+            try { await ensureDebuggerAndFocusEmulation(tabId); } catch (_) {}
+          }
+        } catch (_) {}
+      }
+
+      const injectAndRunBatch = async (payloadObj, forceReinit = false) => {
+        const needsInit = forceReinit || initializedRuntimeTabs.get(tabId) !== effectiveRuntimeVer;
+        if (needsInit && effectiveRuntimeJs) {
+          try {
+            await evalInTab(tabId, effectiveRuntimeJs, false);
+            initializedRuntimeTabs.set(tabId, effectiveRuntimeVer);
+          } catch (rtErr) {
+            if (!isNavigationError(rtErr)) throw rtErr;
+            const navSt = await waitForNavigationSettlement(tabId, "", 10000);
+            if (!navSt.alive) throw rtErr;
+            await evalInTab(tabId, effectiveRuntimeJs, false);
+            initializedRuntimeTabs.set(tabId, effectiveRuntimeVer);
+          }
+        }
+        const batchExpr = `window.__fmu.executeBatch(${JSON.stringify(payloadObj || {})})`;
+        try {
+          return await evalInTab(tabId, batchExpr, true);
+        } catch (runErr) {
+          const msg = String((runErr && runErr.message) || runErr || "");
+          if (
+            effectiveRuntimeJs
+            && (msg.includes("window.__fmu") || (msg.includes("executeBatch") && (msg.includes("undefined") || msg.includes("null"))))
+          ) {
+            initializedRuntimeTabs.delete(tabId);
+            await evalInTab(tabId, effectiveRuntimeJs, false);
+            initializedRuntimeTabs.set(tabId, effectiveRuntimeVer);
+            return await evalInTab(tabId, batchExpr, true);
+          }
+          throw runErr;
+        }
+      };
+
+      const isPostNavSafeOp = (op) => (
+        op === "wait" || op === "sleep" || op === "delay" || op === "settle"
+        || op === "waitfor" || op === "wait_for" || op === "waituntil"
+        || op === "eval" || op === "evaluate"
+        || op === "text" || op === "readtext" || op === "readmain"
+        || op === "snapshot" || op === "diff"
+      );
+
+      const origSteps = Array.isArray(reqPayload.steps) ? reqPayload.steps : [];
+      let batchRes;
+      try {
+        batchRes = await injectAndRunBatch(reqPayload);
+      } catch (batchErr) {
+        if (!isNavigationError(batchErr)) throw batchErr;
+        initializedRuntimeTabs.delete(tabId);
+        const navSt = await waitForNavigationSettlement(tabId, "", 10000);
+        if (!navSt.alive) throw batchErr;
+        const navIdx = origSteps.findIndex(stp => {
+          const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
+          return op === "click" || op === "press" || op === "key" || op === "eval" || op === "evaluate" || op === "webmcp" || op === "calltool";
+        });
+        const remSteps = navIdx >= 0
+          ? origSteps.slice(navIdx + 1).filter(stp => {
+              const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
+              return isPostNavSafeOp(op);
+            })
+          : [];
+        if (reqPayload.skipSnapshot && remSteps.length === 0) {
+          batchRes = {
+            didNavigate: true,
+            url: navSt.url || "",
+            title: navSt.title || "",
+            errors: [],
+            evalOutputs: [],
+            rawEvalValues: [],
+            escalations: [],
+            canvases: [],
+            lines: []
+          };
+        } else {
+          const followReq = { ...reqPayload, steps: remSteps };
+          if (!reqPayload.skipSnapshot) followReq.diff = false;
+          batchRes = await injectAndRunBatch(followReq, true);
+          if (batchRes && typeof batchRes === "object") batchRes.didNavigate = true;
+        }
+      }
+
+      if (batchRes && batchRes.navigated) {
+        const priorErrors = Array.isArray(batchRes.errors) ? batchRes.errors : [];
+        const priorEvals = Array.isArray(batchRes.evalOutputs) ? batchRes.evalOutputs : [];
+        const priorRawVals = Array.isArray(batchRes.rawEvalValues) ? batchRes.rawEvalValues : [];
+        const nextIdx = typeof batchRes.nextStepIndex === "number" ? batchRes.nextStepIndex : origSteps.length;
+        const remSteps = nextIdx < origSteps.length ? origSteps.slice(nextIdx) : [];
+        initializedRuntimeTabs.delete(tabId);
+        const navSt = await waitForNavigationSettlement(tabId, String(batchRes.url || ""), 10000);
+        if (reqPayload.skipSnapshot && remSteps.length === 0) {
+          batchRes = {
+            didNavigate: true,
+            url: navSt.url || batchRes.url || "",
+            title: navSt.title || batchRes.title || "",
+            errors: priorErrors,
+            evalOutputs: priorEvals,
+            rawEvalValues: priorRawVals,
+            escalations: [],
+            canvases: [],
+            timings: batchRes.timings || {},
+            lines: []
+          };
+        } else {
+          const followReq = { ...reqPayload, steps: remSteps };
+          if (!reqPayload.skipSnapshot) followReq.diff = false;
+          const postNavRes = await injectAndRunBatch(followReq, true);
+          if (postNavRes && typeof postNavRes === "object") {
+            postNavRes.didNavigate = true;
+            postNavRes.errors = priorErrors.concat(Array.isArray(postNavRes.errors) ? postNavRes.errors : []);
+            postNavRes.evalOutputs = priorEvals.concat(Array.isArray(postNavRes.evalOutputs) ? postNavRes.evalOutputs : []);
+            postNavRes.rawEvalValues = priorRawVals.concat(Array.isArray(postNavRes.rawEvalValues) ? postNavRes.rawEvalValues : []);
+            batchRes = postNavRes;
+          }
+        }
+      }
+
       if (batchRes && Array.isArray(batchRes.escalations) && batchRes.escalations.length > 0) {
         const steps = (reqPayload && reqPayload.steps) || [];
         if (!Array.isArray(batchRes.evalOutputs)) batchRes.evalOutputs = [];
+        if (!Array.isArray(batchRes.rawEvalValues)) batchRes.rawEvalValues = [];
         if (!Array.isArray(batchRes.errors)) batchRes.errors = [];
         let didMutate = false;
         for (const esc of batchRes.escalations) {
@@ -742,9 +1324,12 @@ async function handleRpc(msg) {
             esc.handled = true;
             didMutate = true;
             try {
-              const val = await evalStepCodeOnTab(tabId, esc.code);
-              if (val !== undefined) {
-                batchRes.evalOutputs.push(typeof val === "string" ? val : JSON.stringify(val));
+              const evalBox = await evalStepCodeOnTab(tabId, esc.code);
+              if (evalBox && evalBox.hasValue) {
+                batchRes.evalOutputs.push(evalBox.text);
+              }
+              if (reqPayload && reqPayload.returnRawEval) {
+                batchRes.rawEvalValues.push(evalBox && evalBox.hasValue ? evalBox.raw : null);
               }
             } catch (evalErr) {
               batchRes.errors.push(`step ${esc.step || 1} (eval): ${(evalErr && evalErr.message) || evalErr}`);
@@ -815,6 +1400,7 @@ async function handleRpc(msg) {
         stopLiveScreencast(targetId);
         try { await chrome.tabs.remove(targetId); } catch (_) {}
         attachedDebuggers.delete(targetId);
+        initializedRuntimeTabs.delete(targetId);
       }
       if (sessionId) sessionTabs.delete(sessionId);
       return { id, result: { closed: Boolean(targetId) } };
@@ -857,7 +1443,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.3.0" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.4.0" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

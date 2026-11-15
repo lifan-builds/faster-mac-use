@@ -1173,6 +1173,10 @@ setInterval(() => {{}}, 1000);
                 node_proc.wait(timeout=2.0)
             except Exception:
                 node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
 
     def test_23_web_steps_schema_validation_and_aliases(self) -> None:
         editor_url = f"{self.server.base_url}/editor"
@@ -1411,6 +1415,10 @@ setInterval(() => {{}}, 1000);
                 node_proc.wait(timeout=2.0)
             except Exception:
                 node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
 
     def test_25_telemetry_perf_logging_privacy_sanitization_and_perf_report(self) -> None:
         from fmu.telemetry import flush_telemetry, load_perf_events
@@ -1489,6 +1497,8 @@ setInterval(() => {{}}, 1000);
             # 1. Trigger a native macOS AX command + web command and verify menu bar working status & live PiP preview
             self.rt.execute({"app": "Calculator", "steps": [{"op": "key", "name": "escape"}]})
             st_app = self.rt.execute({"statusBar": True})
+            if "hud=true" in st_app and "preview=false" in st_app:
+                st_app = self.rt.execute({"togglePreview": True})
             self.assertIn("# fmu-menubar", st_app)
             self.assertIn("visible=true", st_app)
             self.assertIn("hud=true", st_app)
@@ -1884,6 +1894,670 @@ setInterval(() => {{}}, 1000);
 
         rep = guard.stop()
         self.assertTrue(rep.passed_background_invariant, f"Intrusion detected: {rep}")
+
+    def test_29_checkout_booking_regressions_eval_nav_repl_iframes_and_mui_cards(self) -> None:
+        self.rt.execute({"reset": True})
+        checkout_url = f"{self.server.base_url}/checkout"
+        vehicles_url = f"{self.server.base_url}/vehicles"
+        csp_url = f"{self.server.base_url}/strict-csp"
+
+        # 1. Issue 4 & Issue 3: Visible cross-origin PCI <iframe> placeholders + createBrowserTab kwargs + JS REPL await tab.eval / shorthand
+        snap_out = self.rt.execute(
+            {
+                "code": (
+                    f'const tab = await cua.createBrowserTab("headless", "{checkout_url}", sessionName="🤖 Checkout", windowId=42);\n'
+                    "return await tab.snapshot();"
+                )
+            }
+        )
+        self.assertIn('group="🤖 Checkout"', snap_out)
+        for fid, ftitle in (
+            ("first-data-payment-field-name", "Cardholder Name"),
+            ("first-data-payment-field-card", "Card Number"),
+            ("first-data-payment-field-exp", "Expiration Date"),
+            ("first-data-payment-field-cvv", "Security Code"),
+        ):
+            self.assertIn(f'id="{fid}"', snap_out)
+            self.assertIn(f'title="{ftitle}"', snap_out)
+        self.assertIn(f'origin="http://localhost:{self.server.port}"', snap_out)
+        self.assertIn("[visible, cross-origin]", snap_out)
+        # Even <iframe role="presentation"> must emit role `iframe` (not `presentation`)
+        self.assertNotIn('presentation "Expiration Date"', snap_out)
+        self.assertIn('iframe "Expiration Date"', snap_out)
+        # Hidden / 3440x1 / same-origin about:blank iframes must NOT pollute snapshot
+        self.assertNotIn("tracking-pixel", snap_out)
+        self.assertNotIn("Stripe Metrics", snap_out)
+        self.assertNotIn("hidden-beacon", snap_out)
+        self.assertNotIn("same-origin-blank", snap_out)
+        # CSS display:contents button must be detected as visible and clickable
+        self.assertIn('button "Recent search card"', snap_out)
+        # Verify DOM ordering: payment iframes appear between Email address and Shipping Address
+        self.assertLess(
+            snap_out.index("Email address"),
+            snap_out.index("first-data-payment-field-card"),
+        )
+        self.assertLess(
+            snap_out.index("first-data-payment-field-cvv"),
+            snap_out.index("Shipping Address"),
+        )
+
+        # Also verify First Data HTTPS origin reporting, cua.getTab(sessionName=...) reuse, and display:contents click
+        fd_snap = self.rt.execute(
+            {
+                "code": (
+                    'const tab = await cua.getTab(sessionName="🤖 Checkout");\n'
+                    "await tab.click('Recent search card').eval(\"(() => { document.getElementById('first-data-payment-field-card').setAttribute('src', 'https://lib.paymentjs.firstdata.com/v2/card'); return 'SWAPPED'; })()\").snapshot();"
+                )
+            }
+        )
+        self.assertIn("tab=t1 ", fd_snap)
+        self.assertIn("> SWAPPED", fd_snap)
+        self.assertIn('origin="https://lib.paymentjs.firstdata.com"', fd_snap)
+        self.assertIn('val="YYC Pickup"', fd_snap)
+
+        # Issue 3: JS-style REPL `await tab.eval(...)`, `.length`, & `{ fields, iframes }` shorthand transpile cleanly
+        repl_val_out = self.rt.execute(
+            {
+                "code": (
+                    'const tab = await cua.getTab(sessionName="🤖 Checkout");\n'
+                    "const fields = await tab.eval(\"Array.from(document.querySelectorAll('input')).map(el => el.id)\");\n"
+                    "const iframes = await tab.eval(\"(() => { const n = document.querySelectorAll('iframe.pci-frame').length; return n; })()\");\n"
+                    'return { url: await tab.eval("location.href"), fields, fieldCount: fields.length, strLen: "abcd".length, iframes };'
+                )
+            }
+        )
+        self.assertNotIn("TabHandle", repl_val_out)
+        self.assertIn(checkout_url, repl_val_out)
+        self.assertIn("'fields': ['checkout-email', 'shipping-address']", repl_val_out)
+        self.assertIn("'fieldCount': 2", repl_val_out)
+        self.assertIn("'strLen': 4", repl_val_out)
+        self.assertIn("'iframes': 4", repl_val_out)
+
+        # 2. Issue 1: tab.eval() on sync IIFEs, async IIFEs / Promises, multi-statement blocks, >4 KB JSON.stringify, and truncation notice
+        eval_batch_out = self.rt.execute(
+            {
+                "code": (
+                    "const tab = await cua.getTab();\n"
+                    'tab.eval("(() => { const x = 1; return JSON.stringify({ syncIife: x }); })()");\n'
+                    'tab.eval("(async () => { await new Promise(r => setTimeout(r, 15)); return JSON.stringify({ asyncIife: true }); })();");\n'
+                    'tab.eval("const a = 11; const b = 31; JSON.stringify({ multiStmtSum: a + b });");\n'
+                    "tab.eval(\"JSON.stringify(Array.from({length: 110}, (_, i) => { return { idx: i, label: 'return date item ' + 'X'.repeat(48) }; }))\");\n"
+                    "return await tab.flush();"
+                )
+            }
+        )
+        self.assertIn('> {"syncIife":1}', eval_batch_out)
+        self.assertIn('> {"asyncIife":true}', eval_batch_out)
+        self.assertIn('> {"multiStmtSum":42}', eval_batch_out)
+        big_lines = [
+            line[2:]
+            for line in eval_batch_out.splitlines()
+            if line.startswith("> [") and "return date item" in line
+        ]
+        self.assertEqual(len(big_lines), 1, f"Expected >4KB JSON array output line, got: {eval_batch_out[:600]}")
+        self.assertGreater(len(big_lines[0]), 7000)
+        parsed_big = json.loads(big_lines[0])
+        self.assertEqual(len(parsed_big), 110)
+        self.assertEqual(parsed_big[109]["idx"], 109)
+
+        # Verify explicit truncation notice when output exceeds FMU_MAX_EVAL_CHARS (never silently dropped)
+        prev_cap = os.environ.get("FMU_MAX_EVAL_CHARS")
+        os.environ["FMU_MAX_EVAL_CHARS"] = "512"
+        try:
+            trunc_out = self.rt.execute(
+                {
+                    "code": (
+                        "const tab = await cua.getTab();\n"
+                        'tab.eval("(() => { return \'Z\'.repeat(5000); })()");\n'
+                        "return await tab.flush();"
+                    )
+                }
+            )
+            self.assertIn("[truncated: showing 512 of 5000 chars; set FMU_MAX_EVAL_CHARS to increase]", trunc_out)
+        finally:
+            if prev_cap is None:
+                os.environ.pop("FMU_MAX_EVAL_CHARS", None)
+            else:
+                os.environ["FMU_MAX_EVAL_CHARS"] = prev_cap
+
+        # Strict-CSP page sync IIFE + async IIFE via CDP Runtime.evaluate escalation
+        csp_iife_out = self.rt.execute(
+            {
+                "code": (
+                    f'const ctab = await cua.createBrowserTab("headless", "{csp_url}");\n'
+                    'ctab.eval("(() => { const k = \'CSP_SYNC_IIFE_OK\'; return k; })()");\n'
+                    'ctab.eval("(async () => { const p = await Promise.resolve(\'CSP_ASYNC_IIFE_OK\'); return JSON.stringify({ p }); })()");\n'
+                    "return await ctab.flush();"
+                )
+            }
+        )
+        self.assertNotIn("! errors:", csp_iife_out)
+        self.assertIn("> CSP_SYNC_IIFE_OK", csp_iife_out)
+        self.assertIn('> {"p":"CSP_ASYNC_IIFE_OK"}', csp_iife_out)
+
+        # 3. Issue 2: Click-triggered full-page navigation + tab.wait(ms) fluent chaining
+        nav_out_1 = self.rt.execute(
+            {
+                "code": (
+                    f'const ntab = await cua.createBrowserTab("headless", "{checkout_url}");\n'
+                    'return await ntab.click("Continue to Confirmation").snapshot();'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", nav_out_1)
+        self.assertNotIn("-32000", nav_out_1)
+        self.assertIn("CONFIRMED:ORD-991", nav_out_1)
+
+        nav_out_2 = self.rt.execute(
+            {
+                "code": (
+                    "const ntab = await cua.getTab();\n"
+                    'await ntab.click("Back to Checkout").wait(100).snapshot();\n'
+                    'return await ntab.click("Express Checkout Link").wait(120).eval("location.href").flush();'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", nav_out_2)
+        self.assertIn(f"> {self.server.base_url}/confirmation?order=ORD-992", nav_out_2)
+        self.assertIn("CONFIRMED:ORD-992", nav_out_2)
+
+        # Also verify MV3 extension background.js handles CDP `-32000 Inspected target navigated or closed` cleanly
+        bridge = self.rt.browser.ensure_bridge()
+        bg_js_src = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        bg_js_patched = bg_js_src.replace(
+            'ws://127.0.0.1:19222/ext',
+            f'ws://127.0.0.1:{bridge.port}/ext',
+        )
+        mv3_nav_harness = f"""
+const navState = {{
+  url: "https://shop.example.com/checkout",
+  title: "Checkout",
+  status: "complete",
+  pendingUrl: "",
+  groupId: 77,
+}};
+globalThis.chrome = {{
+  tabs: {{
+    query: async () => [{{ id: 501, windowId: 77, groupId: navState.groupId, url: navState.url, title: navState.title, status: navState.status }}],
+    get: async (id) => ({{ id, windowId: 77, groupId: navState.groupId, url: navState.url, pendingUrl: navState.pendingUrl, title: navState.title, status: navState.status }}),
+    create: async (opts) => ({{ id: 501, windowId: opts.windowId || 77, url: opts.url, status: "complete", title: "Checkout" }}),
+    update: async (id, opts) => {{ if (opts.url) navState.url = opts.url; return {{ id, windowId: 77, url: navState.url, status: "complete" }}; }},
+    group: async () => 77,
+    remove: async () => ({{}}),
+  }},
+  tabGroups: {{
+    get: async (gid) => ({{ id: gid, windowId: 77, title: "🤖 Checkout" }}),
+    query: async () => [{{ id: 77, windowId: 77, title: "🤖 Checkout" }}],
+    update: async (gid) => ({{ id: gid, windowId: 77 }}),
+  }},
+  windows: {{
+    getAll: async () => [{{ id: 77, focused: false }}],
+  }},
+  debugger: {{
+    attach: async () => ({{}}),
+    sendCommand: async (_target, method, params) => {{
+      if (method === "Runtime.evaluate") {{
+        const expr = String((params && params.expression) || "");
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const rawJson = expr.slice("window.__fmu.executeBatch(".length, -1);
+          const payload = JSON.parse(rawJson);
+          const steps = payload.steps || [];
+          const hasClick = steps.some(s => (s.op || s.action) === "click");
+          if (hasClick && navState.url.endsWith("/checkout")) {{
+            navState.status = "loading";
+            navState.pendingUrl = "https://shop.example.com/checkout/complete";
+            setTimeout(() => {{
+              navState.url = "https://shop.example.com/checkout/complete";
+              navState.title = "Order Complete";
+              navState.pendingUrl = "";
+              navState.status = "complete";
+            }}, 45);
+            throw new Error(JSON.stringify({{ code: -32000, message: "Inspected target navigated or closed" }}));
+          }}
+          const evalOuts = steps
+            .filter(s => (s.op || s.action) === "eval")
+            .map(() => navState.url);
+          return {{
+            result: {{
+              value: {{
+                url: navState.url,
+                title: navState.title,
+                vw: 1280,
+                vh: 800,
+                crc: navState.url.endsWith("/complete") ? "99887766" : "11223344",
+                seq: 2,
+                count: 2,
+                useDiff: false,
+                cursor: {{ agent: "default", x: 60, y: 60, uid: "@u1", label: "Place Order", op: "click" }},
+                webMcpTools: [],
+                canvases: [],
+                errors: [],
+                evalOutputs: evalOuts,
+                rawEvalValues: evalOuts,
+                escalations: [],
+                lines: navState.url.endsWith("/complete")
+                  ? ['@u1 heading "Thank you for your order"', '@u2 status "Order #88412"']
+                  : ['@u1 button "Place Order"'],
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }},
+}};
+{bg_js_patched}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(
+            ["node", "-e", mv3_nav_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(bridge.wait_connected(timeout=3.0))
+            mv3_nav_out = self.rt.execute(
+                {
+                    "code": (
+                        'const sTab = await cua.createBrowserTab("chrome", "https://shop.example.com/checkout", sessionName="🤖 Checkout", windowId=77, reuseExisting=true);\n'
+                        'return await sTab.click("@u1").wait(40).eval("location.href").snapshot();'
+                    )
+                }
+            )
+            self.assertNotIn("-32000", mv3_nav_out)
+            self.assertNotIn("Inspected target navigated or closed", mv3_nav_out)
+            self.assertIn("> https://shop.example.com/checkout/complete", mv3_nav_out)
+            self.assertIn('heading "Thank you for your order"', mv3_nav_out)
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
+
+        # 4. Issue 5: 16 clickable React/MUI `.MuiCard-root` vehicle cards appear in snapshot() & click cleanly
+        veh_snap = self.rt.execute(
+            {
+                "code": (
+                    f'const vtab = await cua.createBrowserTab("headless", "{vehicles_url}");\n'
+                    "return await vtab.snapshot();"
+                )
+            }
+        )
+        card_lines = [l for l in veh_snap.splitlines() if " card " in l]
+        self.assertEqual(
+            len(card_lines),
+            16,
+            f"Expected all 16 .MuiCard-root vehicle cards in snapshot, got {len(card_lines)}:\n{veh_snap}",
+        )
+        rogue_lines = [l for l in card_lines if "Nissan Rogue" in l]
+        self.assertEqual(len(rogue_lines), 1)
+        rogue_uid = rogue_lines[0].split()[0]
+
+        # Click by @u UID (triggers React-style DOM re-render of all 16 cards)
+        click_uid_out = self.rt.execute(
+            {
+                "code": (
+                    "const vtab = await cua.getTab();\n"
+                    f'return await vtab.click("{rogue_uid}").diff();'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", click_uid_out)
+        self.assertIn("SELECTED:7:Midsize SUV:62", click_uid_out)
+
+        # Click another card by text label after full card list DOM replacement
+        click_txt_out = self.rt.execute(
+            {
+                "code": (
+                    "const vtab = await cua.getTab();\n"
+                    'return await vtab.click("Tesla Model 3").diff();'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", click_txt_out)
+        self.assertIn("SELECTED:11:Electric:66", click_txt_out)
+
+    def test_30_yyc_rental_audit_waitfor_main_text_footer_fold_list_tabs_smart_diff_and_repl(self) -> None:
+        booking_url = f"{self.server.base_url}/rental-booking"
+        csp_url = f"{self.server.base_url}/strict-csp"
+
+        # 1. Primary <main> static text + uncovered <tr> rows + auto-collapsed <footer> links
+        init_snap = self.rt.execute(
+            {
+                "code": (
+                    f'const btab = await cua.createBrowserTab("headless", "{booking_url}");\n'
+                    "return await btab.snapshot();"
+                )
+            }
+        )
+        self.assertIn("MOCK9042XYZ", init_snap)
+        self.assertIn("CAD 76.29", init_snap)
+        self.assertIn("#mock1001 | Hertz | Activated | 10% Back", init_snap)
+        self.assertIn("# footer: +16 items folded (", init_snap)
+        self.assertIn("pass fullPage=true or query=... to expand)", init_snap)
+        self.assertNotIn('"Cookie Settings"', init_snap)
+        self.assertIn("waitFor(text|sel)", init_snap)
+
+        # Folded footer links remain directly clickable by label without fullPage=True,
+        # and chained .snapshot() after an action uses smart diff instead of repeating the whole page!
+        folded_click_diff = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    'return await btab.click("Investor Relations").snapshot();'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", folded_click_diff)
+        self.assertIn("FOOTER:InvestorRelations", folded_click_diff)
+        # Smart diff should NOT repeat unchanged buttons or table rows
+        self.assertNotIn('"Apply Promo"', folded_click_diff)
+        self.assertNotIn("#mock1002 | Avis", folded_click_diff)
+
+        # Standalone 0-step tab.snapshot() returns full snapshot, and fullPage=True expands footer links
+        full_standalone = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    "return await btab.snapshot();"
+                )
+            }
+        )
+        self.assertIn('"Apply Promo"', full_standalone)
+        self.assertIn("# footer: +16 items folded", full_standalone)
+
+        full_page_snap = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    "return await btab.snapshot(fullPage=true);"
+                )
+            }
+        )
+        self.assertIn('"Cookie Settings"', full_page_snap)
+        self.assertIn('"Investor Relations"', full_page_snap)
+        self.assertNotIn("items folded", full_page_snap)
+
+        # 2. Event-driven waitFor (MutationObserver wakeup in ~90ms instead of 4000ms sleep) + timeout handling
+        t_w0 = time.perf_counter()
+        wait_out = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    'return await btab.click("Apply Promo").waitFor({text: "Promo 200692 Applied", gone: ".loading-spinner", timeoutMs: 4000}).diff();'
+                )
+            }
+        )
+        wait_elapsed = time.perf_counter() - t_w0
+        self.assertNotIn("! errors:", wait_out)
+        self.assertIn("Promo 200692 Applied (-15%)", wait_out)
+        self.assertLess(wait_elapsed, 1.5, f"waitFor should wake on MutationObserver, took {wait_elapsed:.2f}s")
+
+        wait_timeout_out = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    'return await btab.waitFor("#does-not-exist", 110).diff();'
+                )
+            }
+        )
+        self.assertIn('! errors: step 1 (waitFor): timed out after 110ms waiting for "#does-not-exist"', wait_timeout_out)
+
+        wait_opt_out = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    'return await btab.waitFor({selector: "#does-not-exist", timeoutMs: 60, optional: true}).diff();'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", wait_opt_out)
+
+        # 3. SPA history.pushState('?vehicle=suv') preserves compact diff across query-param updates
+        push_diff = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    'return await btab.click("Filter SUVs").wait(100).snapshot();'
+                )
+            }
+        )
+        self.assertNotIn("! errors:", push_diff)
+        self.assertIn("Showing: Midsize SUV", push_diff)
+        self.assertNotIn('"Apply Promo"', push_diff)
+
+        # 4. tab.text() as value (including on strict-CSP page with 0 EvalError) and chained step
+        txt_val = self.rt.execute(
+            {
+                "code": (
+                    "const btab = await cua.getTab();\n"
+                    'const summary = await btab.text("#booking-summary");\n'
+                    "return summary;"
+                )
+            }
+        )
+        self.assertIn("MOCK9042XYZ", txt_val)
+        self.assertIn("CAD 76.29", txt_val)
+        self.assertNotIn("# web tab=", txt_val)
+
+        csp_txt = self.rt.execute(
+            {
+                "code": (
+                    f'const ctab = await cua.createBrowserTab("headless", "{csp_url}");\n'
+                    "return await ctab.text();"
+                )
+            }
+        )
+        self.assertTrue(len(csp_txt) > 0)
+        self.assertNotIn("EvalError", csp_txt)
+
+        # 5. REPL multiline JS string, bare evalValue non-str JSON output, destructuring, and safe builtins
+        multiline_code = (
+            'const btab = await cua.getTab("rental-booking");\n'
+            'const Ml = await btab.eval("(() => {\n  const a = \'MOCK\';\n  const b = \'9042XYZ\';\n  return a + b;\n})()");\n'
+            'const { code, ok } = { code: Ml.trim(), ok: Ml.includes("9042") && ["a", "b", "c"].slice(0, 2).join("-") === "a-b" && all([true, 1 === 1]) };\n'
+            "return `${code}:${ok}`;"
+        )
+        ml_out = self.rt.execute({"code": multiline_code})
+        self.assertEqual(ml_out, "MOCK9042XYZ:True")
+
+        bare_eval_val = self.rt.execute(
+            {
+                "code": (
+                    'const btab = await cua.getTab("rental-booking");\n'
+                    'await btab.evalValue("({ total: 76.29, currency: \'CAD\' })");'
+                )
+            }
+        )
+        self.assertEqual(json.loads(bare_eval_val), {"total": 76.29, "currency": "CAD"})
+
+        # 6. Cross-agent cua.getTab("audit:t1") lookup without spawning about:blank
+        self.rt.execute(
+            {
+                "agent": "audit",
+                "code": f'await cua.createBrowserTab("headless", "{booking_url}");',
+            }
+        )
+        tabs_before = set(self.rt.browser._tabs.keys())
+        self.assertIn("audit:t1", tabs_before)
+        cross_out = self.rt.execute(
+            {
+                "code": (
+                    'const at = await cua.getTab("audit:t1");\n'
+                    "return at.url;"
+                )
+            }
+        )
+        self.assertEqual(cross_out, f"{booking_url}?vehicle=suv")
+        self.assertEqual(set(self.rt.browser._tabs.keys()), tabs_before)
+        with self.assertRaises(RuntimeError):
+            self.rt.execute({"code": 'await cua.getTab("ghost:t99");'})
+        self.assertEqual(set(self.rt.browser._tabs.keys()), tabs_before)
+
+        # 7. Real MV3 background.js harness: cua.listTabs(), getTab(chromeTabId), bare-domain reuseExisting preservation,
+        #    bare-domain navigation normalization, and 1-time runtimeJs caching across multiple batches!
+        bridge = self.rt.browser.ensure_bridge()
+        bg_js = (Path(__file__).resolve().parents[1] / "extension" / "background.js").read_text(encoding="utf-8")
+        bg_js_patched = bg_js.replace("ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{bridge.port}/ext")
+        mv3_tabs_harness = f"""
+const fs = require("fs");
+const state = {{
+  tabs: [
+    {{ id: 501, windowId: 88, groupId: 12, active: true, title: "Hertz Vehicle Selection", url: "https://www.hertz.com/us/en/book/vehicles", status: "complete" }},
+    {{ id: 502, windowId: 88, groupId: -1, active: false, title: "Expedia Car Search", url: "https://www.expedia.ca/carsearch?locn=YYC", status: "complete" }}
+  ],
+  updateCalls: [],
+  createdUrls: [],
+  runtimeInitEvals: 0,
+  batchEvals: 0,
+}};
+global.chrome = {{
+  tabs: {{
+    query: async (q) => state.tabs.filter(t => (q.windowId === undefined || t.windowId === q.windowId) && (q.groupId === undefined || t.groupId === q.groupId)),
+    get: async (id) => {{
+      const f = state.tabs.find(t => t.id === id);
+      if (!f) throw new Error("No tab with id " + id);
+      return f;
+    }},
+    create: async (opts) => {{
+      state.createdUrls.push(opts.url);
+      const nt = {{ id: 503, windowId: opts.windowId || 88, groupId: -1, active: false, title: "Avis", url: opts.url, status: "complete" }};
+      state.tabs.push(nt);
+      return nt;
+    }},
+    update: async (id, opts) => {{
+      state.updateCalls.push({{ id, opts }});
+      const f = state.tabs.find(t => t.id === id);
+      if (f && opts.url) f.url = opts.url;
+      return f || {{ id, windowId: 88, url: opts.url || "", status: "complete" }};
+    }},
+    group: async () => 12,
+    remove: async () => ({{}}),
+    onUpdated: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{
+    get: async (gid) => ({{ id: gid, windowId: 88, title: "🤖 Agent" }}),
+    query: async () => [{{ id: 12, windowId: 88, title: "🤖 Agent" }}],
+    update: async (gid) => ({{ id: gid, windowId: 88 }}),
+  }},
+  windows: {{
+    getAll: async () => [{{ id: 88, focused: false }}],
+  }},
+  debugger: {{
+    attach: async () => ({{}}),
+    sendCommand: async (_target, method, params) => {{
+      if (method === "Runtime.evaluate") {{
+        const expr = String((params && params.expression) || "");
+        if (expr.includes("FMU_RUNTIME_VERSION")) {{
+          state.runtimeInitEvals += 1;
+          return {{ result: {{ value: true }} }};
+        }}
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          state.batchEvals += 1;
+          const payload = JSON.parse(expr.slice("window.__fmu.executeBatch(".length, -1));
+          const steps = payload.steps || [];
+          const evalOuts = steps
+            .filter(s => (s.op || s.action) === "eval")
+            .map(() => JSON.stringify(state));
+          return {{
+            result: {{
+              value: {{
+                url: "https://www.hertz.com/us/en/book/vehicles",
+                title: "Hertz Vehicle Selection",
+                vw: 1280,
+                vh: 800,
+                crc: "a1b2c3d4",
+                seq: state.batchEvals,
+                count: 2,
+                useDiff: state.batchEvals > 1 && payload.diff !== false,
+                unchanged: state.batchEvals > 1 && payload.diff !== false && evalOuts.length === 0,
+                cursor: {{ agent: "default", x: 50, y: 50, uid: "@u1", label: "Nissan Rogue", op: "click" }},
+                webMcpTools: [],
+                canvases: [],
+                errors: [],
+                evalOutputs: evalOuts,
+                rawEvalValues: evalOuts,
+                escalations: [],
+                lines: state.batchEvals > 1 && payload.diff !== false
+                  ? ["= unchanged (crc=a1b2c3d4, seq=2)"]
+                  : ['@u1 card "Midsize SUV - Nissan Rogue CAD 76.29"'],
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: false }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }},
+}};
+{bg_js_patched}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(
+            ["node", "-e", mv3_tabs_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(bridge.wait_connected(timeout=3.0))
+            bridge_st = self.rt.execute({"bridgeStatus": True})
+            self.assertIn('version="0.4.0"', bridge_st)
+
+            tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
+            self.assertIn('@tab id=501', tabs_list)
+            self.assertIn('group="🤖 Agent"', tabs_list)
+            self.assertIn("https://www.hertz.com/us/en/book/vehicles", tabs_list)
+            self.assertNotIn("expedia.ca", tabs_list)
+
+            # Attach via getTab("hertz.com") AND createBrowserTab({url: "hertz.com", reuseExisting: true})
+            # Neither should clobber the deep /us/en/book/vehicles URL!
+            attach_state_raw = self.rt.execute(
+                {
+                    "code": (
+                        'const h1 = await cua.getTab("hertz.com");\n'
+                        "const d1 = await h1.diff();\n"
+                        'const h2 = await cua.createBrowserTab({mode: "chrome", url: "hertz.com", reuseExisting: true});\n'
+                        'const a1 = await cua.createBrowserTab({mode: "chrome", url: "avis.ca", reuseExisting: false});\n'
+                        'return await h1.eval("__state__");'
+                    )
+                }
+            )
+            harness_state = json.loads(attach_state_raw)
+            self.assertEqual(
+                harness_state["updateCalls"],
+                [],
+                f"Expected zero chrome.tabs.update URL clobbers on reuseExisting, got {harness_state['updateCalls']}",
+            )
+            self.assertEqual(harness_state["createdUrls"], ["https://avis.ca"])
+            # Tab 501 ran multiple executeBatch calls, yet runtimeInitEvals on tab 501 + tab 503 should be 2 total (1 per tab, not per batch!)
+            self.assertEqual(harness_state["runtimeInitEvals"], 2)
+            self.assertGreaterEqual(harness_state["batchEvals"], 4)
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
 
 
 if __name__ == "__main__":

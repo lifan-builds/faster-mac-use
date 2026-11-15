@@ -24,6 +24,68 @@ from fmu.mac_engine import (
 from fmu.telemetry import flush_telemetry, record_perf_event, sanitize_error, sanitize_url_target
 
 
+_HAS_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+
+def _normalize_nav_url(raw_url: str | None) -> str:
+    s = str(raw_url or "").strip()
+    if not s or s in ("about:blank", "*"):
+        return s or "about:blank"
+    if _HAS_SCHEME_RE.match(s):
+        return s
+    if s.startswith("//"):
+        return "https:" + s
+    low = s.lower()
+    if low.startswith(("localhost", "127.0.0.1", "[::1]")):
+        return "http://" + s
+    return "https://" + s
+
+
+def _url_matches_target(live_url: str | None, requested_url: str | None) -> bool:
+    live = str(live_url or "").strip()
+    req = str(requested_url or "").strip()
+    if not live or not req or req in ("about:blank", "*"):
+        return False
+    if live == req:
+        return True
+    live_l = live.lower()
+    req_l = req.lower()
+    if not _HAS_SCHEME_RE.match(req):
+        stripped = re.sub(r"^/+|/+$", "", req_l)
+        return bool(stripped) and stripped in live_l
+    if req.endswith("/") and live == req[:-1]:
+        return True
+    if live.endswith("/") and req == live[:-1]:
+        return True
+    try:
+        lp = urlparse(live)
+        rp = urlparse(req)
+        lh = (lp.hostname or "").lower().removeprefix("www.")
+        rh = (rp.hostname or "").lower().removeprefix("www.")
+        if lh and lh == rh and (rp.path in ("", "/")) and not rp.query and not rp.fragment:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _same_origin_and_path(u1: str | None, u2: str | None) -> bool:
+    if not u1 or not u2:
+        return False
+    try:
+        p1 = urlparse(str(u1))
+        p2 = urlparse(str(u2))
+        if not p1.scheme or not p1.netloc:
+            return False
+        return (
+            p1.scheme.lower() == p2.scheme.lower()
+            and p1.netloc.lower() == p2.netloc.lower()
+            and (p1.path.rstrip("/") or "/") == (p2.path.rstrip("/") or "/")
+        )
+    except Exception:
+        return False
+
+
 def _short_menubar_target(raw_url: str | None) -> str:
     if not raw_url or raw_url in ("about:blank", "*"):
         return "Chrome"
@@ -67,9 +129,181 @@ def _write_web_preview_b64(b64_data: str | None) -> str | None:
         return None
 
 
+DEFAULT_MAX_EVAL_CHARS = 65536
+
+_JS_NON_EXPR_STMT_RE = re.compile(
+    r"^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b"
+)
+
+
+def _format_eval_output(val: Any) -> str:
+    s = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
+    try:
+        max_chars = int(os.environ.get("FMU_MAX_EVAL_CHARS", str(DEFAULT_MAX_EVAL_CHARS)))
+    except ValueError:
+        max_chars = DEFAULT_MAX_EVAL_CHARS
+    if max_chars > 0 and len(s) > max_chars:
+        return (
+            f"{s[:max_chars]}... "
+            f"[truncated: showing {max_chars} of {len(s)} chars; set FMU_MAX_EVAL_CHARS to increase]"
+        )
+    return s
+
+
+def _is_navigation_error(exc_or_msg: Any) -> bool:
+    msg = str(exc_or_msg or "")
+    low = msg.lower()
+    if any(
+        tok in low
+        for tok in (
+            "inspected target navigated or closed",
+            "inspected target navigated",
+            "execution context was destroyed",
+            "most likely because of a navigation",
+            "cannot find context with specified id",
+            "frame with the given id was not found",
+            "frame was detached",
+            "navigating frame was detached",
+        )
+    ):
+        return True
+    return "-32000" in low and "navigat" in low
+
+
+def _scan_js_top_level_py(code: str) -> tuple[str, bool, int, bool]:
+    """Scan JS code for top-level `return`, trailing semicolons, last `;` split, and top-level assignment."""
+    src = code.strip()
+    n = len(src)
+    in_str: str | None = None
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+    depth = 0
+    has_top_return = False
+    semi_positions: list[int] = []
+    i = 0
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in ("(", "[", "{"):
+            depth += 1
+            i += 1
+            continue
+        if ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0:
+            if ch == ";":
+                semi_positions.append(i)
+            elif (
+                ch == "r"
+                and src.startswith("return", i)
+                and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in ("_", "$", ".")))
+                and (i + 6 >= n or not (src[i + 6].isalnum() or src[i + 6] in ("_", "$")))
+            ):
+                has_top_return = True
+        i += 1
+
+    trimmed = src
+    while trimmed.endswith(";"):
+        trimmed = trimmed[:-1].rstrip()
+
+    # Recompute non-trailing top-level semicolon split on trimmed
+    last_semi = -1
+    for pos in semi_positions:
+        if pos < len(trimmed) and trimmed[pos + 1 :].strip():
+            last_semi = pos
+
+    tail_has_assign = False
+    tail_stmt = trimmed[last_semi + 1 :].strip() if last_semi >= 0 else trimmed
+    if tail_stmt:
+        t_in_str: str | None = None
+        t_esc = False
+        t_depth = 0
+        for idx, ch in enumerate(tail_stmt):
+            if t_esc:
+                t_esc = False
+                continue
+            if t_in_str is not None:
+                if ch == "\\":
+                    t_esc = True
+                elif ch == t_in_str:
+                    t_in_str = None
+                continue
+            if ch in ("'", '"', "`"):
+                t_in_str = ch
+                continue
+            if ch in ("(", "[", "{"):
+                t_depth += 1
+            elif ch in (")", "]", "}"):
+                t_depth = max(0, t_depth - 1)
+            elif ch == "=" and t_depth == 0:
+                prev_c = tail_stmt[idx - 1] if idx > 0 else ""
+                next_c = tail_stmt[idx + 1] if idx + 1 < len(tail_stmt) else ""
+                if prev_c not in ("=", "!", "<", ">") and next_c not in ("=", ">"):
+                    tail_has_assign = True
+                    break
+    return trimmed, has_top_return, last_semi, tail_has_assign
+
+
+def _build_js_eval_candidates(raw_code: str) -> list[str]:
+    code = str(raw_code or "")
+    trimmed, has_top_return, last_semi, tail_has_assign = _scan_js_top_level_py(code)
+    if not trimmed:
+        return [code]
+    if has_top_return:
+        return [code]
+    candidates: list[str] = [f"return (\n{trimmed}\n)"]
+    if last_semi >= 0:
+        prefix = trimmed[: last_semi + 1]
+        last_stmt = trimmed[last_semi + 1 :].strip()
+        if last_stmt and not _JS_NON_EXPR_STMT_RE.match(last_stmt) and not tail_has_assign:
+            candidates.append(f"{prefix}\nreturn (\n{last_stmt}\n);")
+    candidates.append(code)
+    return candidates
+
+
+_FMU_RUNTIME_VERSION = "0.4.0"
+
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.2.3";
+  const FMU_RUNTIME_VERSION = "0.4.0";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -80,9 +314,13 @@ IN_PAGE_RUNTIME_JS = r"""
     agentStates: new Map(),
     virtualTools: new Map(),
     ocrTargets: new Map(),
+    waiters: new Set(),
     nextUid: 1,
     mutationSeq: 1,
-    observerAttached: false
+    observerAttached: false,
+    waiterObserverAttached: false,
+    navListenerAttached: false,
+    navigating: false
   });
   const elToUid = store.elToUid;
   const elToStableLabel = store.elToStableLabel;
@@ -91,6 +329,14 @@ IN_PAGE_RUNTIME_JS = r"""
   const agentStates = store.agentStates;
   const virtualTools = store.virtualTools;
   const ocrTargets = store.ocrTargets;
+  const waiters = store.waiters || (store.waiters = new Set());
+
+  function notifyWaiters() {
+    if (waiters.size === 0) return;
+    for (const fn of Array.from(waiters)) {
+      try { fn(); } catch (_) {}
+    }
+  }
 
   function getShadowRoot(el) {
     return (el && (el.shadowRoot || el._sr || el._shadowRoot || el.__shadowRoot)) || null;
@@ -136,6 +382,7 @@ IN_PAGE_RUNTIME_JS = r"""
         lastCrc: "00000000",
         lastQuery: "",
         lastFoldTables: true,
+        lastFullPage: false,
         cursor: { agent: key, x: 0, y: 0, uid: "", label: "", op: "init" }
       };
       agentStates.set(key, st);
@@ -234,7 +481,10 @@ IN_PAGE_RUNTIME_JS = r"""
   }
 
   if (!store.observerAttached) {
-    const observer = new MutationObserver(() => { store.mutationSeq++; });
+    const observer = new MutationObserver(() => {
+      store.mutationSeq++;
+      notifyWaiters();
+    });
     if (document.documentElement) {
       observer.observe(document.documentElement, {
         subtree: true,
@@ -243,9 +493,32 @@ IN_PAGE_RUNTIME_JS = r"""
         characterData: true
       });
     }
-    window.addEventListener("input", () => { store.mutationSeq++; }, true);
-    window.addEventListener("change", () => { store.mutationSeq++; }, true);
+    window.addEventListener("input", () => { store.mutationSeq++; notifyWaiters(); }, true);
+    window.addEventListener("change", () => { store.mutationSeq++; notifyWaiters(); }, true);
     store.observerAttached = true;
+    store.waiterObserverAttached = true;
+  } else if (!store.waiterObserverAttached) {
+    const wObs = new MutationObserver(() => { notifyWaiters(); });
+    if (document.documentElement) {
+      wObs.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true
+      });
+    }
+    window.addEventListener("popstate", () => { store.mutationSeq++; notifyWaiters(); }, true);
+    window.addEventListener("hashchange", () => { store.mutationSeq++; notifyWaiters(); }, true);
+    store.waiterObserverAttached = true;
+  }
+
+  if (!store.navListenerAttached) {
+    const markNavigating = () => { store.navigating = true; notifyWaiters(); };
+    window.addEventListener("beforeunload", markNavigating, true);
+    window.addEventListener("pagehide", markNavigating, true);
+    window.addEventListener("popstate", () => { store.mutationSeq++; notifyWaiters(); }, true);
+    window.addEventListener("hashchange", () => { store.mutationSeq++; notifyWaiters(); }, true);
+    store.navListenerAttached = true;
   }
 
   function crc32(str) {
@@ -283,7 +556,7 @@ IN_PAGE_RUNTIME_JS = r"""
   function getCandidateAliases(el) {
     const aliases = [getLabel(el)];
     if (el && el.getAttribute) {
-      for (const attr of ["aria-label", "placeholder", "data-placeholder", "aria-placeholder", "data-testid", "name", "title"]) {
+      for (const attr of ["aria-label", "placeholder", "data-placeholder", "aria-placeholder", "data-testid", "name", "title", "id"]) {
         const v = el.getAttribute(attr);
         if (v) aliases.push(cleanStr(v));
       }
@@ -300,7 +573,15 @@ IN_PAGE_RUNTIME_JS = r"""
     return aliases.filter(Boolean).map(s => s.toLowerCase());
   }
 
-  const CANDIDATE_SEL = "button, a, input, select, textarea, canvas, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], [role], label, h1, h2, h3, [data-testid], [data-placeholder], [aria-placeholder]";
+  const CANDIDATE_SEL = "button, a, input, select, textarea, canvas, iframe, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], [role], label, h1, h2, h3, [data-testid], [data-placeholder], [aria-placeholder]";
+
+  function getSearchCandidates() {
+    const base = Array.from(queryAllDeep(CANDIDATE_SEL));
+    const baseSet = new Set(base);
+    const extras = collectInteractivePointerElements(baseSet, 60);
+    for (let i = 0; i < extras.length; i++) base.push(extras[i]);
+    return base;
+  }
 
   function resolveEl(target) {
     if (!target) return null;
@@ -316,14 +597,15 @@ IN_PAGE_RUNTIME_JS = r"""
       const meta = uidToMeta.get(norm);
       if (meta && meta.label) {
         const targetLbl = meta.label.toLowerCase();
-        const candidates = queryAllDeep(CANDIDATE_SEL);
+        const candidates = getSearchCandidates();
         let fallbackMatch = null;
         for (const c of candidates) {
           if (!isVisible(c)) continue;
-          const cLbl = getLabel(c).toLowerCase();
+          const cRole = getRole(c);
+          const cLbl = getLabel(c, cRole === "card" ? 140 : 80).toLowerCase();
           const aliases = getCandidateAliases(c);
           if (cLbl === targetLbl || aliases.includes(targetLbl)) {
-            if (!meta.role || getRole(c) === meta.role) {
+            if (!meta.role || cRole === meta.role) {
               elToUid.set(c, norm);
               uidToRef.set(norm, new WeakRef(c));
               return c;
@@ -345,7 +627,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const byId = document.getElementById(t);
     if (byId) return byId;
     const lower = t.toLowerCase();
-    const candidates = queryAllDeep(CANDIDATE_SEL);
+    const candidates = getSearchCandidates();
     for (const el of candidates) {
       const aliases = getCandidateAliases(el);
       if (aliases.includes(lower)) return el;
@@ -357,12 +639,53 @@ IN_PAGE_RUNTIME_JS = r"""
     return null;
   }
 
+  function getEffectiveRect(el) {
+    if (!el || !el.getBoundingClientRect) {
+      return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return rect;
+    const style = window.getComputedStyle(el);
+    if (style.display === "contents" && el.children && el.children.length > 0) {
+      let minL = Infinity, minT = Infinity, maxR = -Infinity, maxB = -Infinity;
+      const stack = Array.from(el.children);
+      while (stack.length > 0) {
+        const child = stack.shift();
+        if (!child || !child.getBoundingClientRect) continue;
+        const cs = window.getComputedStyle(child);
+        if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") continue;
+        const cr = child.getBoundingClientRect();
+        if (cr.width > 0 && cr.height > 0) {
+          if (cr.left < minL) minL = cr.left;
+          if (cr.top < minT) minT = cr.top;
+          if (cr.right > maxR) maxR = cr.right;
+          if (cr.bottom > maxB) maxB = cr.bottom;
+        } else if (cs.display === "contents" && child.children && child.children.length > 0) {
+          for (let k = 0; k < child.children.length; k++) stack.push(child.children[k]);
+        }
+      }
+      if (minL < Infinity && maxR > minL && maxB > minT) {
+        return {
+          left: minL,
+          top: minT,
+          right: maxR,
+          bottom: maxB,
+          width: maxR - minL,
+          height: maxB - minT,
+          x: minL,
+          y: minT
+        };
+      }
+    }
+    return rect;
+  }
+
   function isVisible(el) {
     if (!el || !el.isConnected) return false;
     if (el.hasAttribute && el.hasAttribute("data-fmu-cursor")) return false;
     const style = window.getComputedStyle(el);
     if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-    const rect = el.getBoundingClientRect();
+    const rect = getEffectiveRect(el);
     return rect.width > 0 && rect.height > 0;
   }
 
@@ -371,13 +694,25 @@ IN_PAGE_RUNTIME_JS = r"""
     return c.length > maxLen ? c.slice(0, maxLen - 1) + "…" : c;
   }
 
+  const CARD_CLASS_RE = /\b(MuiCard-root|MuiCardActionArea-root|[a-zA-Z0-9_-]*[Cc]ard(?:-root|-container|-item|-box|-body)?|[a-zA-Z0-9_-]*[Rr]ate-?(?:card|box|option|tile)|[a-zA-Z0-9_-]*[Vv]ehicle-?(?:card|item|tile))\b/;
+
+  function isCardElement(el) {
+    if (!el || !el.tagName) return false;
+    const tag = el.tagName.toLowerCase();
+    if (tag === "article") return true;
+    const cls = typeof el.className === "string" ? el.className : "";
+    if (cls && CARD_CLASS_RE.test(cls)) return true;
+    return false;
+  }
+
   function getRole(el) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "iframe") return "iframe";
     const explicit = el.getAttribute("role");
     if (explicit) return explicit.toLowerCase();
     if (isContentEditableEl(el)) return "textbox";
-    const tag = el.tagName.toLowerCase();
     if (tag === "a") return "link";
-    if (tag === "button") return "button";
+    if (tag === "button" || tag === "summary") return "button";
     if (tag === "select") return "select";
     if (tag === "textarea") return "textbox";
     if (tag === "canvas") return "canvas";
@@ -389,24 +724,29 @@ IN_PAGE_RUNTIME_JS = r"""
       return "input:" + type;
     }
     if (/^h[1-6]$/.test(tag)) return "heading";
+    if (isCardElement(el)) return "card";
+    if (elToUid.has(el)) {
+      const meta = uidToMeta.get(elToUid.get(el));
+      if (meta && meta.role) return meta.role;
+    }
     return tag;
   }
 
-  function getLabel(el) {
+  function getLabel(el, maxLen = 80) {
     const aria = el.getAttribute("aria-label")
       || el.getAttribute("title")
       || el.getAttribute("placeholder")
       || el.getAttribute("data-placeholder")
       || el.getAttribute("aria-placeholder");
     if (aria) {
-      const cleaned = cleanStr(aria);
+      const cleaned = cleanStr(aria, maxLen);
       if (isContentEditableEl(el)) elToStableLabel.set(el, cleaned);
       return cleaned;
     }
     if (el.id) {
       try {
         const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-        if (lbl) return cleanStr(lbl.innerText || lbl.textContent);
+        if (lbl) return cleanStr(lbl.innerText || lbl.textContent, maxLen);
       } catch (_) {}
     }
     if (isContentEditableEl(el)) {
@@ -416,7 +756,7 @@ IN_PAGE_RUNTIME_JS = r"""
         if (ph && ph !== el) {
           const phText = ph.getAttribute("data-placeholder") || ph.innerText || ph.textContent;
           if (phText) {
-            const cleaned = cleanStr(phText);
+            const cleaned = cleanStr(phText, maxLen);
             elToStableLabel.set(el, cleaned);
             return cleaned;
           }
@@ -427,7 +767,7 @@ IN_PAGE_RUNTIME_JS = r"""
             || ancestor.getAttribute("data-placeholder")
             || ancestor.getAttribute("aria-placeholder");
           if (ancLabel) {
-            const cleaned = cleanStr(ancLabel);
+            const cleaned = cleanStr(ancLabel, maxLen);
             if (!elToStableLabel.has(el)) elToStableLabel.set(el, cleaned);
             return elToStableLabel.get(el) || cleaned;
           }
@@ -436,15 +776,232 @@ IN_PAGE_RUNTIME_JS = r"""
       if (elToStableLabel.has(el)) {
         return elToStableLabel.get(el);
       }
-      const fallback = cleanStr(el.getAttribute("name") || el.getAttribute("data-testid") || el.id || "richtext");
+      const fallback = cleanStr(el.getAttribute("name") || el.getAttribute("data-testid") || el.id || "richtext", maxLen);
       elToStableLabel.set(el, fallback);
       return fallback;
     }
     const tag = el.tagName.toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select" || tag === "canvas") {
-      return cleanStr(el.name || el.id || tag);
+      return cleanStr(el.name || el.id || tag, maxLen);
     }
-    return cleanStr(el.innerText || el.textContent || "");
+    if (tag === "iframe") {
+      return cleanStr(el.getAttribute("title") || el.id || el.getAttribute("name") || "iframe", maxLen);
+    }
+    return cleanStr(el.innerText || el.textContent || "", maxLen);
+  }
+
+  function getCrossOriginIframeInfo(el) {
+    if (!el || !el.tagName || el.tagName.toLowerCase() !== "iframe") return null;
+    if (el.getAttribute("aria-hidden") === "true") return null;
+    const style = window.getComputedStyle(el);
+    if (style.pointerEvents === "none") return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 16 || rect.height < 16) return null;
+
+    const rawSrc = String(el.getAttribute("src") || el.src || "").trim();
+    let parsedOrigin = "";
+    let parsedHost = "";
+    if (rawSrc && rawSrc !== "about:blank" && !rawSrc.startsWith("javascript:")) {
+      try {
+        const u = new URL(rawSrc, location.href);
+        parsedOrigin = u.origin || "";
+        parsedHost = u.host || u.hostname || "";
+      } catch (_) {}
+    }
+    let docAccessible = false;
+    try {
+      docAccessible = Boolean(el.contentDocument && el.contentDocument.documentElement);
+    } catch (_) {
+      docAccessible = false;
+    }
+    const hasCrossOriginUrl = Boolean(
+      parsedOrigin && parsedOrigin !== "null" && parsedOrigin !== location.origin
+    );
+    const isIsolated = !docAccessible && Boolean(
+      (rawSrc && rawSrc !== "about:blank") || el.hasAttribute("sandbox")
+    );
+    if (!hasCrossOriginUrl && !isIsolated) return null;
+
+    const idAttr = cleanStr(el.id || "", 80);
+    const nameAttr = cleanStr(el.getAttribute("name") || "", 80);
+    const titleAttr = cleanStr(el.getAttribute("title") || el.getAttribute("aria-label") || "", 80);
+    let assocLabel = "";
+    if (el.id) {
+      try {
+        const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (lbl) assocLabel = cleanStr(lbl.innerText || lbl.textContent, 80);
+      } catch (_) {}
+    }
+    if (!assocLabel && el.parentElement && el.parentElement.id) {
+      try {
+        const pLbl = document.querySelector(`label[for="${CSS.escape(el.parentElement.id)}"]`);
+        if (pLbl) assocLabel = cleanStr(pLbl.innerText || pLbl.textContent, 80);
+      } catch (_) {}
+    }
+    if (!assocLabel && el.closest) {
+      const wrapLbl = el.closest("label");
+      if (wrapLbl) assocLabel = cleanStr(wrapLbl.innerText || wrapLbl.textContent, 80);
+    }
+    const originStr = (parsedOrigin && parsedOrigin !== "null")
+      ? parsedOrigin
+      : (parsedHost || (rawSrc.startsWith("data:") ? "data:" : "cross-origin"));
+    const label = titleAttr || assocLabel || idAttr || nameAttr || parsedHost || "hosted-field";
+    const ix = Math.round(rect.left);
+    const iy = Math.round(rect.top);
+    const iw = Math.round(rect.width);
+    const ih = Math.round(rect.height);
+
+    let body = `iframe "${label}"`;
+    if (idAttr) body += ` id="${idAttr}"`;
+    if (nameAttr && nameAttr !== idAttr) body += ` name="${nameAttr}"`;
+    else if (nameAttr && !idAttr) body += ` name="${nameAttr}"`;
+    else if (nameAttr) body += ` name="${nameAttr}"`;
+    if (titleAttr) body += ` title="${titleAttr}"`;
+    body += ` origin="${originStr}" (${ix},${iy}) [${iw}x${ih}] [visible, cross-origin]`;
+    const searchBlob = `${label} ${idAttr} ${nameAttr} ${titleAttr} ${originStr} iframe`.toLowerCase();
+    return { label, body, searchBlob, x: ix, y: iy, w: iw, h: ih, origin: originStr };
+  }
+
+  const NON_POINTER_SCAN_TAGS = new Set([
+    "html", "body", "head", "script", "style", "link", "meta", "noscript", "template",
+    "svg", "path", "g", "circle", "rect", "polygon", "line", "polyline", "defs", "use", "symbol",
+    "img", "picture", "source", "video", "audio", "br", "hr",
+    "button", "a", "input", "select", "textarea", "label", "option", "optgroup",
+    "canvas", "iframe", "table", "thead", "tbody", "tfoot", "tr", "th",
+    "ul", "ol", "dl", "nav", "header", "footer", "main", "form", "fieldset",
+    "h1", "h2", "h3", "h4", "h5", "h6", "p"
+  ]);
+
+  const SEMANTIC_INTERACTIVE_ANCESTOR_SEL = "button, a[href], label, select, textarea, input, summary, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='switch'], [role='option'], [role='textbox'], [role='searchbox'], [role='combobox'], [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
+
+  function hasDirectClickBinding(el) {
+    if (!el) return false;
+    if (typeof el.onclick === "function" || (el.hasAttribute && el.hasAttribute("onclick"))) {
+      return true;
+    }
+    if (el.hasAttribute) {
+      if (
+        el.hasAttribute("@click")
+        || el.hasAttribute("x-on:click")
+        || el.hasAttribute("(click)")
+        || el.hasAttribute("ng-click")
+      ) {
+        return true;
+      }
+    }
+    try {
+      const ownKeys = Object.getOwnPropertyNames(el);
+      for (let i = 0; i < ownKeys.length; i++) {
+        const k = ownKeys[i];
+        if (k.startsWith("__reactProps$") || k.startsWith("__reactEventHandlers$")) {
+          const props = el[k];
+          if (
+            props
+            && (
+              typeof props.onClick === "function"
+              || typeof props.onClickCapture === "function"
+              || typeof props.onMouseUp === "function"
+              || typeof props.onPointerUp === "function"
+            )
+          ) {
+            return true;
+          }
+        } else if (k === "__vei" && el.__vei && (el.__vei.onClick || el.__vei.onclick)) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function collectInteractivePointerElements(semanticSet, maxPointerItems = 60) {
+    const root = document.body || document.documentElement;
+    if (!root) return [];
+    const all = queryAllDeep("*", root);
+    const maxScan = Math.min(all.length, 4000);
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 800;
+    const results = [];
+    const acceptedTextByEl = new Map();
+
+    for (let i = 0; i < maxScan && results.length < maxPointerItems; i++) {
+      const el = all[i];
+      if (!el || semanticSet.has(el)) continue;
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      if (!tag || NON_POINTER_SCAN_TAGS.has(tag)) continue;
+      if (el.getAttribute && (el.getAttribute("aria-hidden") === "true" || el.hasAttribute("disabled"))) continue;
+      if (el.getAttribute && el.getAttribute("role")) continue;
+      if (el.closest && el.closest(SEMANTIC_INTERACTIVE_ANCESTOR_SEL)) continue;
+
+      const directClick = hasDirectClickBinding(el);
+      const tabIdxZero = el.getAttribute && el.getAttribute("tabindex") === "0";
+      let style = null;
+      if (!directClick) {
+        style = window.getComputedStyle(el);
+        if (style.cursor !== "pointer") continue;
+        if (!tabIdxZero && !isCardElement(el) && el.parentElement) {
+          const pStyle = window.getComputedStyle(el.parentElement);
+          if (pStyle.cursor === "pointer") continue;
+        }
+      } else {
+        style = window.getComputedStyle(el);
+      }
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0" || style.pointerEvents === "none") {
+        continue;
+      }
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 24 || rect.height < 18) continue;
+      if (rect.width > vw * 0.96 && rect.height > vh * 0.85) continue;
+
+      if (el.querySelectorAll) {
+        const subCards = el.querySelectorAll(".MuiCard-root, article");
+        if (subCards && subCards.length > 2) continue;
+      }
+
+      const rawText = String(
+        el.getAttribute("aria-label")
+        || el.getAttribute("title")
+        || el.innerText
+        || el.textContent
+        || ""
+      ).replace(/\s+/g, " ").trim();
+      if (rawText.length < 2 || rawText.length > 900) continue;
+
+      // Skip if an already-accepted interactive ancestor has identical normalized text
+      let dupAncestor = false;
+      let anc = el.parentElement;
+      while (anc && anc !== root) {
+        if (acceptedTextByEl.has(anc) && acceptedTextByEl.get(anc) === rawText) {
+          dupAncestor = true;
+          break;
+        }
+        anc = anc.parentElement;
+      }
+      if (dupAncestor) continue;
+
+      // Skip if this is merely a styling wrapper around a single semantic link/button with identical text
+      let wrapsIdenticalSemantic = false;
+      if (el.querySelectorAll) {
+        const semKids = el.querySelectorAll("a[href], button, input, select, textarea, [role='button'], [role='link']");
+        if (semKids.length === 1 && semanticSet.has(semKids[0])) {
+          const kidText = String(semKids[0].innerText || semKids[0].textContent || semKids[0].getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+          if (kidText === rawText) wrapsIdenticalSemantic = true;
+        }
+      }
+      if (wrapsIdenticalSemantic) continue;
+
+      acceptedTextByEl.set(el, rawText);
+      results.push(el);
+    }
+    return results;
+  }
+
+  function classifyInteractiveElementRole(el) {
+    if (isCardElement(el)) return "card";
+    const rect = el.getBoundingClientRect();
+    const txtLen = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().length;
+    if (rect.width >= 140 && rect.height >= 72 && txtLen >= 20) return "card";
+    return "button";
   }
 
   function getValue(el) {
@@ -466,19 +1023,157 @@ IN_PAGE_RUNTIME_JS = r"""
     return "";
   }
 
-  function collectSnapshot(query = "", maxItems = 180, foldTables = true) {
+  function getPageFooterScope(el, footerLinkCache) {
+    if (!el || !el.closest) return null;
+    const footerEl = el.closest("footer, [role='contentinfo']");
+    if (!footerEl) return null;
+    if (footerEl.closest("dialog, [role='dialog'], [aria-modal='true'], form, main, [role='main']")) {
+      return null;
+    }
+    let linkCount = footerLinkCache.get(footerEl);
+    if (linkCount === undefined) {
+      linkCount = footerEl.querySelectorAll ? footerEl.querySelectorAll("a[href]").length : 0;
+      footerLinkCache.set(footerEl, linkCount);
+    }
+    return linkCount >= 8 ? footerEl : null;
+  }
+
+  function collectPrimaryStaticEntries(capturedSet, capturedLabels, footerLinkCache, foldFooter, maxStaticItems = 28) {
+    const entries = [];
+    if (maxStaticItems <= 0 || !document.body) return entries;
+    const seenLabels = new Set();
+    for (const lbl of capturedLabels) {
+      if (lbl) seenLabels.add(lbl.toLowerCase());
+    }
+    const isCoveredByCaptured = (el, normTxt) => {
+      if (!normTxt || normTxt.length < 2) return true;
+      const lower = normTxt.toLowerCase();
+      if (seenLabels.has(lower)) return true;
+      let cur = el;
+      while (cur && cur !== document.body) {
+        if (capturedSet.has(cur)) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+
+    // 1. Static or partially-uncovered data table rows (`<tr>`)
+    const allRows = document.querySelectorAll("tbody tr, table tr");
+    for (let i = 0; i < allRows.length && entries.length < maxStaticItems; i++) {
+      const tr = allRows[i];
+      if (!isVisible(tr)) continue;
+      if (foldFooter && getPageFooterScope(tr, footerLinkCache)) continue;
+      if (tr.closest("nav, [role='navigation']")) continue;
+      const cells = tr.cells ? Array.from(tr.cells) : Array.from(tr.querySelectorAll("td"));
+      if (cells.length === 0) continue;
+      let hasTd = false;
+      const uncoveredParts = [];
+      let rowHasInteractive = false;
+      for (const cell of cells) {
+        if (cell.tagName.toLowerCase() === "td") hasTd = true;
+        const cellHasInteractive = Array.from(cell.querySelectorAll("*")).some(ch => capturedSet.has(ch)) || capturedSet.has(cell);
+        if (cellHasInteractive) {
+          rowHasInteractive = true;
+          continue;
+        }
+        const ct = cleanStr(cell.innerText || cell.textContent || "", 56);
+        if (ct) uncoveredParts.push(ct);
+      }
+      if (!hasTd || uncoveredParts.length === 0) continue;
+      const rowSummary = cleanStr(uncoveredParts.join(" | "), 140);
+      if (!rowSummary || rowSummary.length < 2) continue;
+      if (rowHasInteractive) {
+        // Skip if every uncovered cell is already a substring of an interactive label in this row
+        const rowInteractiveText = Array.from(tr.querySelectorAll("*"))
+          .filter(ch => capturedSet.has(ch))
+          .map(ch => cleanStr(ch.innerText || ch.textContent || "", 120).toLowerCase())
+          .join(" ");
+        const allRedundant = uncoveredParts.every(p => rowInteractiveText.includes(p.toLowerCase()));
+        if (allRedundant) continue;
+      }
+      const lowerRow = rowSummary.toLowerCase();
+      if (seenLabels.has(lowerRow)) continue;
+      seenLabels.add(lowerRow);
+      entries.push({ el: tr, role: "row", label: rowSummary });
+    }
+
+    // 2. Concise leaf text blocks inside <main> / [role="main"] / article / open dialogs (or compact body)
+    let roots = Array.from(document.querySelectorAll("dialog[open], [role='dialog'], [aria-modal='true'], main, [role='main'], article"))
+      .filter(r => isVisible(r));
+    const usingBodyFallback = roots.length === 0;
+    if (usingBodyFallback) {
+      roots = [document.body];
+    }
+    const INLINE_TAGS = new Set(["span", "strong", "b", "em", "i", "code", "small", "time", "mark", "abbr", "sup", "sub", "br", "wbr"]);
+    const BLOCK_SKIP_SEL = "script, style, noscript, svg, template, table, nav, [role='navigation'], footer, [role='contentinfo'], [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
+    const textSel = "p, li, dt, dd, h4, h5, h6, [data-testid], [class*='price'], [class*='total'], [class*='confirm'], [class*='amount'], [class*='summary'], [class*='error'], [class*='msg'], [class*='trip'], div, span";
+
+    for (const root of roots) {
+      if (entries.length >= maxStaticItems) break;
+      const cands = root.querySelectorAll(textSel);
+      for (let i = 0; i < cands.length && entries.length < maxStaticItems; i++) {
+        const el = cands[i];
+        if (capturedSet.has(el)) continue;
+        if (el.closest(BLOCK_SKIP_SEL)) continue;
+        if (usingBodyFallback && el.closest("header, [role='banner'], aside")) continue;
+        const tag = el.tagName.toLowerCase();
+        if (tag === "label" || el.closest("label")) continue;
+        if (el.querySelector("button, a[href], input, select, textarea, div, p, ul, ol, dl, table, section, article, form, h1, h2, h3, h4")) {
+          continue;
+        }
+        const childEls = el.children;
+        if (childEls.length > 4) continue;
+        let onlyInlineChildren = true;
+        for (let c = 0; c < childEls.length; c++) {
+          if (!INLINE_TAGS.has(childEls[c].tagName.toLowerCase())) {
+            onlyInlineChildren = false;
+            break;
+          }
+        }
+        if (!onlyInlineChildren) continue;
+        // If parent is also an inline-only leaf with identical text, let parent emit once and skip child
+        const par = el.parentElement;
+        if (par && par !== root && par !== document.body && !par.querySelector("button, a[href], input, select, textarea, div, p, ul, ol, table")) {
+          const parTxt = cleanStr(par.innerText || par.textContent || "", 140);
+          const ownTxt0 = cleanStr(el.innerText || el.textContent || "", 140);
+          if (parTxt && parTxt === ownTxt0 && (tag === "span" || INLINE_TAGS.has(tag))) {
+            continue;
+          }
+        }
+        if (!isVisible(el)) continue;
+        const txt = cleanStr(el.innerText || el.textContent || "", 140);
+        if (!txt || txt.length < 3) continue;
+        if (isCoveredByCaptured(el, txt)) continue;
+        seenLabels.add(txt.toLowerCase());
+        capturedSet.add(el);
+        entries.push({ el, role: "text", label: txt });
+      }
+    }
+    return entries;
+  }
+
+  function collectSnapshot(query = "", maxItems = 180, foldTables = true, fullPage = false) {
     const q = String(query || "").toLowerCase();
-    const sel = "button, a[href], input, select, textarea, canvas, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='switch'], [role='option'], [role='textbox'], [role='searchbox'], [role='combobox'], [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], h1, h2, h3, [data-status], [role='status'], [role='alert'], output, .result, #result, #status";
-    const nodes = queryAllDeep(sel);
-    const currentMap = new Map();
-    const lines = [];
+    const effectiveMaxItems = (!foldTables || fullPage) ? Math.max(maxItems, 320) : maxItems;
+    const foldFooter = Boolean(foldTables && !fullPage && !q);
+    const footerLinkCache = new Map();
+    const sel = "button, a[href], input, select, textarea, canvas, iframe, summary, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='switch'], [role='option'], [role='textbox'], [role='searchbox'], [role='combobox'], [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], h1, h2, h3, [data-status], [role='status'], [role='alert'], output, .result, #result, #status";
+    const semNodes = Array.from(queryAllDeep(sel));
+    const semanticSet = new Set(semNodes);
+    const pointerExtras = collectInteractivePointerElements(semanticSet, 60);
+    const pointerSet = new Set(pointerExtras);
+    let nodes = semNodes;
+    if (pointerExtras.length > 0) {
+      nodes = semNodes.concat(pointerExtras);
+    }
+
+    const capturedSet = new Set();
+    const capturedLabels = [];
+    const stagedItems = [];
     const canvases = [];
-    const tbodyRows = new Map();
-    const foldedStats = new Map();
-    const maxVisibleTableRows = 6;
 
     for (const el of nodes) {
-      if (currentMap.size >= maxItems) break;
+      if (stagedItems.length >= effectiveMaxItems) break;
       if (!isVisible(el)) continue;
       if (
         el.parentElement
@@ -489,12 +1184,26 @@ IN_PAGE_RUNTIME_JS = r"""
           continue;
         }
       }
-      const role = getRole(el);
-      const label = getLabel(el);
+      const isPointerExtra = pointerSet.has(el);
+      const role = isPointerExtra ? classifyInteractiveElementRole(el) : getRole(el);
+      if (role === "iframe") {
+        const info = getCrossOriginIframeInfo(el);
+        if (!info) continue;
+        if (q && !info.searchBlob.includes(q)) continue;
+        const uid = getUid(el);
+        uidToMeta.set(uid, { role: "iframe", label: info.label });
+        capturedSet.add(el);
+        if (info.label) capturedLabels.push(info.label);
+        const fullLine = `${uid} ${info.body}`;
+        stagedItems.push({ el, uid, role: "iframe", label: info.label, val: "", body: info.body, fullLine });
+        continue;
+      }
+      const label = getLabel(el, role === "card" ? 140 : 80);
       const val = getValue(el);
       if (role === "canvas") {
         const uid = getUid(el);
         uidToMeta.set(uid, { role: "canvas", label });
+        capturedSet.add(el);
         const rect = el.getBoundingClientRect();
         const cx = Math.round(rect.left);
         const cy = Math.round(rect.top);
@@ -506,12 +1215,14 @@ IN_PAGE_RUNTIME_JS = r"""
         const body = `canvas "${label}" (${cx},${cy}) [${cw}x${ch}]`;
         const fullLine = `${uid} ${body}`;
         if (!q || label.toLowerCase().includes(q) || "canvas".includes(q)) {
-          currentMap.set(uid, { uid, role: "canvas", label, val: "", body, fullLine, folded: false });
-          lines.push(fullLine);
+          stagedItems.push({ el, uid, role: "canvas", label, val: "", body, fullLine });
         }
         continue;
       }
       if (!label && !val && !role.startsWith("input") && role !== "textbox" && role !== "select") continue;
+      capturedSet.add(el);
+      if (label) capturedLabels.push(label);
+      if (val) capturedLabels.push(val);
       if (q && !label.toLowerCase().includes(q) && !val.toLowerCase().includes(q) && !role.includes(q)) continue;
 
       const uid = getUid(el);
@@ -521,12 +1232,62 @@ IN_PAGE_RUNTIME_JS = r"""
       if (val && val !== label) body += ` val="${val}"`;
       if (el.disabled) body += " [disabled]";
       const fullLine = `${uid} ${body}`;
+      stagedItems.push({ el, uid, role, label, val, body, fullLine });
+    }
 
-      let isFoldedRow = false;
-      if (foldTables && !q) {
-        const tr = el.closest ? el.closest("tbody tr") : null;
+    // Collect concise primary static text & uncovered data-table rows within remaining budget
+    const remainingBudget = Math.min(28, Math.max(0, effectiveMaxItems - stagedItems.length));
+    if (remainingBudget > 0) {
+      const staticEntries = collectPrimaryStaticEntries(capturedSet, capturedLabels, footerLinkCache, foldFooter, remainingBudget);
+      for (const se of staticEntries) {
+        if (q && !se.label.toLowerCase().includes(q) && !se.role.includes(q)) continue;
+        const uid = getUid(se.el);
+        uidToMeta.set(uid, { role: se.role, label: se.label });
+        const body = `${se.role} "${se.label}"`;
+        const fullLine = `${uid} ${body}`;
+        stagedItems.push({ el: se.el, uid, role: se.role, label: se.label, val: "", body, fullLine });
+      }
+    }
+
+    if (stagedItems.length > 1) {
+      stagedItems.sort((a, b) => {
+        if (a.el === b.el) return 0;
+        try {
+          const pos = a.el.compareDocumentPosition(b.el);
+          if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+          if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        } catch (_) {}
+        return 0;
+      });
+    }
+
+    const currentMap = new Map();
+    const lines = [];
+    const tbodyRows = new Map();
+    const foldedStats = new Map();
+    const footerStats = new Map();
+    const maxVisibleTableRows = 6;
+
+    for (const item of stagedItems) {
+      const el = item.el;
+      let isFolded = false;
+      if (foldFooter && !item.role.startsWith("input") && item.role !== "textbox" && item.role !== "select") {
+        const footerScope = getPageFooterScope(el, footerLinkCache);
+        if (footerScope) {
+          let fst = footerStats.get(footerScope);
+          if (!fst) {
+            fst = { count: 0, firstUid: item.uid, lastUid: item.uid };
+            footerStats.set(footerScope, fst);
+          }
+          fst.count += 1;
+          fst.lastUid = item.uid;
+          isFolded = true;
+        }
+      }
+      if (!isFolded && foldTables && !q) {
+        const tr = el.tagName && el.tagName.toLowerCase() === "tr" ? el : (el.closest ? el.closest("tbody tr") : null);
         const tbody = tr ? tr.parentElement : null;
-        if (tbody && tr) {
+        if (tbody && tbody.tagName && tbody.tagName.toLowerCase() === "tbody" && tr) {
           let rowSet = tbodyRows.get(tbody);
           if (!rowSet) {
             rowSet = new Set();
@@ -536,19 +1297,28 @@ IN_PAGE_RUNTIME_JS = r"""
           if (rowSet.size > maxVisibleTableRows) {
             let st = foldedStats.get(tbody);
             if (!st) {
-              st = { rows: new Set(), count: 0, firstUid: uid, lastUid: uid };
+              st = { rows: new Set(), count: 0, firstUid: item.uid, lastUid: item.uid };
               foldedStats.set(tbody, st);
             }
             st.rows.add(tr);
             st.count += 1;
-            st.lastUid = uid;
-            isFoldedRow = true;
+            st.lastUid = item.uid;
+            isFolded = true;
           }
         }
       }
-      currentMap.set(uid, { uid, role, label, val, body, fullLine, folded: isFoldedRow });
-      if (isFoldedRow) continue;
-      lines.push(fullLine);
+      currentMap.set(item.uid, {
+        uid: item.uid,
+        role: item.role,
+        label: item.label,
+        val: item.val,
+        body: item.body,
+        fullLine: item.fullLine,
+        folded: isFolded
+      });
+      if (!isFolded) {
+        lines.push(item.fullLine);
+      }
     }
 
     for (const [oUid, oItem] of ocrTargets.entries()) {
@@ -563,6 +1333,9 @@ IN_PAGE_RUNTIME_JS = r"""
 
     for (const st of foldedStats.values()) {
       lines.push(`# ... +${st.rows.size} rows (${st.firstUid}..${st.lastUid}, ${st.count} items indexed; target by label/UID)`);
+    }
+    for (const fst of footerStats.values()) {
+      lines.push(`# footer: +${fst.count} items folded (${fst.firstUid}..${fst.lastUid} indexed; pass fullPage=true or query=... to expand)`);
     }
 
     const allFullLines = [];
@@ -756,6 +1529,195 @@ IN_PAGE_RUNTIME_JS = r"""
     }
   }
 
+  function getVisiblePageText() {
+    if (!document.body) return "";
+    return String(document.body.innerText || document.body.textContent || "");
+  }
+
+  function extractReadableText(selector = "", maxChars = 4000) {
+    const cap = Math.max(120, Math.min(Number(maxChars || 4000), 32000));
+    let root = null;
+    const selStr = String(selector || "").trim();
+    if (selStr) {
+      root = resolveEl(selStr) || queryOneDeep(selStr);
+      if (!root) throw new Error(`selector not found (${selStr})`);
+    } else {
+      const mainCands = document.querySelectorAll("dialog[open], [role='dialog'], [aria-modal='true'], main, [role='main'], article");
+      for (const c of mainCands) {
+        if (isVisible(c) && String(c.innerText || "").trim().length >= 20) {
+          root = c;
+          break;
+        }
+      }
+      if (!root) root = document.body;
+    }
+    if (!root) return "";
+    let raw = "";
+    if (!selStr && root === document.body) {
+      // Exclude boilerplate footer/nav when summarizing body without explicit selector
+      const parts = [];
+      for (const child of Array.from(root.children)) {
+        const tag = child.tagName ? child.tagName.toLowerCase() : "";
+        const role = child.getAttribute ? (child.getAttribute("role") || "") : "";
+        if (tag === "script" || tag === "style" || tag === "noscript" || tag === "svg" || tag === "footer" || role === "contentinfo") {
+          continue;
+        }
+        if (!isVisible(child)) continue;
+        const ct = String(child.innerText || "").trim();
+        if (ct) parts.push(ct);
+      }
+      raw = parts.length > 0 ? parts.join("\n") : String(root.innerText || "");
+    } else {
+      raw = String(root.innerText || root.textContent || "");
+    }
+    const cleaned = raw
+      .split(/\r?\n/)
+      .map(l => l.replace(/[ \t]+/g, " ").trim())
+      .filter(Boolean)
+      .join("\n");
+    if (cleaned.length <= cap) return cleaned;
+    return cleaned.slice(0, cap) + `\n[truncated: ${cap} of ${cleaned.length} chars]`;
+  }
+
+  function matchSingleSelectorOrUid(sel, requireVisible = true) {
+    const s = String(sel || "").trim();
+    if (!s) return false;
+    if (s.startsWith("@")) {
+      const el = resolveEl(s);
+      return Boolean(el && (!requireVisible || isVisible(el)));
+    }
+    let el = null;
+    try { el = queryOneDeep(s); } catch (_) {}
+    if (!el) el = resolveEl(s);
+    return Boolean(el && (!requireVisible || isVisible(el)));
+  }
+
+  async function waitForCondition(s) {
+    const timeoutMs = Math.max(0, Math.min(Number(s.timeoutMs ?? s.timeout ?? s.ms ?? 5000), 25000));
+    const requireVisible = String(s.state || "visible").toLowerCase() !== "attached";
+    const wantUrl = s.url !== undefined ? String(s.url) : "";
+    const wantSel = s.selector !== undefined ? String(s.selector) : "";
+    const wantJs = s.js !== undefined ? String(s.js) : (s.expr !== undefined ? String(s.expr) : "");
+    const invertFlag = s.gone === true || String(s.state || "").toLowerCase() === "hidden" || String(s.state || "").toLowerCase() === "detached";
+    const explicitGone = typeof s.gone === "string" ? s.gone : "";
+    const wantTextGone = s.textGone !== undefined ? String(s.textGone) : "";
+    const wantSelGone = s.selectorGone !== undefined ? String(s.selectorGone) : "";
+
+    let textList = [];
+    if (Array.isArray(s.anyText)) {
+      textList = s.anyText.map(x => String(x)).filter(Boolean);
+    } else if (Array.isArray(s.text)) {
+      textList = s.text.map(x => String(x)).filter(Boolean);
+    } else if (s.text !== undefined && s.text !== null && String(s.text) !== "") {
+      textList = [String(s.text)];
+    }
+
+    const fallbackTarget = (!wantUrl && !wantSel && !wantJs && !explicitGone && !wantTextGone && !wantSelGone && textList.length === 0)
+      ? String(s.target || s.uid || s.ref || s.name || s.value || "").trim()
+      : "";
+
+    const descParts = [];
+    if (textList.length > 0) descParts.push(`${invertFlag ? "text gone" : "text"}=${JSON.stringify(textList.length === 1 ? textList[0] : textList)}`);
+    if (wantSel) descParts.push(`${invertFlag ? "selector gone" : "selector"}=${JSON.stringify(wantSel)}`);
+    if (wantUrl) descParts.push(`url=${JSON.stringify(wantUrl)}`);
+    if (explicitGone) descParts.push(`gone=${JSON.stringify(explicitGone)}`);
+    if (wantTextGone) descParts.push(`textGone=${JSON.stringify(wantTextGone)}`);
+    if (wantSelGone) descParts.push(`selectorGone=${JSON.stringify(wantSelGone)}`);
+    if (wantJs) descParts.push("js condition");
+    if (fallbackTarget) descParts.push(JSON.stringify(fallbackTarget));
+    const desc = descParts.join(", ") || "condition";
+
+    const looksLikeCss = (str) => /^[#.@\[]|[>+~]/.test(str);
+
+    const checkOnce = async () => {
+      if (wantUrl) {
+        const href = String(location.href || "");
+        if (wantUrl.startsWith("/") && wantUrl.lastIndexOf("/") > 0) {
+          const lastSlash = wantUrl.lastIndexOf("/");
+          try {
+            const re = new RegExp(wantUrl.slice(1, lastSlash), wantUrl.slice(lastSlash + 1) || "i");
+            if (!re.test(href)) return false;
+          } catch (_) {
+            if (!href.toLowerCase().includes(wantUrl.toLowerCase())) return false;
+          }
+        } else if (!href.toLowerCase().includes(wantUrl.toLowerCase())) {
+          return false;
+        }
+      }
+      let pageTxtLower = null;
+      const getPageLower = () => {
+        if (pageTxtLower === null) pageTxtLower = getVisiblePageText().toLowerCase();
+        return pageTxtLower;
+      };
+      if (textList.length > 0) {
+        const matchedAny = textList.some(t => {
+          const tl = t.toLowerCase();
+          if (getPageLower().includes(tl)) return true;
+          const el = resolveEl(t);
+          return Boolean(el && isVisible(el));
+        });
+        if (invertFlag ? matchedAny : !matchedAny) return false;
+      }
+      if (wantSel) {
+        const matchedSel = matchSingleSelectorOrUid(wantSel, requireVisible);
+        if (invertFlag ? matchedSel : !matchedSel) return false;
+      }
+      if (explicitGone) {
+        const present = looksLikeCss(explicitGone)
+          ? matchSingleSelectorOrUid(explicitGone, true)
+          : (getPageLower().includes(explicitGone.toLowerCase()) || Boolean(resolveEl(explicitGone)));
+        if (present) return false;
+      }
+      if (wantTextGone) {
+        if (getPageLower().includes(wantTextGone.toLowerCase())) return false;
+      }
+      if (wantSelGone) {
+        if (matchSingleSelectorOrUid(wantSelGone, true)) return false;
+      }
+      if (fallbackTarget) {
+        const matchedFb = looksLikeCss(fallbackTarget)
+          ? (matchSingleSelectorOrUid(fallbackTarget, requireVisible) || getPageLower().includes(fallbackTarget.toLowerCase()))
+          : (getPageLower().includes(fallbackTarget.toLowerCase()) || matchSingleSelectorOrUid(fallbackTarget, requireVisible));
+        if (invertFlag ? matchedFb : !matchedFb) return false;
+      }
+      if (wantJs) {
+        try {
+          const jsRes = await runInPageEval(wantJs);
+          if (!jsRes) return false;
+        } catch (_) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const t0 = performance.now();
+    if (await checkOnce()) {
+      return { ok: true, elapsedMs: +(performance.now() - t0).toFixed(2) };
+    }
+    while (performance.now() - t0 < timeoutMs) {
+      if (store.navigating) return { navigating: true };
+      const rem = Math.max(1, timeoutMs - (performance.now() - t0));
+      await new Promise(resolve => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          waiters.delete(finish);
+          clearTimeout(tid);
+          resolve();
+        };
+        const tid = setTimeout(finish, Math.min(35, rem));
+        waiters.add(finish);
+      });
+      if (store.navigating) return { navigating: true };
+      if (await checkOnce()) {
+        return { ok: true, elapsedMs: +(performance.now() - t0).toFixed(2) };
+      }
+    }
+    return { ok: false, timedOut: true, timeoutMs, desc };
+  }
+
   function interpolateTemplate(val, args) {
     if (typeof val === "string") {
       const exactMatch = val.match(/^(?:\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}|\$([a-zA-Z0-9_]+))$/);
@@ -834,7 +1796,7 @@ IN_PAGE_RUNTIME_JS = r"""
       return;
     }
     if (el) {
-      const rect = el.getBoundingClientRect();
+      const rect = getEffectiveRect(el);
       const uid = getUid(el);
       const label = getLabel(el);
       uidToMeta.set(uid, { role: getRole(el), label });
@@ -851,12 +1813,205 @@ IN_PAGE_RUNTIME_JS = r"""
 
   const VALID_WEB_OPS = new Set([
     "click", "upload", "fill", "set", "type", "select", "move",
-    "press", "key", "wait", "settle", "eval", "webmcp", "calltool",
+    "press", "key", "wait", "sleep", "delay", "settle",
+    "waitfor", "wait_for", "waituntil",
+    "text", "readtext", "readmain",
+    "eval", "evaluate", "webmcp", "calltool",
     "goto", "navigate", "open", "close", "snapshot", "diff", "ocr"
   ]);
 
+  const NON_EXPR_STMT_RE = /^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b/;
+
+  function scanJsTopLevel(rawCode) {
+    const src = String(rawCode || "").trim();
+    const n = src.length;
+    let inStr = null;
+    let inLineComment = false;
+    let inBlockComment = false;
+    let escape = false;
+    let depth = 0;
+    let hasTopReturn = false;
+    const semiPositions = [];
+
+    for (let i = 0; i < n; i++) {
+      const ch = src[i];
+      const nxt = i + 1 < n ? src[i + 1] : "";
+      if (inLineComment) {
+        if (ch === "\n") inLineComment = false;
+        continue;
+      }
+      if (inBlockComment) {
+        if (ch === "*" && nxt === "/") {
+          inBlockComment = false;
+          i++;
+        }
+        continue;
+      }
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (inStr !== null) {
+        if (ch === "\\") escape = true;
+        else if (ch === inStr) inStr = null;
+        continue;
+      }
+      if (ch === "/" && nxt === "/") {
+        inLineComment = true;
+        i++;
+        continue;
+      }
+      if (ch === "/" && nxt === "*") {
+        inBlockComment = true;
+        i++;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        inStr = ch;
+        continue;
+      }
+      if (ch === "(" || ch === "[" || ch === "{") {
+        depth++;
+        continue;
+      }
+      if (ch === ")" || ch === "]" || ch === "}") {
+        depth = Math.max(0, depth - 1);
+        continue;
+      }
+      if (depth === 0) {
+        if (ch === ";") {
+          semiPositions.push(i);
+        } else if (
+          ch === "r"
+          && src.slice(i, i + 6) === "return"
+          && (i === 0 || !/[a-zA-Z0-9_$.]/.test(src[i - 1]))
+          && (i + 6 >= n || !/[a-zA-Z0-9_$]/.test(src[i + 6]))
+        ) {
+          hasTopReturn = true;
+        }
+      }
+    }
+
+    let trimmed = src;
+    while (trimmed.endsWith(";")) {
+      trimmed = trimmed.slice(0, -1).trimEnd();
+    }
+    let lastSemi = -1;
+    for (let i = 0; i < semiPositions.length; i++) {
+      const pos = semiPositions[i];
+      if (pos < trimmed.length && trimmed.slice(pos + 1).trim().length > 0) {
+        lastSemi = pos;
+      }
+    }
+    const tailStmt = lastSemi >= 0 ? trimmed.slice(lastSemi + 1).trim() : trimmed;
+    let tailHasAssign = false;
+    if (tailStmt) {
+      let tStr = null;
+      let tEsc = false;
+      let tDepth = 0;
+      for (let i = 0; i < tailStmt.length; i++) {
+        const ch = tailStmt[i];
+        if (tEsc) { tEsc = false; continue; }
+        if (tStr !== null) {
+          if (ch === "\\") tEsc = true;
+          else if (ch === tStr) tStr = null;
+          continue;
+        }
+        if (ch === "'" || ch === '"' || ch === "`") { tStr = ch; continue; }
+        if (ch === "(" || ch === "[" || ch === "{") tDepth++;
+        else if (ch === ")" || ch === "]" || ch === "}") tDepth = Math.max(0, tDepth - 1);
+        else if (ch === "=" && tDepth === 0) {
+          const prev = i > 0 ? tailStmt[i - 1] : "";
+          const next = i + 1 < tailStmt.length ? tailStmt[i + 1] : "";
+          if (prev !== "=" && prev !== "!" && prev !== "<" && prev !== ">" && next !== "=" && next !== ">") {
+            tailHasAssign = true;
+            break;
+          }
+        }
+      }
+    }
+    return { code: String(rawCode || ""), trimmed, hasTopReturn, lastSemi, tailHasAssign };
+  }
+
+  function buildEvalCandidates(rawCode) {
+    const info = scanJsTopLevel(rawCode);
+    if (!info.trimmed || info.hasTopReturn) return [info.code];
+    const out = [`return (\n${info.trimmed}\n)`];
+    if (info.lastSemi >= 0) {
+      const prefix = info.trimmed.slice(0, info.lastSemi + 1);
+      const lastStmt = info.trimmed.slice(info.lastSemi + 1).trim();
+      if (lastStmt && !NON_EXPR_STMT_RE.test(lastStmt) && !info.tailHasAssign) {
+        out.push(`${prefix}\nreturn (\n${lastStmt}\n);`);
+      }
+    }
+    out.push(info.code);
+    return out;
+  }
+
+  function safeStringifyEval(val) {
+    if (typeof val === "string") return val;
+    if (val === null) return "null";
+    if (typeof val === "number" || typeof val === "boolean" || typeof val === "bigint") {
+      return String(val);
+    }
+    try {
+      const seen = new WeakSet();
+      const s = JSON.stringify(val, (_k, v) => {
+        if (typeof v === "bigint") return String(v);
+        if (v && typeof v === "object") {
+          if (seen.has(v)) return "[Circular]";
+          seen.add(v);
+        }
+        return v;
+      });
+      if (s !== undefined) return s;
+    } catch (_) {}
+    try {
+      return String(val);
+    } catch (_) {
+      return "[Unserializable]";
+    }
+  }
+
+  function toCloneableEval(val) {
+    if (val === undefined || val === null) return null;
+    if (typeof val === "string" || typeof val === "number" || typeof val === "boolean") return val;
+    if (typeof val === "bigint") return String(val);
+    try {
+      return JSON.parse(safeStringifyEval(val));
+    } catch (_) {
+      return safeStringifyEval(val);
+    }
+  }
+
+  async function runInPageEval(rawCode) {
+    const AsyncFn = Object.getPrototypeOf(async function () {}).constructor;
+    const candidates = buildEvalCandidates(rawCode);
+    let fn = null;
+    let lastSyntaxErr = null;
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        fn = new AsyncFn(candidates[i]);
+        break;
+      } catch (synErr) {
+        lastSyntaxErr = synErr;
+        const msg = String((synErr && synErr.message) || synErr || "");
+        if (
+          (synErr && synErr.name === "EvalError")
+          || msg.includes("Content Security Policy")
+          || msg.includes("unsafe-eval")
+        ) {
+          throw synErr;
+        }
+      }
+    }
+    if (!fn) throw lastSyntaxErr || new SyntaxError("Invalid JavaScript in eval()");
+    return await fn();
+  }
+
   async function executeBatch(req) {
     const tBatchStart = performance.now();
+    store.navigating = false;
     if (req.virtualTools) {
       registerVirtualTools(req.virtualTools);
     }
@@ -868,8 +2023,9 @@ IN_PAGE_RUNTIME_JS = r"""
     const steps = req.steps || [];
     const query = String(req.query || "");
     const foldTables = req.fullTable !== true;
-    const viewChanged = (query !== st.lastQuery) || (foldTables !== st.lastFoldTables);
-    const forceFull = req.diff === false || req.fullTable === true || viewChanged;
+    const fullPage = req.fullPage === true;
+    const viewChanged = (query !== st.lastQuery) || (foldTables !== st.lastFoldTables) || (fullPage !== st.lastFullPage);
+    const forceFull = req.diff === false || req.fullTable === true || req.fullPage === true || viewChanged;
     const hadBaseline = st.lastLinesByUid.size > 0 && !viewChanged;
 
     if (steps.length === 0 && req.diff === true && !forceFull && hadBaseline && store.mutationSeq === st.lastSnapSeq) {
@@ -886,19 +2042,41 @@ IN_PAGE_RUNTIME_JS = r"""
       };
     }
 
-    if (!hadBaseline && !query && steps.length > 0) {
-      const base = collectSnapshot("", 180, foldTables);
+    if (!hadBaseline && !query && steps.length > 0 && !req.skipSnapshot) {
+      const base = collectSnapshot("", 180, foldTables, fullPage);
       st.lastLinesByUid = base.currentMap;
       st.lastCrc = base.newCrc;
       st.lastSnapSeq = store.mutationSeq;
       st.lastQuery = "";
       st.lastFoldTables = foldTables;
+      st.lastFullPage = fullPage;
     }
 
     const errors = [];
     const evalOutputs = [];
+    const rawEvalValues = [];
     const escalations = [];
     const tExecStart = performance.now();
+
+    const makeNavigatedEarlyReturn = (nextIdx) => ({
+      navigated: true,
+      nextStepIndex: nextIdx,
+      url: location.href,
+      title: document.title,
+      errors,
+      evalOutputs,
+      rawEvalValues,
+      escalations,
+      cursor: st.cursor,
+      canvases: [],
+      timings: {
+        execMs: +(performance.now() - tExecStart).toFixed(2),
+        settleMs: 0,
+        snapMs: 0,
+        totalInPageMs: +(performance.now() - tBatchStart).toFixed(2)
+      },
+      lines: []
+    });
 
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i] || {};
@@ -907,7 +2085,7 @@ IN_PAGE_RUNTIME_JS = r"""
       const stepValue = s.value !== undefined ? s.value : s.text;
       if (!op) {
         if (!s.optional) {
-          errors.push(`step ${i + 1}: missing 'op' (or 'action') field; valid ops: click, fill, set, type, select, upload, move, press, key, wait, eval, callTool`);
+          errors.push(`step ${i + 1}: missing 'op' (or 'action') field; valid ops: click, fill, set, type, select, upload, move, press, key, waitFor, wait, text, eval, callTool`);
         }
         continue;
       }
@@ -919,35 +2097,45 @@ IN_PAGE_RUNTIME_JS = r"""
       }
       if (!VALID_WEB_OPS.has(op)) {
         if (!s.optional) {
-          errors.push(`step ${i + 1}: unsupported op '${op}'; valid ops: click, fill, set, type, select, upload, move, press, key, wait, eval, callTool`);
+          errors.push(`step ${i + 1}: unsupported op '${op}'; valid ops: click, fill, set, type, select, upload, move, press, key, waitFor, wait, text, eval, callTool`);
         }
         continue;
       }
       try {
-        if (op === "wait" || op === "settle") {
+        const hasWaitCond = (
+          s.text !== undefined || s.anyText !== undefined || s.selector !== undefined
+          || s.url !== undefined || s.gone !== undefined || s.textGone !== undefined
+          || s.selectorGone !== undefined || s.js !== undefined || s.expr !== undefined
+        );
+        if (op === "waitfor" || op === "wait_for" || op === "waituntil" || (op === "wait" && hasWaitCond)) {
+          const wRes = await waitForCondition(s);
+          if (wRes.navigating || store.navigating) return makeNavigatedEarlyReturn(i + 1);
+          if (!wRes.ok && !s.optional) {
+            errors.push(`step ${i + 1} (waitFor): timed out after ${wRes.timeoutMs}ms waiting for ${wRes.desc}`);
+          }
+          continue;
+        }
+        if (op === "wait" || op === "sleep" || op === "delay" || op === "settle") {
           await new Promise(r => setTimeout(r, Number(s.ms || 25)));
+          if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
+          continue;
+        }
+        if (op === "text" || op === "readtext" || op === "readmain") {
+          const selArg = String(s.selector || s.target || s.uid || "");
+          const txtOut = extractReadableText(selArg, Number(s.maxChars || 4000));
+          evalOutputs.push(txtOut);
+          if (req.returnRawEval) rawEvalValues.push(txtOut);
           continue;
         }
         if (op === "snapshot" || op === "diff" || op === "ocr") {
           continue;
         }
-        if (op === "eval") {
+        if (op === "eval" || op === "evaluate") {
           const code = String(s.code || stepValue || "");
-          const body = code.includes("return ") ? code : `return (${code}\n)`;
           try {
-            const AsyncFn = Object.getPrototypeOf(async function () {}).constructor;
-            let fn;
-            try {
-              fn = new AsyncFn(body);
-            } catch (synErr) {
-              if (!code.includes("return ")) {
-                fn = new AsyncFn(code);
-              } else {
-                throw synErr;
-              }
-            }
-            const res = await fn();
-            if (res !== undefined) evalOutputs.push(typeof res === "string" ? res : JSON.stringify(res));
+            const res = await runInPageEval(code);
+            if (res !== undefined) evalOutputs.push(safeStringifyEval(res));
+            if (req.returnRawEval) rawEvalValues.push(toCloneableEval(res));
           } catch (evalErr) {
             const msg = String((evalErr && evalErr.message) || evalErr || "");
             if (
@@ -960,6 +2148,7 @@ IN_PAGE_RUNTIME_JS = r"""
               throw evalErr;
             }
           }
+          if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
           continue;
         }
         if (op === "webmcp" || op === "calltool") {
@@ -967,8 +2156,9 @@ IN_PAGE_RUNTIME_JS = r"""
           const res = await invokeWebMcp(tName, s.args || stepValue || {});
           store.mutationSeq++;
           if (res !== undefined) {
-            evalOutputs.push(`webmcp(${tName}): ${typeof res === "string" ? res : JSON.stringify(res)}`);
+            evalOutputs.push(`webmcp(${tName}): ${safeStringifyEval(res)}`);
           }
+          if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
           continue;
         }
         if (op === "press" || op === "key") {
@@ -978,7 +2168,9 @@ IN_PAGE_RUNTIME_JS = r"""
           active.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
           if (key === "Enter" && active && active.form) {
             active.form.requestSubmit ? active.form.requestSubmit() : active.form.submit();
+            if (!store.navigating) await new Promise(r => setTimeout(r, 0));
           }
+          if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
           continue;
         }
 
@@ -987,6 +2179,8 @@ IN_PAGE_RUNTIME_JS = r"""
           updateAgentCursor(st, hitEl, op, s.x, s.y);
           if (op === "click") {
             dispatchCanvasClick({ x: s.x, y: s.y, label: "@xy", uid: "@xy", canvasUid: "" });
+            if (!store.navigating) await new Promise(r => setTimeout(r, 0));
+            if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
           }
           continue;
         }
@@ -1014,6 +2208,8 @@ IN_PAGE_RUNTIME_JS = r"""
               continue;
             } else if (op === "click") {
               dispatchCanvasClick(ocrItem);
+              if (!store.navigating) await new Promise(r => setTimeout(r, 0));
+              if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
               continue;
             } else if (op === "fill" || op === "set" || op === "type") {
               dispatchCanvasClick(ocrItem);
@@ -1030,7 +2226,8 @@ IN_PAGE_RUNTIME_JS = r"""
           continue;
         }
 
-        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        const scrollEl = (window.getComputedStyle(el).display === "contents" && el.firstElementChild) ? el.firstElementChild : el;
+        scrollEl.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
         updateAgentCursor(st, el, op);
 
         if (op === "move") {
@@ -1085,6 +2282,8 @@ IN_PAGE_RUNTIME_JS = r"""
           }
           el.focus({ preventScroll: true });
           el.click();
+          if (!store.navigating) await new Promise(r => setTimeout(r, 0));
+          if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
         } else if (op === "fill" || op === "set" || op === "type") {
           el.focus({ preventScroll: true });
           setNativeValue(el, stepValue ?? "", Boolean(s.append));
@@ -1111,12 +2310,16 @@ IN_PAGE_RUNTIME_JS = r"""
     }
 
     const execMs = +(performance.now() - tExecStart).toFixed(2);
+    if (store.navigating) {
+      return makeNavigatedEarlyReturn(steps.length);
+    }
     if (req.skipSnapshot) {
       return {
         url: location.href,
         title: document.title,
         errors,
         evalOutputs,
+        rawEvalValues,
         escalations,
         cursor: st.cursor,
         canvases: [],
@@ -1131,13 +2334,16 @@ IN_PAGE_RUNTIME_JS = r"""
       await waitQuietDom(14, 100);
       settleMs = +(performance.now() - tSettle0).toFixed(2);
     }
+    if (store.navigating) {
+      return makeNavigatedEarlyReturn(steps.length);
+    }
 
     const tSnap0 = performance.now();
     const prevMap = st.lastLinesByUid;
     const prevCrc = st.lastCrc;
     st.preBatchLinesByUid = prevMap;
     st.preBatchCrc = prevCrc;
-    const snap = collectSnapshot(query, 180, foldTables);
+    const snap = collectSnapshot(query, 180, foldTables, fullPage);
     if (!query) {
       st.lastLinesByUid = snap.currentMap;
       st.lastCrc = snap.newCrc;
@@ -1145,6 +2351,7 @@ IN_PAGE_RUNTIME_JS = r"""
     }
     st.lastQuery = query;
     st.lastFoldTables = foldTables;
+    st.lastFullPage = fullPage;
 
     const nativeTools = (navigator.modelContext && Array.isArray(navigator.modelContext.tools))
       ? navigator.modelContext.tools.map(t => t.name)
@@ -1160,11 +2367,18 @@ IN_PAGE_RUNTIME_JS = r"""
         const delta = computeDiff(prevMap, snap.currentMap);
         if (delta.length === 0) {
           outLines = [`= unchanged (crc=${snap.newCrc}, seq=${store.mutationSeq})`];
-        } else if (req.diff !== true && delta.length > 24 && delta.join("\n").length > snap.lines.join("\n").length) {
-          outLines = snap.lines;
-          useDiff = false;
         } else {
-          outLines = delta;
+          let removedCount = 0;
+          for (const uid of prevMap.keys()) {
+            if (!snap.currentMap.has(uid)) removedCount++;
+          }
+          const majorRouteSwap = prevMap.size >= 8 && removedCount >= Math.ceil(prevMap.size * 0.75);
+          if ((req.diff !== true || majorRouteSwap) && delta.length > 24 && delta.join("\n").length > snap.lines.join("\n").length) {
+            outLines = snap.lines;
+            useDiff = false;
+          } else {
+            outLines = delta;
+          }
         }
       }
     } else {
@@ -1186,6 +2400,7 @@ IN_PAGE_RUNTIME_JS = r"""
       useDiff,
       errors,
       evalOutputs,
+      rawEvalValues,
       escalations,
       timings: { execMs, settleMs, snapMs, totalInPageMs: +(performance.now() - tBatchStart).toFixed(2) },
       lines: outLines
@@ -1200,10 +2415,11 @@ IN_PAGE_RUNTIME_JS = r"""
     }
     const query = String((opts && opts.query) || "");
     const foldTables = (opts && opts.fullTable) !== true;
+    const fullPage = Boolean(opts && opts.fullPage);
     const useDiff = Boolean(opts && opts.useDiff);
     const prevMap = st.preBatchLinesByUid || st.lastLinesByUid;
     const prevCrc = st.preBatchCrc || st.lastCrc;
-    const snap = collectSnapshot(query, 180, foldTables);
+    const snap = collectSnapshot(query, 180, foldTables, fullPage);
     if (!query) {
       st.lastLinesByUid = snap.currentMap;
       st.lastCrc = snap.newCrc;
@@ -1271,7 +2487,9 @@ class ExtensionWebSocketBridge:
         self._client_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._ready_event = threading.Event()
+        self._hello_event = threading.Event()
         self._hello_info: dict[str, Any] = {}
+        self._sent_runtime_version: str = ""
         self._next_req_id = 1
         self._pending: dict[int, tuple[threading.Event, list[Any]]] = {}
         self._pending_lock = threading.Lock()
@@ -1334,8 +2552,11 @@ class ExtensionWebSocketBridge:
 
     def get_status(self) -> dict[str, Any]:
         self.ensure_preferred_port()
+        connected = self.is_connected()
+        if connected and not self._hello_info:
+            self._hello_event.wait(timeout=0.15)
         return {
-            "connected": self.is_connected(),
+            "connected": connected,
             "port": self.port,
             "preferredPort": self.preferred_port,
             "wsUrl": f"ws://127.0.0.1:{self.preferred_port}/ext",
@@ -1454,6 +2675,9 @@ class ExtensionWebSocketBridge:
                     except Exception:
                         pass
                 self._client_sock = conn
+                self._sent_runtime_version = ""
+                self._hello_info = {}
+                self._hello_event.clear()
                 self._ready_event.set()
 
             while not self._stopped:
@@ -1470,6 +2694,7 @@ class ExtensionWebSocketBridge:
                     msg_type = msg.get("type")
                     if msg_type == "hello":
                         self._hello_info = msg
+                        self._hello_event.set()
                         self._ready_event.set()
                         continue
                     if msg_type and self.on_event is not None:
@@ -1493,6 +2718,7 @@ class ExtensionWebSocketBridge:
             with self._client_lock:
                 if self._client_sock is conn:
                     self._client_sock = None
+                    self._sent_runtime_version = ""
                     self._ready_event.clear()
             with self._pending_lock:
                 for _, (ev, box) in list(self._pending.items()):
@@ -1641,10 +2867,36 @@ class _ExtensionPageAdapter:
             batch_arg = dict(arg)
             if not _preview_enabled():
                 batch_arg["skipPreview"] = True
-            res = self._bridge.call_rpc(
-                "executeBatch",
-                {**batch_arg, "tabId": self.chrome_tab_id, "runtimeJs": IN_PAGE_RUNTIME_JS},
-            )
+            step_wait_s = 0.0
+            for st in batch_arg.get("steps") or []:
+                if isinstance(st, dict):
+                    sop = str(st.get("op") or st.get("action") or "").lower()
+                    if sop in ("waitfor", "wait_for", "waituntil"):
+                        step_wait_s += max(
+                            0.2,
+                            float(st.get("timeoutMs") or st.get("timeout") or st.get("ms") or 5000) / 1000.0,
+                        )
+                    elif sop in ("wait", "sleep", "delay", "settle"):
+                        step_wait_s += max(0.0, float(st.get("ms") or 30) / 1000.0)
+            rpc_timeout = max(12.0, step_wait_s + 8.0)
+            rpc_payload: dict[str, Any] = {
+                **batch_arg,
+                "tabId": self.chrome_tab_id,
+                "runtimeVersion": _FMU_RUNTIME_VERSION,
+            }
+            if self._bridge._sent_runtime_version != _FMU_RUNTIME_VERSION:
+                rpc_payload["runtimeJs"] = IN_PAGE_RUNTIME_JS
+            try:
+                res = self._bridge.call_rpc("executeBatch", rpc_payload, timeout=rpc_timeout)
+                self._bridge._sent_runtime_version = _FMU_RUNTIME_VERSION
+            except Exception as exc:
+                if "No runtimeJs available" in str(exc):
+                    self._bridge._sent_runtime_version = ""
+                    rpc_payload["runtimeJs"] = IN_PAGE_RUNTIME_JS
+                    res = self._bridge.call_rpc("executeBatch", rpc_payload, timeout=rpc_timeout)
+                    self._bridge._sent_runtime_version = _FMU_RUNTIME_VERSION
+                else:
+                    raise
             if isinstance(res, dict):
                 if res.get("url"):
                     self.url = str(res["url"])
@@ -1730,6 +2982,8 @@ class BrowserTabSession:
         self.documented = False
         self._documented_agents: set[str] = set()
         self._focus_emulated = False
+        self._runtime_ensured = False
+        self._ocr_checked = False
         self._ocr_populated = False
         self._last_ocr_items: list[dict[str, Any]] = []
         self._screencast_attached = False
@@ -1738,6 +2992,24 @@ class BrowserTabSession:
         self.last_preview_path: str | None = None
         self.last_vw: int = 1280
         self.last_vh: int = 800
+        if not is_extension and hasattr(page, "on"):
+            try:
+                page.on("framenavigated", self._on_playwright_main_nav)
+            except Exception:
+                pass
+
+    def _on_playwright_main_nav(self, frame: Any) -> None:
+        try:
+            if frame == self._raw_page.main_frame:
+                new_u = str(getattr(self._raw_page, "url", "") or "")
+                if not _same_origin_and_path(self.last_url, new_u):
+                    self._runtime_ensured = False
+                    self._ocr_checked = False
+                    self._ocr_populated = False
+                    self._focus_emulated = False
+        except Exception:
+            self._runtime_ensured = False
+            self._ocr_checked = False
 
     def enable_background_focus_emulation(self) -> None:
         if self._focus_emulated:
@@ -1829,8 +3101,29 @@ class BrowserTabSession:
             pass
         return self.last_preview_path
 
-    def ensure_runtime(self) -> None:
-        self._raw_page.evaluate(IN_PAGE_RUNTIME_JS)
+    def ensure_runtime(self, force: bool = False) -> None:
+        if self.is_extension and not force:
+            self._runtime_ensured = True
+            return
+        if self._runtime_ensured and not force:
+            return
+        try:
+            self._raw_page.evaluate(IN_PAGE_RUNTIME_JS)
+            self._runtime_ensured = True
+        except Exception as exc:
+            if not _is_navigation_error(exc):
+                raise
+            if not self.is_extension:
+                try:
+                    self._raw_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                self._focus_emulated = False
+                self.enable_background_focus_emulation()
+            else:
+                time.sleep(0.1)
+            self._raw_page.evaluate(IN_PAGE_RUNTIME_JS)
+            self._runtime_ensured = True
 
 
 class BrowserEngine:
@@ -2042,6 +3335,10 @@ class BrowserEngine:
         if not url:
             return False
         raw = str(url).strip()
+        if raw in ("about:blank", "*"):
+            return False
+        if not _HAS_SCHEME_RE.match(raw) and "." in raw and " " not in raw:
+            raw = _normalize_nav_url(raw)
         if not raw.startswith(("http://", "https://")):
             return False
         try:
@@ -2176,6 +3473,7 @@ class BrowserEngine:
     ) -> list[dict[str, Any]]:
         if canvases is None:
             try:
+                sess.ensure_runtime(force=sess.is_extension)
                 canvases = sess._raw_page.evaluate(
                     "() => (window.__fmu ? (window.__fmu.collectSnapshot('', 180, true).canvases || []) : [])"
                 )
@@ -2435,6 +3733,7 @@ class BrowserEngine:
         group_color: str = "blue",
         window: str | None = None,
         window_id: int | None = None,
+        chrome_tab_id: int | None = None,
         reuse_existing: bool = False,
         require_extension: bool = False,
     ) -> BrowserTabSession:
@@ -2447,6 +3746,7 @@ class BrowserEngine:
                 group_color,
                 window=window,
                 window_id=window_id,
+                chrome_tab_id=chrome_tab_id,
                 reuse_existing=reuse_existing,
                 require_extension=require_extension,
             )
@@ -2470,10 +3770,15 @@ class BrowserEngine:
         url: str | None = None,
         window: str | None = None,
         window_id: int | None = None,
+        chrome_tab_id: int | None = None,
         reuse_existing: bool = False,
         reattach: bool = False,
     ) -> bool:
-        explicit_ext = mode in ("extension", "chrome-extension", "live") or require_extension
+        explicit_ext = (
+            mode in ("extension", "chrome-extension", "live")
+            or require_extension
+            or chrome_tab_id is not None
+        )
         if mode == "headless" and not explicit_ext:
             return False
         use_ext_env = os.environ.get("FMU_USE_EXTENSION", "1") != "0"
@@ -2516,17 +3821,24 @@ class BrowserEngine:
         group_color: str = "blue",
         window: str | None = None,
         window_id: int | None = None,
+        chrome_tab_id: int | None = None,
         reuse_existing: bool = False,
         require_extension: bool = False,
         reattach: bool = False,
         schedule_preview: bool = True,
     ) -> BrowserTabSession:
         self._cancel_pending_preview()
-        tid = tab_id or f"t{self._next_tab_num}"
+        if tab_id:
+            tid = tab_id
+        else:
+            while f"t{self._next_tab_num}" in self._tabs:
+                self._next_tab_num += 1
+            tid = f"t{self._next_tab_num}"
         effective_url = url or self._tab_last_urls.get(tid) or "about:blank"
         must_use_ext = (
             mode in ("extension", "chrome-extension", "live")
             or require_extension
+            or chrome_tab_id is not None
             or (
                 mode == "chrome"
                 and os.environ.get("FMU_USE_EXTENSION", "1") != "0"
@@ -2542,14 +3854,23 @@ class BrowserEngine:
         if tid in self._tabs:
             sess = self._tabs[tid]
             if self._is_session_alive(sess) and (not must_use_ext or sess.is_extension):
-                if url and url != "about:blank" and sess._raw_page.url != url:
-                    sess._raw_page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                    sess.last_url = url
-                    self._tab_last_urls[tid] = url
-                    sess._focus_emulated = False
-                    sess._ocr_populated = False
-                    sess.enable_background_focus_emulation()
-                    sess.ensure_runtime()
+                if (
+                    url
+                    and url != "about:blank"
+                    and sess._raw_page.url != url
+                    and not (reuse_existing and _url_matches_target(sess._raw_page.url, url))
+                ):
+                    norm_u = _normalize_nav_url(url)
+                    if sess._raw_page.url != norm_u:
+                        sess._raw_page.goto(norm_u, wait_until="domcontentloaded", timeout=15000)
+                        sess.last_url = str(getattr(sess._raw_page, "url", "") or norm_u)
+                        self._tab_last_urls[tid] = sess.last_url
+                        sess._focus_emulated = False
+                        sess._runtime_ensured = False
+                        sess._ocr_checked = False
+                        sess._ocr_populated = False
+                        sess.enable_background_focus_emulation()
+                        sess.ensure_runtime()
                 return sess
             self._tabs.pop(tid, None)
 
@@ -2559,6 +3880,7 @@ class BrowserEngine:
             url=effective_url,
             window=window,
             window_id=window_id,
+            chrome_tab_id=chrome_tab_id,
             reuse_existing=reuse_existing,
             reattach=reattach,
         ):
@@ -2574,12 +3896,14 @@ class BrowserEngine:
                     rpc_params["window"] = str(window)
                 if window_id is not None:
                     rpc_params["windowId"] = int(window_id)
+                if chrome_tab_id is not None:
+                    rpc_params["chromeTabId"] = int(chrome_tab_id)
                 if reuse_existing:
                     rpc_params["reuseExisting"] = True
                 if reattach:
                     rpc_params["reattach"] = True
                 ext_res = self._ext_bridge.call_rpc("createBrowserTab", rpc_params)
-                chrome_tab_id = int(ext_res.get("tabId", 1))
+                ext_chrome_tid = int(ext_res.get("tabId", chrome_tab_id or 1))
                 chrome_win_id = ext_res.get("windowId")
                 actual_url = str(ext_res.get("url") or effective_url)
                 actual_title = str(ext_res.get("title") or "")
@@ -2592,13 +3916,13 @@ class BrowserEngine:
 
                 ext_page = _ExtensionPageAdapter(
                     self._ext_bridge,
-                    chrome_tab_id,
+                    ext_chrome_tid,
                     initial_url=actual_url,
                     initial_title=actual_title,
                     window_id=int(chrome_win_id) if chrome_win_id is not None else None,
                     on_preview=_handle_ext_preview,
                 )
-                ext_cdp = _ExtensionCdpAdapter(self._ext_bridge, chrome_tab_id)
+                ext_cdp = _ExtensionCdpAdapter(self._ext_bridge, ext_chrome_tid)
                 sess = BrowserTabSession(
                     engine=self,
                     tab_id=tid,
@@ -2627,6 +3951,7 @@ class BrowserEngine:
         self._next_tab_num += 1
         page = self._context.new_page()
         cdp = self._context.new_cdp_session(page)
+        norm_eff_url = _normalize_nav_url(effective_url) if effective_url and effective_url != "about:blank" else "about:blank"
         sess = BrowserTabSession(
             engine=self,
             tab_id=tid,
@@ -2634,16 +3959,17 @@ class BrowserEngine:
             cdp_session=cdp,
             group_name=session_name,
             group_color=group_color,
-            last_url=effective_url,
+            last_url=norm_eff_url,
             is_extension=False,
         )
         sess.enable_background_focus_emulation()
         sess.start_playwright_screencast()
         self._tabs[tid] = sess
 
-        if effective_url and effective_url != "about:blank":
-            page.goto(effective_url, wait_until="domcontentloaded", timeout=15000)
-            self._tab_last_urls[tid] = effective_url
+        if norm_eff_url and norm_eff_url != "about:blank":
+            page.goto(norm_eff_url, wait_until="domcontentloaded", timeout=15000)
+            sess.last_url = page.url or norm_eff_url
+            self._tab_last_urls[tid] = sess.last_url
             self._try_assign_chrome_tab_group(page.url, session_name, color=group_color)
             if schedule_preview:
                 self._schedule_async_preview(
@@ -2655,6 +3981,245 @@ class BrowserEngine:
                 )
         sess.ensure_runtime()
         return sess
+
+    def attach_existing_tab(
+        self,
+        *,
+        tab_id: str | None = None,
+        chrome_tab_id: int | None = None,
+        url_pattern: str | None = None,
+        window: str | None = None,
+        window_id: int | None = None,
+        session_name: str | None = None,
+        group_color: str = "blue",
+    ) -> BrowserTabSession | None:
+        return self._run_sync(
+            lambda: self._attach_existing_tab_inner(
+                tab_id=tab_id,
+                chrome_tab_id=chrome_tab_id,
+                url_pattern=url_pattern,
+                window=window,
+                window_id=window_id,
+                session_name=session_name,
+                group_color=group_color,
+            )
+        )
+
+    def _attach_existing_tab_inner(
+        self,
+        *,
+        tab_id: str | None = None,
+        chrome_tab_id: int | None = None,
+        url_pattern: str | None = None,
+        window: str | None = None,
+        window_id: int | None = None,
+        session_name: str | None = None,
+        group_color: str = "blue",
+    ) -> BrowserTabSession | None:
+        if chrome_tab_id is not None:
+            for existing in list(self._tabs.values()):
+                if (
+                    existing.is_extension
+                    and self._is_session_alive(existing)
+                    and getattr(existing._raw_page, "chrome_tab_id", None) == int(chrome_tab_id)
+                ):
+                    return existing
+        if os.environ.get("FMU_USE_EXTENSION", "1") == "0":
+            return None
+        if not self._ext_bridge.is_connected():
+            if chrome_tab_id is not None or (
+                self._ext_bridge_inst is not None and (time.monotonic() - self._init_mono) < 3.0
+            ):
+                self._ext_bridge.wait_connected(timeout=0.25)
+        if not self._ext_bridge.is_connected():
+            if chrome_tab_id is not None:
+                raise RuntimeError(self._extension_diagnostic_error())
+            return None
+
+        rpc_params: dict[str, Any] = {
+            "allowMissing": True,
+            "skipPreview": not _preview_enabled(),
+        }
+        if chrome_tab_id is not None:
+            rpc_params["chromeTabId"] = int(chrome_tab_id)
+        if url_pattern:
+            rpc_params["urlPattern"] = str(url_pattern)
+        if window:
+            rpc_params["window"] = str(window)
+        if window_id is not None:
+            rpc_params["windowId"] = int(window_id)
+        if session_name:
+            rpc_params["sessionName"] = str(session_name)
+
+        try:
+            ext_res = self._ext_bridge.call_rpc("getTab", rpc_params, timeout=4.0)
+        except Exception:
+            if chrome_tab_id is not None:
+                raise
+            return None
+
+        if not isinstance(ext_res, dict) or not ext_res.get("found") or not ext_res.get("tabId"):
+            return None
+
+        matched_chrome_tid = int(ext_res["tabId"])
+        actual_url = str(ext_res.get("url") or "about:blank")
+        actual_title = str(ext_res.get("title") or "")
+        chrome_win_id = ext_res.get("windowId")
+
+        for existing in list(self._tabs.values()):
+            if (
+                existing.is_extension
+                and self._is_session_alive(existing)
+                and getattr(existing._raw_page, "chrome_tab_id", None) == matched_chrome_tid
+            ):
+                if actual_url:
+                    existing.last_url = actual_url
+                    existing._raw_page.url = actual_url
+                    self._tab_last_urls[existing.tab_id] = actual_url
+                if actual_title:
+                    existing.last_title = actual_title
+                    existing._raw_page.title = actual_title
+                    self._tab_last_titles[existing.tab_id] = actual_title
+                return existing
+
+        if tab_id:
+            tid = tab_id
+        else:
+            while f"t{self._next_tab_num}" in self._tabs:
+                self._next_tab_num += 1
+            tid = f"t{self._next_tab_num}"
+        self._next_tab_num += 1
+        eff_group = str(ext_res.get("groupTitle") or session_name or "🤖 Agent")
+        sess_holder: list[BrowserTabSession] = []
+
+        def _handle_ext_preview(prev_obj: dict[str, Any], u_hint: str) -> None:
+            if sess_holder:
+                self._apply_inline_preview(sess_holder[0], prev_obj, url_hint=u_hint, push_frame=True)
+
+        ext_page = _ExtensionPageAdapter(
+            self._ext_bridge,
+            matched_chrome_tid,
+            initial_url=actual_url,
+            initial_title=actual_title,
+            window_id=int(chrome_win_id) if chrome_win_id is not None else None,
+            on_preview=_handle_ext_preview,
+        )
+        ext_cdp = _ExtensionCdpAdapter(self._ext_bridge, matched_chrome_tid)
+        sess = BrowserTabSession(
+            engine=self,
+            tab_id=tid,
+            page=ext_page,
+            cdp_session=ext_cdp,
+            group_name=eff_group,
+            group_color=group_color,
+            last_url=actual_url,
+            last_title=actual_title,
+            is_extension=True,
+        )
+        sess_holder.append(sess)
+        self._tabs[tid] = sess
+        self._tab_last_urls[tid] = actual_url
+        if actual_title:
+            self._tab_last_titles[tid] = actual_title
+        if isinstance(ext_res.get("preview"), dict):
+            self._apply_inline_preview(sess, ext_res["preview"], url_hint=actual_url, push_frame=True)
+        return sess
+
+    def list_tabs(
+        self,
+        query: str = "",
+        *,
+        window: str | None = None,
+        window_id: int | None = None,
+        session_name: str | None = None,
+        include_internal: bool = False,
+        mode: str = "chrome",
+    ) -> str:
+        return self._run_sync(
+            lambda: self._list_tabs_inner(
+                query=query,
+                window=window,
+                window_id=window_id,
+                session_name=session_name,
+                include_internal=include_internal,
+                mode=mode,
+            )
+        )
+
+    def _list_tabs_inner(
+        self,
+        *,
+        query: str = "",
+        window: str | None = None,
+        window_id: int | None = None,
+        session_name: str | None = None,
+        include_internal: bool = False,
+        mode: str = "chrome",
+    ) -> str:
+        q_low = str(query or "").strip().lower()
+        chrome_tid_to_sess: dict[int, str] = {}
+        for tid_k, s_v in list(self._tabs.items()):
+            if s_v.is_extension and self._is_session_alive(s_v):
+                ctid = getattr(s_v._raw_page, "chrome_tab_id", None)
+                if ctid is not None:
+                    chrome_tid_to_sess[int(ctid)] = tid_k
+
+        lines: list[str] = []
+        ext_used = False
+        if mode != "headless" and os.environ.get("FMU_USE_EXTENSION", "1") != "0":
+            if not self._ext_bridge.is_connected() and self._ext_bridge_inst is not None and (time.monotonic() - self._init_mono) < 3.0:
+                self._ext_bridge.wait_connected(timeout=0.2)
+            if self._ext_bridge.is_connected():
+                rpc_p: dict[str, Any] = {"includeInternal": bool(include_internal)}
+                if query:
+                    rpc_p["query"] = str(query)
+                if window:
+                    rpc_p["window"] = str(window)
+                if window_id is not None:
+                    rpc_p["windowId"] = int(window_id)
+                if session_name:
+                    rpc_p["sessionName"] = str(session_name)
+                try:
+                    ext_res = self._ext_bridge.call_rpc("listTabs", rpc_p, timeout=4.0)
+                    if isinstance(ext_res, dict) and isinstance(ext_res.get("tabs"), list):
+                        ext_used = True
+                        for t in ext_res["tabs"]:
+                            if not isinstance(t, dict) or t.get("tabId") is None:
+                                continue
+                            ctid_i = int(t["tabId"])
+                            parts = [f"@tab id={ctid_i}"]
+                            if ctid_i in chrome_tid_to_sess:
+                                parts.append(f"session={chrome_tid_to_sess[ctid_i]}")
+                            if t.get("windowId") is not None:
+                                parts.append(f"window={t['windowId']}")
+                            g_title = str(t.get("groupTitle") or "")
+                            if g_title:
+                                parts.append(f"group={json.dumps(g_title, ensure_ascii=False)}")
+                            if t.get("active"):
+                                parts.append("[active]")
+                            t_title = str(t.get("title") or "").replace("\n", " ").strip()
+                            if len(t_title) > 90:
+                                t_title = t_title[:87] + "..."
+                            parts.append(json.dumps(t_title, ensure_ascii=False))
+                            parts.append(str(t.get("url") or ""))
+                            lines.append(" ".join(parts))
+                except Exception:
+                    pass
+
+        for tid_k, s_v in list(self._tabs.items()):
+            if s_v.is_extension or not self._is_session_alive(s_v):
+                continue
+            u_str = str(getattr(s_v._raw_page, "url", "") or s_v.last_url or "")
+            t_str = str(s_v.last_title or "")
+            if q_low and q_low not in u_str.lower() and q_low not in t_str.lower() and q_low not in tid_k.lower():
+                continue
+            lines.append(
+                f'@tab session={tid_k} bridge="playwright" {json.dumps(t_str, ensure_ascii=False)} {u_str}'
+            )
+
+        bridge_label = "mv3" if ext_used else ("playwright" if lines else ("mv3" if self._ext_bridge.is_connected() else "none"))
+        header = f'# tabs count={len(lines)} bridge="{bridge_label}"'
+        return "\n".join([header] + lines)
 
     def get_tab(self, tab_id: str | None = None) -> BrowserTabSession:
         return self._run_sync(lambda: self._get_tab_inner(tab_id))
@@ -2683,15 +4248,39 @@ class BrowserEngine:
                 pass
         return f"# web tab={tab_id} closed"
 
-    def _eval_step_via_cdp(self, sess: BrowserTabSession, raw_code: str) -> Any:
-        code = str(raw_code or "")
-        body = code if "return " in code else f"return ({code}\n)"
+    def _eval_step_via_cdp(self, sess: BrowserTabSession, raw_code: str) -> tuple[bool, Any]:
+        candidates = _build_js_eval_candidates(raw_code)
 
-        def _send(expr_body: str) -> Any:
+        def _send(expr_body: str) -> tuple[bool, Any]:
+            wrapped = (
+                "(async () => {\n"
+                "  const __fmuRun = async () => {\n"
+                f"{expr_body}\n"
+                "  };\n"
+                "  const __val = await __fmuRun();\n"
+                "  if (__val === undefined) return { __fmuEvalBox: true, hasValue: false, raw: null };\n"
+                "  if (__val === null || typeof __val === 'string' || typeof __val === 'number' || typeof __val === 'boolean') {\n"
+                "    return { __fmuEvalBox: true, hasValue: true, raw: __val };\n"
+                "  }\n"
+                "  if (typeof __val === 'bigint') {\n"
+                "    return { __fmuEvalBox: true, hasValue: true, raw: String(__val) };\n"
+                "  }\n"
+                "  try {\n"
+                "    const __seen = new WeakSet();\n"
+                "    const __s = JSON.stringify(__val, (_k, v) => {\n"
+                "      if (typeof v === 'bigint') return String(v);\n"
+                "      if (v && typeof v === 'object') { if (__seen.has(v)) return '[Circular]'; __seen.add(v); }\n"
+                "      return v;\n"
+                "    });\n"
+                "    if (__s !== undefined) return { __fmuEvalBox: true, hasValue: true, raw: JSON.parse(__s) };\n"
+                "  } catch (_) {}\n"
+                "  return { __fmuEvalBox: true, hasValue: true, raw: String(__val) };\n"
+                "})()"
+            )
             cdp_res = sess._raw_cdp.send(
                 "Runtime.evaluate",
                 {
-                    "expression": f"(async () => {{\n{expr_body}\n}})()",
+                    "expression": wrapped,
                     "awaitPromise": True,
                     "returnByValue": True,
                 },
@@ -2702,15 +4291,25 @@ class BrowserEngine:
                 desc = res_obj.get("description") or exc_det.get("text") or "Runtime.evaluate error"
                 raise RuntimeError(str(desc))
             if isinstance(cdp_res, dict) and isinstance(cdp_res.get("result"), dict):
-                return cdp_res["result"].get("value")
-            return None
+                val = cdp_res["result"].get("value")
+                if isinstance(val, dict) and val.get("__fmuEvalBox") is True:
+                    return bool(val.get("hasValue")), val.get("raw")
+                if "value" in cdp_res["result"]:
+                    return True, val
+            return False, None
 
-        try:
-            return _send(body)
-        except Exception as exc:
-            if "return " not in code and "SyntaxError" in str(exc):
-                return _send(code)
-            raise
+        last_err: Exception | None = None
+        for idx, cand in enumerate(candidates):
+            try:
+                return _send(cand)
+            except Exception as exc:
+                last_err = exc
+                if idx + 1 < len(candidates) and "SyntaxError" in str(exc):
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+        return False, None
 
     def _handle_eval_escalations(
         self,
@@ -2720,6 +4319,7 @@ class BrowserEngine:
         agent_id: str,
         query: str = "",
         full_table: bool = False,
+        full_page: bool = False,
         skip_snapshot: bool = False,
     ) -> None:
         if not isinstance(res, dict):
@@ -2728,6 +4328,7 @@ class BrowserEngine:
         if not isinstance(escs, list) or not escs:
             return
         eval_outs = list(res.get("evalOutputs") or [])
+        raw_vals = list(res.get("rawEvalValues") or [])
         errs = list(res.get("errors") or [])
         ran_any = False
         for esc in escs:
@@ -2736,15 +4337,17 @@ class BrowserEngine:
             ran_any = True
             esc["handled"] = True
             try:
-                val = self._eval_step_via_cdp(sess, str(esc.get("code") or ""))
-                if val is not None:
-                    eval_outs.append(val if isinstance(val, str) else json.dumps(val))
+                has_val, val = self._eval_step_via_cdp(sess, str(esc.get("code") or ""))
+                if has_val:
+                    eval_outs.append(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
+                raw_vals.append(val if has_val else None)
             except Exception as exc:
                 step_no = esc.get("step", 1)
                 errs.append(f"step {step_no} (eval): {exc}")
         if not ran_any:
             return
         res["evalOutputs"] = eval_outs
+        res["rawEvalValues"] = raw_vals
         res["errors"] = errs
         if not skip_snapshot:
             try:
@@ -2754,6 +4357,7 @@ class BrowserEngine:
                         "agent": agent_id,
                         "query": query,
                         "fullTable": full_table,
+                        "fullPage": full_page,
                         "useDiff": bool(res.get("useDiff")),
                     },
                 )
@@ -2765,8 +4369,260 @@ class BrowserEngine:
             except Exception:
                 pass
 
+    def _settle_playwright_navigation(self, sess: BrowserTabSession, prev_url: str, tab_id: str) -> None:
+        if sess.is_extension:
+            return
+        deadline = time.monotonic() + 0.16
+        while time.monotonic() < deadline:
+            try:
+                if sess._raw_page.is_closed():
+                    return
+                if prev_url and sess._raw_page.url != prev_url:
+                    break
+            except Exception:
+                break
+            time.sleep(0.015)
+        try:
+            sess._raw_page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        if not sess._raw_page.is_closed():
+            if sess._raw_page.url:
+                sess.last_url = sess._raw_page.url
+                self._tab_last_urls[tab_id] = sess._raw_page.url
+            sess._focus_emulated = False
+            sess._runtime_ensured = False
+            sess._ocr_checked = False
+            sess._ocr_populated = False
+            sess.enable_background_focus_emulation()
+            sess.ensure_runtime()
+
+    def _eval_batch_handling_navigation(
+        self,
+        sess: BrowserTabSession,
+        payload: dict[str, Any],
+        *,
+        tab_id: str,
+    ) -> dict[str, Any]:
+        prev_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
+        steps = list(payload.get("steps") or [])
+
+        def _invoke(p: dict[str, Any]) -> dict[str, Any]:
+            try:
+                out = sess._raw_page.evaluate("req => window.__fmu.executeBatch(req)", p)
+                return out if isinstance(out, dict) else {}
+            except Exception as inner_exc:
+                msg = str(inner_exc)
+                if (
+                    "window.__fmu" in msg
+                    or ("executeBatch" in msg and "undefined" in msg)
+                    or "Cannot read properties of undefined" in msg
+                ):
+                    sess._focus_emulated = False
+                    sess.enable_background_focus_emulation()
+                    sess.ensure_runtime(force=True)
+                    out = sess._raw_page.evaluate("req => window.__fmu.executeBatch(req)", p)
+                    return out if isinstance(out, dict) else {}
+                raise
+
+        try:
+            res = _invoke(payload)
+        except Exception as exc:
+            if not _is_navigation_error(exc) or sess._raw_page.is_closed():
+                raise
+            self._settle_playwright_navigation(sess, prev_url, tab_id)
+            if sess.is_extension:
+                time.sleep(0.08)
+            rem_steps: list[dict[str, Any]] = []
+            nav_trigger_idx = next(
+                (
+                    idx
+                    for idx, stp in enumerate(steps)
+                    if str(stp.get("op") or stp.get("action") or "").lower()
+                    in ("click", "press", "key", "eval", "evaluate", "webmcp", "calltool")
+                ),
+                -1,
+            )
+            if nav_trigger_idx >= 0:
+                rem_steps = [
+                    stp
+                    for stp in steps[nav_trigger_idx + 1 :]
+                    if str(stp.get("op") or stp.get("action") or "").lower()
+                    in (
+                        "wait",
+                        "sleep",
+                        "delay",
+                        "settle",
+                        "waitfor",
+                        "wait_for",
+                        "waituntil",
+                        "text",
+                        "readtext",
+                        "readmain",
+                        "eval",
+                        "evaluate",
+                        "snapshot",
+                        "diff",
+                    )
+                ]
+            follow_payload = dict(payload)
+            follow_payload["steps"] = rem_steps
+            if not follow_payload.get("skipSnapshot"):
+                follow_payload["diff"] = False
+            follow_payload["virtualTools"] = self.get_macros_for_url(sess.last_url)
+            res_after_err = _invoke(follow_payload)
+            res_after_err["didNavigate"] = True
+            return res_after_err
+
+        if isinstance(res, dict) and res.get("navigated"):
+            prior_errors = list(res.get("errors") or [])
+            prior_evals = list(res.get("evalOutputs") or [])
+            prior_raw_vals = list(res.get("rawEvalValues") or [])
+            next_idx = int(res.get("nextStepIndex") or len(steps))
+            rem_steps = steps[next_idx:] if next_idx < len(steps) else []
+            self._settle_playwright_navigation(sess, str(res.get("url") or prev_url), tab_id)
+            if sess.is_extension:
+                time.sleep(0.08)
+            if payload.get("skipSnapshot") and not rem_steps:
+                return {
+                    "didNavigate": True,
+                    "url": str(getattr(sess._raw_page, "url", "") or sess.last_url or ""),
+                    "title": sess.last_title,
+                    "errors": prior_errors,
+                    "evalOutputs": prior_evals,
+                    "rawEvalValues": prior_raw_vals,
+                    "escalations": [],
+                    "canvases": [],
+                    "timings": res.get("timings") or {},
+                    "lines": [],
+                }
+            follow_payload = dict(payload)
+            follow_payload["steps"] = rem_steps
+            if not follow_payload.get("skipSnapshot"):
+                follow_payload["diff"] = False
+            follow_payload["virtualTools"] = self.get_macros_for_url(sess.last_url)
+            res2 = _invoke(follow_payload)
+            res2["didNavigate"] = True
+            res2["errors"] = prior_errors + list(res2.get("errors") or [])
+            res2["evalOutputs"] = prior_evals + list(res2.get("evalOutputs") or [])
+            res2["rawEvalValues"] = prior_raw_vals + list(res2.get("rawEvalValues") or [])
+            return res2
+
+        return res
+
+    def evaluate_value(
+        self,
+        code: str,
+        *,
+        agent: str = "default",
+        session: str | None = None,
+        mode: str = "chrome",
+        session_name: str = "🤖 Agent",
+        window: str | None = None,
+        window_id: int | None = None,
+        chrome_tab_id: int | None = None,
+        require_extension: bool = False,
+        step_override: dict[str, Any] | None = None,
+    ) -> Any:
+        if is_user_stopped():
+            raise RuntimeError(USER_STOPPED_ERROR)
+
+        def _run_once(force_reattach: bool = False) -> Any:
+            agent_id = str(agent or "default").strip() or "default"
+            default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
+            tab_id = str(session or default_tab)
+            group_color = self._get_agent_color(agent_id)
+            restore_url = self._tab_last_urls.get(tab_id) or "about:blank"
+            req_ext = (
+                bool(require_extension)
+                or mode in ("extension", "chrome-extension", "live")
+                or chrome_tab_id is not None
+            )
+            needs_ext = req_ext or (
+                mode == "chrome"
+                and os.environ.get("FMU_USE_EXTENSION", "1") != "0"
+                and not self._find_chrome_devtools_ws()
+                and (self._is_external_url(restore_url) or window is not None or window_id is not None)
+            )
+            if (
+                tab_id not in self._tabs
+                or not self._is_session_alive(self._tabs[tab_id])
+                or (needs_ext and not self._tabs[tab_id].is_extension)
+            ):
+                sess = self._create_tab_inner(
+                    url=restore_url,
+                    mode=mode,
+                    session_name=session_name,
+                    tab_id=tab_id,
+                    group_color=group_color,
+                    window=window,
+                    window_id=window_id,
+                    chrome_tab_id=chrome_tab_id,
+                    reuse_existing=force_reattach,
+                    require_extension=req_ext,
+                    reattach=(force_reattach or tab_id not in self._tab_last_urls),
+                    schedule_preview=False,
+                )
+            else:
+                sess = self._tabs[tab_id]
+            sess.enable_background_focus_emulation()
+            sess.ensure_runtime()
+            step_item = dict(step_override) if step_override is not None else {"op": "eval", "code": str(code)}
+            res = self._eval_batch_handling_navigation(
+                sess,
+                {
+                    "agent": agent_id,
+                    "steps": [step_item],
+                    "settle": False,
+                    "skipSnapshot": True,
+                    "returnRawEval": True,
+                },
+                tab_id=tab_id,
+            )
+            self._handle_eval_escalations(
+                sess,
+                res,
+                agent_id=agent_id,
+                skip_snapshot=True,
+            )
+            errs = res.get("errors") or []
+            if errs:
+                raise RuntimeError("; ".join(str(e) for e in errs))
+            raw_vals = res.get("rawEvalValues")
+            if isinstance(raw_vals, list) and raw_vals:
+                return raw_vals[-1]
+            eval_outs = res.get("evalOutputs")
+            if isinstance(eval_outs, list) and eval_outs:
+                return eval_outs[-1]
+            return None
+
+        def _run() -> Any:
+            try:
+                return _run_once(False)
+            except Exception as exc:
+                msg = str(exc)
+                if any(
+                    tok in msg
+                    for tok in (
+                        "No tab with given id",
+                        "No target with given id",
+                        "Tab not found",
+                        "Target page, context or browser has been closed",
+                        "TargetClosedError",
+                        "Session closed",
+                    )
+                ):
+                    agent_id = str(agent or "default").strip() or "default"
+                    default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
+                    tab_id = str(session or default_tab)
+                    self._tabs.pop(tab_id, None)
+                    return _run_once(True)
+                raise
+
+        return self._run_sync(_run)
+
     def execute_batch(self, req: dict[str, Any]) -> str:
-        if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension")) and is_user_stopped():
+        if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension", "listTabs")) and is_user_stopped():
             return USER_STOPPED_ERROR
         return self._run_sync(lambda: self._execute_batch_with_retry(req))
 
@@ -2795,6 +4651,9 @@ class BrowserEngine:
             if any(
                 tok in msg
                 for tok in (
+                    "No tab with given id",
+                    "No target with given id",
+                    "Tab not found",
                     "Target page, context or browser has been closed",
                     "TargetClosedError",
                     "Connection closed",
@@ -2843,6 +4702,27 @@ class BrowserEngine:
             self._ext_bridge.call_rpc("reloadExtension", {}, timeout=3.0)
             return "# fmu-web extension reloading"
 
+        if req.get("listTabs"):
+            lt_spec = req["listTabs"]
+            if isinstance(lt_spec, dict):
+                return self._list_tabs_inner(
+                    query=str(lt_spec.get("query") or req.get("query") or ""),
+                    window=str(lt_spec["window"]) if lt_spec.get("window") else (str(req["window"]) if req.get("window") else None),
+                    window_id=int(lt_spec["windowId"]) if lt_spec.get("windowId") is not None else (int(req["windowId"]) if req.get("windowId") is not None else None),
+                    session_name=str(lt_spec["sessionName"]) if lt_spec.get("sessionName") else (str(req["sessionName"]) if req.get("sessionName") else None),
+                    include_internal=bool(lt_spec.get("includeInternal", False)),
+                    mode=str(lt_spec.get("mode") or req.get("mode") or "chrome"),
+                )
+            q_val = lt_spec if isinstance(lt_spec, str) else str(req.get("query") or "")
+            return self._list_tabs_inner(
+                query=q_val,
+                window=str(req["window"]) if req.get("window") else None,
+                window_id=int(req["windowId"]) if req.get("windowId") is not None else None,
+                session_name=str(req["sessionName"]) if req.get("sessionName") else None,
+                include_internal=bool(req.get("includeInternal", False)),
+                mode=str(req.get("mode") or "chrome"),
+            )
+
         if req.get("saveMacro"):
             m_spec = req["saveMacro"]
             if isinstance(m_spec, str):
@@ -2869,6 +4749,7 @@ class BrowserEngine:
         require_ext = bool(req.get("requireExtension")) or mode in ("extension", "chrome-extension", "live")
         window_filter = str(req["window"]) if req.get("window") else None
         window_id = int(req["windowId"]) if req.get("windowId") is not None else None
+        chrome_tab_id = int(req["chromeTabId"]) if req.get("chromeTabId") is not None else None
         reuse_existing = bool(req.get("reuseExisting"))
         url = req.get("url")
         steps = list(req.get("steps") or [])
@@ -2935,6 +4816,7 @@ class BrowserEngine:
                 require_ext=require_ext,
                 window_filter=window_filter,
                 window_id=window_id,
+                chrome_tab_id=chrome_tab_id,
                 reuse_existing=reuse_existing,
                 url=url,
                 steps=steps,
@@ -2961,6 +4843,7 @@ class BrowserEngine:
         require_ext: bool,
         window_filter: str | None,
         window_id: int | None,
+        chrome_tab_id: int | None,
         reuse_existing: bool,
         url: Any,
         steps: list[dict[str, Any]],
@@ -2971,6 +4854,7 @@ class BrowserEngine:
         self._cancel_pending_preview()
         needs_ext_for_req = (
             require_ext
+            or chrome_tab_id is not None
             or (
                 mode == "chrome"
                 and os.environ.get("FMU_USE_EXTENSION", "1") != "0"
@@ -2986,6 +4870,7 @@ class BrowserEngine:
 
         reattach_candidate = bool(
             url is None
+            and chrome_tab_id is None
             and tab_id not in self._tabs
             and tab_id not in self._tab_last_urls
             and (steps or req.get("diff") is not None or req.get("query"))
@@ -3009,6 +4894,7 @@ class BrowserEngine:
                 group_color=group_color,
                 window=window_filter,
                 window_id=window_id,
+                chrome_tab_id=chrome_tab_id,
                 reuse_existing=reuse_existing,
                 require_extension=require_ext,
                 reattach=reattach_candidate,
@@ -3017,15 +4903,23 @@ class BrowserEngine:
         else:
             sess = self._tabs[tab_id]
             sess.start_playwright_screencast()
-            if url and url != sess._raw_page.url:
-                sess._raw_page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                sess.last_url = url
-                self._tab_last_urls[tab_id] = url
-                sess._focus_emulated = False
-                sess._ocr_populated = False
-                sess.documented = False
-                sess._documented_agents.clear()
-                self._last_tab_steps.pop(tab_id, None)
+            if (
+                url
+                and url != sess._raw_page.url
+                and not (reuse_existing and _url_matches_target(sess._raw_page.url, url))
+            ):
+                norm_u = _normalize_nav_url(url)
+                if norm_u != sess._raw_page.url:
+                    sess._raw_page.goto(norm_u, wait_until="domcontentloaded", timeout=15000)
+                    sess.last_url = str(getattr(sess._raw_page, "url", "") or norm_u)
+                    self._tab_last_urls[tab_id] = sess.last_url
+                    sess._focus_emulated = False
+                    sess._runtime_ensured = False
+                    sess._ocr_checked = False
+                    sess._ocr_populated = False
+                    sess.documented = False
+                    sess._documented_agents.clear()
+                    self._last_tab_steps.pop(tab_id, None)
 
         sess.enable_background_focus_emulation()
         sess.start_playwright_screencast()
@@ -3071,8 +4965,19 @@ class BrowserEngine:
 
         virtual_tools = self.get_macros_for_url(sess.last_url)
 
-        if req.get("ocr") is not False and (not sess._ocr_populated or req.get("ocr") is True):
+        full_page = bool(req.get("fullPage", False))
+        has_mutating_steps = any(
+            str(s.get("op") or s.get("action") or "").lower()
+            not in ("wait", "sleep", "delay", "settle", "waitfor", "wait_for", "waituntil", "text", "readtext", "readmain")
+            for s in active_steps
+        )
+
+        if req.get("ocr") is not False and (
+            req.get("ocr") is True
+            or (has_mutating_steps and not sess._ocr_checked and not sess._ocr_populated)
+        ):
             t_ocr0 = time.perf_counter()
+            sess._ocr_checked = True
             try:
                 has_canvas = bool(
                     sess._raw_page.evaluate("() => document.querySelectorAll('canvas').length > 0")
@@ -3103,6 +5008,8 @@ class BrowserEngine:
             combined_evals: list[str] = []
             res: dict[str, Any] = {}
             had_pre_on_current_page = False
+            navigated_in_batch = False
+            initial_batch_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
             for b_idx in boundary_indices:
                 if is_user_stopped():
                     return USER_STOPPED_ERROR
@@ -3112,8 +5019,8 @@ class BrowserEngine:
                     pre_steps = active_steps[last_idx:b_idx]
                     if pre_steps:
                         t_ip0 = time.perf_counter()
-                        res = sess._raw_page.evaluate(
-                            "req => window.__fmu.executeBatch(req)",
+                        res = self._eval_batch_handling_navigation(
+                            sess,
                             {
                                 "agent": agent_id,
                                 "steps": pre_steps,
@@ -3121,9 +5028,11 @@ class BrowserEngine:
                                 "query": req.get("query") or "",
                                 "diff": req.get("diff"),
                                 "fullTable": req.get("fullTable", False),
+                                "fullPage": full_page,
                                 "settle": False,
                                 "skipSnapshot": True,
                             },
+                            tab_id=tab_id,
                         )
                         _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
                         t_esc0 = time.perf_counter()
@@ -3133,21 +5042,43 @@ class BrowserEngine:
                             agent_id=agent_id,
                             query=req.get("query") or "",
                             full_table=bool(req.get("fullTable", False)),
+                            full_page=full_page,
                             skip_snapshot=True,
                         )
                         escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
                         combined_errors.extend(res.get("errors") or [])
                         combined_evals.extend(res.get("evalOutputs") or [])
-                        had_pre_on_current_page = True
+                        if res.get("didNavigate"):
+                            navigated_in_batch = True
+                            had_pre_on_current_page = False
+                        else:
+                            had_pre_on_current_page = True
                     wait_ms = int(b_step.get("ms") or 30)
                     if not interruptible_sleep(wait_ms / 1000.0):
                         return USER_STOPPED_ERROR
+                    if not sess.is_extension and not sess._raw_page.is_closed():
+                        try:
+                            sess._raw_page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        except Exception:
+                            pass
+                        cur_u = str(getattr(sess._raw_page, "url", "") or "")
+                        if cur_u and cur_u != initial_batch_url:
+                            sess.last_url = cur_u
+                            self._tab_last_urls[tab_id] = cur_u
+                            if not _same_origin_and_path(initial_batch_url, cur_u):
+                                navigated_in_batch = True
+                                had_pre_on_current_page = False
+                                sess._focus_emulated = False
+                                sess._runtime_ensured = False
+                                sess._ocr_checked = False
+                        sess.enable_background_focus_emulation()
+                        sess.ensure_runtime()
                 elif b_op in ("goto", "navigate", "open"):
                     pre_steps = active_steps[last_idx:b_idx]
                     if pre_steps:
                         t_ip0 = time.perf_counter()
-                        res = sess._raw_page.evaluate(
-                            "req => window.__fmu.executeBatch(req)",
+                        res = self._eval_batch_handling_navigation(
+                            sess,
                             {
                                 "agent": agent_id,
                                 "steps": pre_steps,
@@ -3155,9 +5086,11 @@ class BrowserEngine:
                                 "query": req.get("query") or "",
                                 "diff": req.get("diff"),
                                 "fullTable": req.get("fullTable", False),
+                                "fullPage": full_page,
                                 "settle": True,
                                 "skipSnapshot": True,
                             },
+                            tab_id=tab_id,
                         )
                         _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
                         t_esc0 = time.perf_counter()
@@ -3167,31 +5100,36 @@ class BrowserEngine:
                             agent_id=agent_id,
                             query=req.get("query") or "",
                             full_table=bool(req.get("fullTable", False)),
+                            full_page=full_page,
                             skip_snapshot=True,
                         )
                         escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
                         combined_errors.extend(res.get("errors") or [])
                         combined_evals.extend(res.get("evalOutputs") or [])
-                    nav_url = str(b_step.get("url") or b_step.get("value") or "").strip()
+                    raw_nav_url = str(b_step.get("url") or b_step.get("value") or "").strip()
+                    nav_url = _normalize_nav_url(raw_nav_url) if raw_nav_url else ""
                     if nav_url and nav_url != sess._raw_page.url:
                         t_nav0 = time.perf_counter()
                         if not sess.is_extension and not self._is_cdp_chrome and mode == "chrome" and self._is_external_url(nav_url):
                             self._should_use_extension_bridge(mode, require_extension=require_ext, url=nav_url)
                         sess._raw_page.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
-                        sess.last_url = nav_url
-                        self._tab_last_urls[tab_id] = nav_url
+                        sess.last_url = str(getattr(sess._raw_page, "url", "") or nav_url)
+                        self._tab_last_urls[tab_id] = sess.last_url
                         sess._focus_emulated = False
+                        sess._runtime_ensured = False
+                        sess._ocr_checked = False
                         sess._ocr_populated = False
                         sess.enable_background_focus_emulation()
                         sess.ensure_runtime()
                         tab_attach_ms += (time.perf_counter() - t_nav0) * 1000.0
                         virtual_tools = self.get_macros_for_url(sess.last_url)
                         had_pre_on_current_page = False
+                        navigated_in_batch = True
                 else:
                     pre_steps = active_steps[last_idx : b_idx + 1]
                     t_ip0 = time.perf_counter()
-                    res = sess._raw_page.evaluate(
-                        "req => window.__fmu.executeBatch(req)",
+                    res = self._eval_batch_handling_navigation(
+                        sess,
                         {
                             "agent": agent_id,
                             "steps": pre_steps,
@@ -3199,9 +5137,11 @@ class BrowserEngine:
                             "query": req.get("query") or "",
                             "diff": req.get("diff"),
                             "fullTable": req.get("fullTable", False),
+                            "fullPage": full_page,
                             "settle": False,
                             "skipSnapshot": True,
                         },
+                        tab_id=tab_id,
                     )
                     _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
                     t_esc0 = time.perf_counter()
@@ -3211,6 +5151,7 @@ class BrowserEngine:
                         agent_id=agent_id,
                         query=req.get("query") or "",
                         full_table=bool(req.get("fullTable", False)),
+                        full_page=full_page,
                         skip_snapshot=True,
                     )
                     combined_errors.extend(res.get("errors") or [])
@@ -3243,20 +5184,30 @@ class BrowserEngine:
 
             if is_user_stopped():
                 return USER_STOPPED_ERROR
+            cur_post_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
+            if (
+                cur_post_url
+                and initial_batch_url
+                and cur_post_url != initial_batch_url
+                and not _same_origin_and_path(initial_batch_url, cur_post_url)
+            ):
+                navigated_in_batch = True
             post_steps = active_steps[last_idx:]
             t_ip0 = time.perf_counter()
-            res = sess._raw_page.evaluate(
-                "req => window.__fmu.executeBatch(req)",
+            res = self._eval_batch_handling_navigation(
+                sess,
                 {
                     "agent": agent_id,
                     "steps": post_steps,
-                    "virtualTools": virtual_tools,
+                    "virtualTools": self.get_macros_for_url(sess.last_url) if navigated_in_batch else virtual_tools,
                     "query": req.get("query") or "",
-                    "diff": req.get("diff"),
+                    "diff": False if navigated_in_batch else req.get("diff"),
                     "fullTable": req.get("fullTable", False),
+                    "fullPage": full_page,
                     "settle": req.get("settle", True),
                     "hadPreSteps": had_pre_on_current_page or bool(post_steps),
                 },
+                tab_id=tab_id,
             )
             _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
             t_esc0 = time.perf_counter()
@@ -3266,6 +5217,7 @@ class BrowserEngine:
                 agent_id=agent_id,
                 query=req.get("query") or "",
                 full_table=bool(req.get("fullTable", False)),
+                full_page=full_page,
                 skip_snapshot=False,
             )
             escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
@@ -3275,8 +5227,8 @@ class BrowserEngine:
             if is_user_stopped():
                 return USER_STOPPED_ERROR
             t_ip0 = time.perf_counter()
-            res = sess._raw_page.evaluate(
-                "req => window.__fmu.executeBatch(req)",
+            res = self._eval_batch_handling_navigation(
+                sess,
                 {
                     "agent": agent_id,
                     "steps": active_steps,
@@ -3284,8 +5236,10 @@ class BrowserEngine:
                     "query": req.get("query") or "",
                     "diff": req.get("diff"),
                     "fullTable": req.get("fullTable", False),
+                    "fullPage": full_page,
                     "settle": req.get("settle", True),
                 },
+                tab_id=tab_id,
             )
             _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
             t_esc0 = time.perf_counter()
@@ -3295,17 +5249,19 @@ class BrowserEngine:
                 agent_id=agent_id,
                 query=req.get("query") or "",
                 full_table=bool(req.get("fullTable", False)),
+                full_page=full_page,
                 skip_snapshot=False,
             )
             escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
 
         if is_user_stopped():
             return USER_STOPPED_ERROR
+        sess._ocr_checked = True
 
         if (
             req.get("ocr") is not False
             and res.get("canvases")
-            and (active_steps or not sess._ocr_populated or req.get("ocr") is True)
+            and (has_mutating_steps or not sess._ocr_populated or req.get("ocr") is True)
         ):
             t_ocr1 = time.perf_counter()
             new_ocr = self._sync_canvas_ocr(sess, res.get("canvases"))
@@ -3317,6 +5273,7 @@ class BrowserEngine:
                         "ocrTargets": new_ocr,
                         "query": req.get("query") or "",
                         "fullTable": req.get("fullTable", False),
+                        "fullPage": full_page,
                         "useDiff": bool(res.get("useDiff")),
                     },
                 )
@@ -3372,7 +5329,7 @@ class BrowserEngine:
         if res.get("webMcpTools"):
             header += f' webmcp={json.dumps(res["webMcpTools"])}'
         if (agent_id not in sess._documented_agents and not sess.documented) or req.get("showDocs"):
-            header += "\n# api: click(uid|text), fill(uid,val), select(uid,val), move(uid|text), press(key), eval(code), callTool(name,args), saveMacro(name,steps), snapshot(), diff()"
+            header += "\n# api: click(uid|text), fill(uid,val), select(uid,val), move(uid|text), press(key), waitFor(text|sel), wait(ms), text(sel?), eval(code), callTool(name,args), saveMacro(name,steps), diff(), snapshot(full=True)"
             sess.documented = True
             sess._documented_agents.add(agent_id)
 
@@ -3381,7 +5338,7 @@ class BrowserEngine:
             out.append("! errors: " + "; ".join(res["errors"]))
         if res.get("evalOutputs"):
             for ev in res["evalOutputs"]:
-                out.append(f"> {ev}")
+                out.append(f"> {_format_eval_output(ev)}")
         out.extend(res.get("lines") or [])
         final_out = "\n".join(out)
 

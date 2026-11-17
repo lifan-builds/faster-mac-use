@@ -683,6 +683,32 @@ class _BenchHandler(BaseHTTPRequestHandler):
             body = VEHICLES_HTML
         elif self.path.startswith("/rental-booking"):
             body = RENTAL_BOOKING_HTML
+        elif self.path.startswith("/qa-test"):
+            body = (
+                "<!doctype html><html><head>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                "<title>QA Responsive App</title>"
+                "<style>"
+                "body { margin: 0; font-family: system-ui; }"
+                ".mobile-nav { display: none; }"
+                ".desktop-nav { display: block; }"
+                "@media (max-width: 600px) { .mobile-nav { display: block; } .desktop-nav { display: none; } }"
+                ".tall-spacer { height: 2100px; background: linear-gradient(#f8fafc, #e2e8f0); }"
+                "</style></head><body>"
+                "<nav><button class='desktop-nav'>Desktop Menu</button>"
+                "<button class='mobile-nav'>Mobile Drawer</button></nav>"
+                "<main>"
+                "<button id='btn-err' onclick=\""
+                "console.error('Hydration mismatch on PriceCard');"
+                "fetch('/api/qa-fail', {method: 'POST'});"
+                "setTimeout(() => { throw new Error('Uncaught checkout crash'); }, 0);"
+                "document.getElementById('qa-status').textContent = 'Triggered';"
+                "\">Trigger Bugs</button>"
+                "<p id='qa-status'>Idle</p>"
+                "<div class='tall-spacer'></div>"
+                "<button id='bottom-cta'>Bottom CTA</button>"
+                "</main></body></html>"
+            )
         else:
             body = ORDERS_HTML
         raw = body.encode("utf-8")
@@ -693,6 +719,18 @@ class _BenchHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def do_POST(self) -> None:
+        if self.path.startswith("/api/qa-fail"):
+            raw = b'{"error":"Order DB timeout"}'
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass

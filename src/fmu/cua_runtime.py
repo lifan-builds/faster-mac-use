@@ -193,6 +193,51 @@ class AppHandle:
         self._pending_steps.append({"op": "ocr"})
         return self
 
+    def screenshot(self, path: str | dict[str, Any] | None = None) -> AppHandle:
+        self._fresh = False
+        shot_path = ""
+        if isinstance(path, dict):
+            shot_path = str(path.get("path") or path.get("file") or "")
+        elif path is not None:
+            shot_path = str(path)
+        step: dict[str, Any] = {"op": "screenshot"}
+        if shot_path:
+            step["value"] = shot_path
+        self._pending_steps.append(step)
+        return self
+
+    def screenshotValue(self, path: str | dict[str, Any] | None = None) -> str:
+        self._fresh = False
+        if self.has_pending():
+            flushed = self.flush(diff=True)
+            sess = self.runtime._get_agent_session(self.agent_id)
+            if sess.active_outputs is not None and flushed:
+                sess.active_outputs.append(flushed)
+        shot_path = ""
+        if isinstance(path, dict):
+            shot_path = str(path.get("path") or path.get("file") or "")
+        elif path is not None:
+            shot_path = str(path)
+        step: dict[str, Any] = {"op": "screenshot"}
+        if shot_path:
+            step["value"] = shot_path
+        out = self.runtime.mac.execute(
+            {
+                "app": self.app_name,
+                "window": self.window,
+                "agent": self.agent_id,
+                "steps": [step],
+                "diff": True,
+            }
+        )
+        m = re.search(r'^# screenshot path="([^"]+)"', out, re.MULTILINE)
+        if m:
+            return m.group(1)
+        err_m = re.search(r"^! errors:\s*(.+)$", out, re.MULTILINE)
+        if err_m:
+            raise RuntimeError(err_m.group(1).strip())
+        raise RuntimeError(f"Screenshot failed on app {self.app_name}: {out}")
+
     def wait(self, ms: int | float = 250) -> AppHandle:
         self._fresh = False
         self._pending_steps.append({"op": "wait", "ms": max(0, int(round(float(ms))))})
@@ -482,6 +527,148 @@ class TabHandle:
         self._fresh = False
         self._force_ocr = True
         return self
+
+    def screenshot(
+        self,
+        path: str | dict[str, Any] | None = None,
+        options: dict[str, Any] | bool | None = None,
+        *,
+        fullPage: bool = False,
+        full_page: bool = False,
+    ) -> TabHandle:
+        self._fresh = False
+        shot_path = ""
+        fp = bool(fullPage or full_page)
+        if isinstance(path, dict):
+            shot_path = str(path.get("path") or path.get("file") or "")
+            fp = bool(fp or path.get("fullPage") or path.get("full_page"))
+        elif path is not None:
+            shot_path = str(path)
+        if isinstance(options, dict):
+            if not shot_path and (options.get("path") or options.get("file")):
+                shot_path = str(options.get("path") or options.get("file"))
+            fp = bool(fp or options.get("fullPage") or options.get("full_page"))
+        elif isinstance(options, bool):
+            fp = bool(fp or options)
+        step: dict[str, Any] = {"op": "screenshot"}
+        if shot_path:
+            step["path"] = shot_path
+        if fp:
+            step["fullPage"] = True
+        self._pending_steps.append(step)
+        return self
+
+    def screenshotValue(
+        self,
+        path: str | dict[str, Any] | None = None,
+        options: dict[str, Any] | bool | None = None,
+        *,
+        fullPage: bool = False,
+        full_page: bool = False,
+    ) -> str:
+        self._fresh = False
+        if self.has_pending():
+            flushed = self.flush(diff=True)
+            sess = self.runtime._get_agent_session(self.agent_id)
+            if sess.active_outputs is not None and flushed:
+                sess.active_outputs.append(flushed)
+        shot_path: str | None = None
+        fp = bool(fullPage or full_page)
+        if isinstance(path, dict):
+            raw_p = path.get("path") or path.get("file")
+            shot_path = str(raw_p) if raw_p else None
+            fp = bool(fp or path.get("fullPage") or path.get("full_page"))
+        elif path is not None and str(path).strip():
+            shot_path = str(path)
+        if isinstance(options, dict):
+            if not shot_path and (options.get("path") or options.get("file")):
+                shot_path = str(options.get("path") or options.get("file"))
+            fp = bool(fp or options.get("fullPage") or options.get("full_page"))
+        elif isinstance(options, bool):
+            fp = bool(fp or options)
+        return self.runtime.browser.screenshot_tab(
+            path=shot_path,
+            full_page=fp,
+            agent=self.agent_id,
+            session=self.tab_id,
+            mode=self.mode,
+            session_name=self.session_name,
+            window=self.window,
+            window_id=self.window_id,
+            chrome_tab_id=self.chrome_tab_id,
+            require_extension=self.require_extension,
+        )
+
+    def setViewport(
+        self,
+        width: int | float | dict[str, Any] | None = None,
+        height: int | float | None = None,
+        options: dict[str, Any] | None = None,
+        *,
+        scale: float = 1.0,
+        deviceScaleFactor: float | None = None,
+        mobile: bool | None = None,
+        reset: bool = False,
+    ) -> TabHandle:
+        self._fresh = False
+        w = width
+        h = height
+        sc = float(deviceScaleFactor if deviceScaleFactor is not None else scale)
+        mob = mobile
+        do_reset = reset
+        if isinstance(width, dict):
+            do_reset = bool(do_reset or width.get("reset"))
+            w = width.get("width")
+            h = width.get("height")
+            if width.get("scale") is not None or width.get("deviceScaleFactor") is not None:
+                sc = float(width.get("scale") or width.get("deviceScaleFactor") or 1.0)
+            if "mobile" in width:
+                mob = bool(width["mobile"])
+        if isinstance(options, dict):
+            if options.get("scale") is not None or options.get("deviceScaleFactor") is not None:
+                sc = float(options.get("scale") or options.get("deviceScaleFactor") or 1.0)
+            if "mobile" in options:
+                mob = bool(options["mobile"])
+            if options.get("reset"):
+                do_reset = True
+        if do_reset or w is None or h is None:
+            self._pending_steps.append({"op": "viewport", "reset": True})
+            return self
+        step: dict[str, Any] = {
+            "op": "viewport",
+            "width": int(round(float(w))),
+            "height": int(round(float(h))),
+            "scale": sc,
+        }
+        if mob is not None:
+            step["mobile"] = bool(mob)
+        self._pending_steps.append(step)
+        return self
+
+    viewport = setViewport
+    set_viewport = setViewport
+
+    def resetViewport(self) -> TabHandle:
+        return self.setViewport(reset=True)
+
+    reset_viewport = resetViewport
+
+    def errors(self, clear: bool | dict[str, Any] = False) -> list[dict[str, Any]]:
+        self._fresh = False
+        if self.has_pending():
+            flushed = self.flush(diff=True)
+            sess = self.runtime._get_agent_session(self.agent_id)
+            if sess.active_outputs is not None and flushed:
+                sess.active_outputs.append(flushed)
+        do_clear = bool(clear.get("clear")) if isinstance(clear, dict) else bool(clear)
+        return self.runtime.browser.get_tab_errors(self.tab_id, clear=do_clear)
+
+    def clearErrors(self) -> TabHandle:
+        self._fresh = False
+        self._pending_steps.append({"op": "clearerrors"})
+        return self
+
+    clear_errors = clearErrors
 
     def upload(self, target: str, files: str | list[str]) -> TabHandle:
         self._fresh = False
@@ -1256,6 +1443,16 @@ _TAB_CHAIN_METHODS: frozenset[str] = frozenset(
         "callTool",
         "saveMacro",
         "ocr",
+        "screenshot",
+        "screenshotValue",
+        "setViewport",
+        "viewport",
+        "set_viewport",
+        "resetViewport",
+        "reset_viewport",
+        "errors",
+        "clearErrors",
+        "clear_errors",
         "upload",
         "close",
         "diff",
@@ -1370,7 +1567,7 @@ def _rewrite_value_evals(stmt: str) -> str:
             stmt,
         )
     )
-    eval_re = re.compile(r"\.(eval|evaluate|text|readText|readMain)\s*\(")
+    eval_re = re.compile(r"\.(eval|evaluate|text|readText|readMain|screenshot)\s*\(")
     pos = 0
     while True:
         m = eval_re.search(stmt, pos)
@@ -1402,7 +1599,12 @@ def _rewrite_value_evals(stmt: str) -> str:
             continue
         has_trailing_op = bool(after.strip())
         if is_return or is_assign or outer_depth > 0 or has_trailing_op:
-            repl = ".textValue(" if m_name in ("text", "readText", "readMain") else ".evalValue("
+            if m_name in ("text", "readText", "readMain"):
+                repl = ".textValue("
+            elif m_name == "screenshot":
+                repl = ".screenshotValue("
+            else:
+                repl = ".evalValue("
             stmt = stmt[:dot_idx] + repl + stmt[open_paren + 1 :]
             pos = dot_idx + len(repl)
         else:

@@ -7,6 +7,7 @@ const sessionGroups = new Map();
 const sessionTabs = new Map();
 const attachedDebuggers = new Set();
 const initializedRuntimeTabs = new Map();
+const pendingNetRequests = new Map();
 let cachedRuntimeJs = "";
 let cachedRuntimeVersion = "";
 let activeScreencastTabId = null;
@@ -163,6 +164,19 @@ async function ensureDebuggerAndFocusEmulation(tabId) {
   try {
     await chrome.debugger.sendCommand({ tabId }, "Page.setWebLifecycleState", { state: "active" });
   } catch (_) {}
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {});
+  } catch (_) {}
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Log.enable", {});
+  } catch (_) {}
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Network.enable", {
+      maxPostDataSize: 0,
+      maxResourceBufferSize: 0,
+      maxTotalBufferSize: 0
+    });
+  } catch (_) {}
 }
 
 async function sendDebuggerCommand(tabId, method, commandParams = {}) {
@@ -200,28 +214,100 @@ if (chrome.tabs && chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addList
   });
 }
 
+function emitTabDiagnostic(tabId, entry) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !tabId || !entry) return;
+  try {
+    ws.send(JSON.stringify({ type: "tabDiagnostic", tabId, entry }));
+  } catch (_) {}
+}
+
 if (chrome.debugger && chrome.debugger.onEvent && typeof chrome.debugger.onEvent.addListener === "function") {
   chrome.debugger.onEvent.addListener((source, method, params) => {
-    if (method !== "Page.screencastFrame" || !source || !source.tabId || !params) return;
+    if (!source || !source.tabId || !params) return;
     const tabId = source.tabId;
-    if (params.sessionId !== undefined) {
-      chrome.debugger.sendCommand({ tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+    if (method === "Page.screencastFrame") {
+      if (params.sessionId !== undefined) {
+        chrome.debugger.sendCommand({ tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+      }
+      const now = Date.now();
+      if (!params.data || now - lastScreencastPushAt < 120) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      lastScreencastPushAt = now;
+      const meta = params.metadata || {};
+      try {
+        ws.send(JSON.stringify({
+          type: "screencastFrame",
+          tabId,
+          data: params.data,
+          vw: Math.round(Number(meta.deviceWidth || 0)),
+          vh: Math.round(Number(meta.deviceHeight || 0)),
+          ts: now
+        }));
+      } catch (_) {}
+      return;
     }
-    const now = Date.now();
-    if (!params.data || now - lastScreencastPushAt < 120) return;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    lastScreencastPushAt = now;
-    const meta = params.metadata || {};
-    try {
-      ws.send(JSON.stringify({
-        type: "screencastFrame",
-        tabId,
-        data: params.data,
-        vw: Math.round(Number(meta.deviceWidth || 0)),
-        vh: Math.round(Number(meta.deviceHeight || 0)),
-        ts: now
-      }));
-    } catch (_) {}
+    if (method === "Runtime.exceptionThrown") {
+      const det = params.exceptionDetails || {};
+      const exc = det.exception || {};
+      const msg = String(exc.description || exc.value || det.text || "Uncaught exception").trim();
+      emitTabDiagnostic(tabId, { kind: "pageerror", message: msg.slice(0, 500), url: String(det.url || "") });
+      return;
+    }
+    if (method === "Runtime.consoleAPICalled" && params.type === "error") {
+      const parts = (params.args || []).map(a => String(a.value !== undefined ? a.value : (a.description || ""))).filter(Boolean);
+      const msg = parts.join(" ").trim();
+      if (msg) emitTabDiagnostic(tabId, { kind: "console.error", message: msg.slice(0, 500), url: "" });
+      return;
+    }
+    if (method === "Log.entryAdded" && params.entry && params.entry.level === "error") {
+      const ent = params.entry;
+      const u = String(ent.url || "");
+      if (u.endsWith("/favicon.ico") || ent.source === "network") return;
+      const msg = String(ent.text || "").trim();
+      if (msg) emitTabDiagnostic(tabId, { kind: "console.error", message: msg.slice(0, 500), url: u });
+      return;
+    }
+    if (method === "Network.requestWillBeSent" && params.requestId && params.request) {
+      const rType = String(params.type || "");
+      if (rType === "Document" || rType === "Fetch" || rType === "XHR") {
+        if (pendingNetRequests.size > 250) {
+          const oldest = pendingNetRequests.keys().next().value;
+          if (oldest !== undefined) pendingNetRequests.delete(oldest);
+        }
+        pendingNetRequests.set(`${tabId}:${params.requestId}`, {
+          method: String(params.request.method || "GET"),
+          url: String(params.request.url || ""),
+          type: rType
+        });
+      }
+      return;
+    }
+    if (method === "Network.responseReceived" && params.response) {
+      const reqKey = `${tabId}:${params.requestId}`;
+      const tracked = pendingNetRequests.get(reqKey);
+      pendingNetRequests.delete(reqKey);
+      const rType = String(params.type || (tracked && tracked.type) || "");
+      const status = Number(params.response.status || 0);
+      const u = String(params.response.url || (tracked && tracked.url) || "");
+      if (status >= 400 && (rType === "Document" || rType === "Fetch" || rType === "XHR") && !u.endsWith("/favicon.ico")) {
+        const verb = (tracked && tracked.method) || "GET";
+        emitTabDiagnostic(tabId, { kind: "http", status, url: u, message: `${status} ${verb} ${u}`.slice(0, 500) });
+      }
+      return;
+    }
+    if (method === "Network.loadingFailed" && params.requestId) {
+      const reqKey = `${tabId}:${params.requestId}`;
+      const tracked = pendingNetRequests.get(reqKey);
+      pendingNetRequests.delete(reqKey);
+      const errText = String(params.errorText || "failed");
+      if (tracked && !params.canceled && errText !== "net::ERR_ABORTED" && !tracked.url.endsWith("/favicon.ico")) {
+        emitTabDiagnostic(tabId, {
+          kind: "network",
+          url: tracked.url,
+          message: `${tracked.method} ${tracked.url} (${errText})`.slice(0, 500)
+        });
+      }
+    }
   });
 }
 

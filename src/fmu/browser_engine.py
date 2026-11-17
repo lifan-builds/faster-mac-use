@@ -104,6 +104,7 @@ def _short_menubar_target(raw_url: str | None) -> str:
 
 _PREVIEW_FILE_LOCK = threading.Lock()
 _PREVIEW_SEQ = 0
+_SCREENSHOT_SEQ = 0
 
 
 def _preview_enabled() -> bool:
@@ -299,11 +300,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.4.0"
+_FMU_RUNTIME_VERSION = "0.4.1"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.4.0";
+  const FMU_RUNTIME_VERSION = "0.4.1";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -1817,7 +1818,8 @@ IN_PAGE_RUNTIME_JS = r"""
     "waitfor", "wait_for", "waituntil",
     "text", "readtext", "readmain",
     "eval", "evaluate", "webmcp", "calltool",
-    "goto", "navigate", "open", "close", "snapshot", "diff", "ocr"
+    "goto", "navigate", "open", "close", "snapshot", "diff", "ocr",
+    "screenshot", "viewport", "setviewport", "resetviewport", "clearerrors"
   ]);
 
   const NON_EXPR_STMT_RE = /^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b/;
@@ -2128,7 +2130,11 @@ IN_PAGE_RUNTIME_JS = r"""
           if (req.returnRawEval) rawEvalValues.push(txtOut);
           continue;
         }
-        if (op === "snapshot" || op === "diff" || op === "ocr") {
+        if (
+          op === "snapshot" || op === "diff" || op === "ocr"
+          || op === "screenshot" || op === "viewport" || op === "setviewport"
+          || op === "resetviewport" || op === "clearerrors"
+        ) {
           continue;
         }
         if (op === "eval" || op === "evaluate") {
@@ -2993,11 +2999,100 @@ class BrowserTabSession:
         self.last_preview_path: str | None = None
         self.last_vw: int = 1280
         self.last_vh: int = 800
+        self._diag_lock = threading.Lock()
+        self._diagnostics: list[dict[str, Any]] = []
+        self._unreported_diags: list[dict[str, Any]] = []
         if not is_extension and hasattr(page, "on"):
             try:
                 page.on("framenavigated", self._on_playwright_main_nav)
+                page.on("pageerror", self._on_playwright_pageerror)
+                page.on("console", self._on_playwright_console)
+                page.on("response", self._on_playwright_response)
+                page.on("requestfailed", self._on_playwright_requestfailed)
             except Exception:
                 pass
+
+    def record_diagnostic(
+        self,
+        kind: str,
+        message: str,
+        *,
+        url: str = "",
+        status: int | None = None,
+    ) -> None:
+        msg = str(message or "").strip()
+        if not msg:
+            return
+        u = str(url or "").strip()
+        if u.endswith("/favicon.ico") or "/favicon.ico" in msg:
+            return
+        if "Refused to evaluate a string as JavaScript" in msg:
+            return
+        entry: dict[str, Any] = {"kind": kind, "message": msg[:500]}
+        if u:
+            entry["url"] = u
+        if status is not None:
+            entry["status"] = int(status)
+        with self._diag_lock:
+            self._diagnostics.append(entry)
+            if len(self._diagnostics) > 60:
+                del self._diagnostics[:-60]
+            self._unreported_diags.append(entry)
+            if len(self._unreported_diags) > 60:
+                del self._unreported_diags[:-60]
+
+    def get_diagnostics(self, *, clear: bool = False) -> list[dict[str, Any]]:
+        with self._diag_lock:
+            items = [dict(d) for d in self._diagnostics]
+            if clear:
+                self._diagnostics.clear()
+                self._unreported_diags.clear()
+            return items
+
+    def clear_diagnostics(self) -> None:
+        with self._diag_lock:
+            self._diagnostics.clear()
+            self._unreported_diags.clear()
+
+    def consume_unreported_diagnostics(self) -> list[dict[str, Any]]:
+        with self._diag_lock:
+            if not self._unreported_diags:
+                return []
+            items = list(self._unreported_diags)
+            self._unreported_diags.clear()
+            return items
+
+    def _on_playwright_pageerror(self, exc: Any) -> None:
+        self.record_diagnostic("pageerror", str(exc), url=self.last_url)
+
+    def _on_playwright_console(self, msg: Any) -> None:
+        if msg.type != "error":
+            return
+        txt = str(msg.text or "").strip()
+        if txt.startswith("Failed to load resource:"):
+            return
+        loc = msg.location or {}
+        self.record_diagnostic("console.error", txt, url=str(loc.get("url") or self.last_url))
+
+    def _on_playwright_response(self, resp: Any) -> None:
+        status = int(resp.status)
+        if status < 400:
+            return
+        req = resp.request
+        if req.resource_type not in ("document", "fetch", "xhr"):
+            return
+        u = str(resp.url or "")
+        self.record_diagnostic("http", f"{status} {req.method} {u}", url=u, status=status)
+
+    def _on_playwright_requestfailed(self, req: Any) -> None:
+        if req.resource_type not in ("document", "fetch", "xhr"):
+            return
+        fail = req.failure
+        err_txt = str(fail.get("errorText") if isinstance(fail, dict) else (fail or "failed"))
+        if "ERR_ABORTED" in err_txt:
+            return
+        u = str(req.url or "")
+        self.record_diagnostic("network", f"{req.method} {u} ({err_txt})", url=u)
 
     def _on_playwright_main_nav(self, frame: Any) -> None:
         try:
@@ -3101,6 +3196,97 @@ class BrowserTabSession:
         except Exception:
             pass
         return self.last_preview_path
+
+    def capture_screenshot(
+        self,
+        path: str | None = None,
+        *,
+        full_page: bool = False,
+    ) -> tuple[str, int, int]:
+        global _SCREENSHOT_SEQ
+        cdp_params: dict[str, Any] = {"format": "png"}
+        if full_page:
+            metrics = self._raw_cdp.send("Page.getLayoutMetrics", {}) or {}
+            cs = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
+            cw = max(1, int(round(float(cs.get("width") or self.last_vw or 1280))))
+            ch = max(1, min(16384, int(round(float(cs.get("height") or self.last_vh or 800)))))
+            cdp_params["captureBeyondViewport"] = True
+            cdp_params["clip"] = {"x": 0, "y": 0, "width": cw, "height": ch, "scale": 1}
+        shot = self._raw_cdp.send("Page.captureScreenshot", cdp_params)
+        b64_data = shot.get("data") if isinstance(shot, dict) else None
+        if not isinstance(b64_data, str) or not b64_data:
+            raise RuntimeError(f"Page.captureScreenshot returned empty data on tab {self.tab_id}")
+        raw = base64.b64decode(b64_data)
+        if path and str(path).strip():
+            dest = Path(str(path).strip()).expanduser().resolve()
+        else:
+            with _PREVIEW_FILE_LOCK:
+                _SCREENSHOT_SEQ += 1
+                seq = _SCREENSHOT_SEQ
+            safe_tab = re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.tab_id)
+            dest = Path(f"/tmp/fmu-screenshot-{safe_tab}-{seq}.png")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(raw)
+        img_w = self.last_vw or 1280
+        img_h = self.last_vh or 800
+        if len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n":
+            img_w, img_h = struct.unpack(">II", raw[16:24])
+        return str(dest), int(img_w), int(img_h)
+
+    def set_viewport(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+        *,
+        scale: float = 1.0,
+        mobile: bool | None = None,
+        reset: bool = False,
+    ) -> tuple[int, int]:
+        if reset or width is None or height is None:
+            try:
+                self._raw_cdp.send("Emulation.clearDeviceMetricsOverride", {})
+            except Exception:
+                pass
+            if not self.is_extension and not self._engine._is_cdp_chrome:
+                self._raw_page.set_viewport_size({"width": 1280, "height": 800})
+                self.last_vw, self.last_vh = 1280, 800
+            else:
+                try:
+                    metrics = self._raw_cdp.send("Page.getLayoutMetrics", {}) or {}
+                    vp = metrics.get("cssVisualViewport") or metrics.get("visualViewport") or {}
+                    if vp.get("clientWidth") and vp.get("clientHeight"):
+                        self.last_vw = int(round(float(vp["clientWidth"])))
+                        self.last_vh = int(round(float(vp["clientHeight"])))
+                except Exception:
+                    pass
+            try:
+                self._raw_page.evaluate("() => { if (window.__fmuStore) window.__fmuStore.mutationSeq++; }")
+            except Exception:
+                pass
+            return self.last_vw, self.last_vh
+
+        w = max(200, int(round(float(width))))
+        h = max(160, int(round(float(height))))
+        sc = max(0.25, float(scale or 1.0))
+        is_mob = bool(mobile) if mobile is not None else False
+        if not self.is_extension and not self._engine._is_cdp_chrome:
+            self._raw_page.set_viewport_size({"width": w, "height": h})
+        self._raw_cdp.send(
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": w,
+                "height": h,
+                "deviceScaleFactor": sc,
+                "mobile": is_mob,
+            },
+        )
+        try:
+            self._raw_page.evaluate("() => { if (window.__fmuStore) window.__fmuStore.mutationSeq++; }")
+        except Exception:
+            pass
+        self.last_vw = w
+        self.last_vh = h
+        return w, h
 
     def ensure_runtime(self, force: bool = False) -> None:
         if self.is_extension and not force:
@@ -3229,7 +3415,23 @@ class BrowserEngine:
             return self._ext_bridge_inst
 
     def _on_extension_event(self, msg: dict[str, Any]) -> None:
-        if msg.get("type") != "screencastFrame":
+        mtype = msg.get("type")
+        if mtype == "tabDiagnostic":
+            chrome_tid = msg.get("tabId")
+            entry = msg.get("entry")
+            if chrome_tid is None or not isinstance(entry, dict):
+                return
+            for s in list(self._tabs.values()):
+                if s.is_extension and getattr(s._raw_page, "chrome_tab_id", None) == chrome_tid:
+                    s.record_diagnostic(
+                        str(entry.get("kind") or "console.error"),
+                        str(entry.get("message") or ""),
+                        url=str(entry.get("url") or ""),
+                        status=int(entry["status"]) if entry.get("status") is not None else None,
+                    )
+                    break
+            return
+        if mtype != "screencastFrame":
             return
         b64_data = msg.get("data")
         if not isinstance(b64_data, str) or len(b64_data) < 64:
@@ -4622,6 +4824,58 @@ class BrowserEngine:
 
         return self._run_sync(_run)
 
+    def screenshot_tab(
+        self,
+        *,
+        path: str | None = None,
+        full_page: bool = False,
+        agent: str = "default",
+        session: str | None = None,
+        mode: str = "chrome",
+        session_name: str = "🤖 Agent",
+        window: str | None = None,
+        window_id: int | None = None,
+        chrome_tab_id: int | None = None,
+        require_extension: bool = False,
+    ) -> str:
+        if is_user_stopped():
+            raise RuntimeError(USER_STOPPED_ERROR)
+
+        def _capture() -> str:
+            agent_id = str(agent or "default").strip() or "default"
+            default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
+            tab_id = str(session or default_tab)
+            sess = self._tabs.get(tab_id)
+            if sess is None or not self._is_session_alive(sess):
+                sess = self._create_tab_inner(
+                    url=self._tab_last_urls.get(tab_id) or "about:blank",
+                    mode=mode,
+                    session_name=session_name,
+                    tab_id=tab_id,
+                    group_color=self._get_agent_color(agent_id),
+                    window=window,
+                    window_id=window_id,
+                    chrome_tab_id=chrome_tab_id,
+                    require_extension=require_extension,
+                    reattach=tab_id not in self._tab_last_urls,
+                    schedule_preview=False,
+                )
+            saved_path, _, _ = sess.capture_screenshot(path=path, full_page=full_page)
+            return saved_path
+
+        return self._run_sync(_capture)
+
+    def get_tab_errors(self, tab_id: str, *, clear: bool = False) -> list[dict[str, Any]]:
+        sess = self._tabs.get(tab_id)
+        if sess is None:
+            return []
+        return sess.get_diagnostics(clear=clear)
+
+    def clear_tab_errors(self, tab_id: str) -> None:
+        sess = self._tabs.get(tab_id)
+        if sess is not None:
+            sess.clear_diagnostics()
+
     def execute_batch(self, req: dict[str, Any]) -> str:
         if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension", "listTabs")) and is_user_stopped():
             return USER_STOPPED_ERROR
@@ -4957,7 +5211,17 @@ class BrowserEngine:
             s
             for s in active_steps
             if str(s.get("op") or s.get("action") or "").lower()
-            not in ("snapshot", "diff", "webmcp", "calltool")
+            not in (
+                "snapshot",
+                "diff",
+                "webmcp",
+                "calltool",
+                "screenshot",
+                "viewport",
+                "setviewport",
+                "resetviewport",
+                "clearerrors",
+            )
         ]
         if recordable_steps:
             prev_rec = self._last_tab_steps.setdefault(tab_id, [])
@@ -4990,12 +5254,24 @@ class BrowserEngine:
                 self._sync_canvas_ocr(sess)
             ocr_ms += (time.perf_counter() - t_ocr0) * 1000.0
 
+        meta_lines: list[str] = []
         boundary_indices = [
             idx
             for idx, s in enumerate(active_steps)
             if (
                 s.get("files")
-                or (s.get("op") or s.get("action")) in ("upload", "goto", "navigate", "open")
+                or str(s.get("op") or s.get("action") or "").lower()
+                in (
+                    "upload",
+                    "goto",
+                    "navigate",
+                    "open",
+                    "screenshot",
+                    "viewport",
+                    "setviewport",
+                    "resetviewport",
+                    "clearerrors",
+                )
                 or (
                     str(s.get("op") or s.get("action") or "").lower()
                     in ("wait", "sleep", "delay", "settle")
@@ -5011,6 +5287,7 @@ class BrowserEngine:
             res: dict[str, Any] = {}
             had_pre_on_current_page = False
             navigated_in_batch = False
+            viewport_changed_in_batch = False
             initial_batch_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
             for b_idx in boundary_indices:
                 if is_user_stopped():
@@ -5127,6 +5404,69 @@ class BrowserEngine:
                         virtual_tools = self.get_macros_for_url(sess.last_url)
                         had_pre_on_current_page = False
                         navigated_in_batch = True
+                elif b_op in ("screenshot", "viewport", "setviewport", "resetviewport", "clearerrors"):
+                    pre_steps = active_steps[last_idx:b_idx]
+                    if pre_steps:
+                        t_ip0 = time.perf_counter()
+                        res = self._eval_batch_handling_navigation(
+                            sess,
+                            {
+                                "agent": agent_id,
+                                "steps": pre_steps,
+                                "virtualTools": virtual_tools,
+                                "query": req.get("query") or "",
+                                "diff": req.get("diff"),
+                                "fullTable": req.get("fullTable", False),
+                                "fullPage": full_page,
+                                "settle": True,
+                                "skipSnapshot": True,
+                            },
+                            tab_id=tab_id,
+                        )
+                        _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+                        t_esc0 = time.perf_counter()
+                        self._handle_eval_escalations(
+                            sess,
+                            res,
+                            agent_id=agent_id,
+                            query=req.get("query") or "",
+                            full_table=bool(req.get("fullTable", False)),
+                            full_page=full_page,
+                            skip_snapshot=True,
+                        )
+                        escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
+                        combined_errors.extend(res.get("errors") or [])
+                        combined_evals.extend(res.get("evalOutputs") or [])
+                        if res.get("didNavigate"):
+                            navigated_in_batch = True
+                            had_pre_on_current_page = False
+                        else:
+                            had_pre_on_current_page = True
+                    t_esc0 = time.perf_counter()
+                    try:
+                        if b_op == "screenshot":
+                            raw_shot_path = b_step.get("path") or b_step.get("file") or b_step.get("value")
+                            shot_fp = bool(b_step.get("fullPage") or b_step.get("full_page"))
+                            saved_p, sw, sh = sess.capture_screenshot(
+                                path=str(raw_shot_path) if raw_shot_path else None,
+                                full_page=shot_fp,
+                            )
+                            meta_lines.append(f'# screenshot path="{saved_p}" size={sw}x{sh}')
+                        elif b_op in ("viewport", "setviewport", "resetviewport"):
+                            vw_new, vh_new = sess.set_viewport(
+                                width=b_step.get("width"),
+                                height=b_step.get("height"),
+                                scale=float(b_step.get("scale") or b_step.get("deviceScaleFactor") or 1.0),
+                                mobile=b_step.get("mobile"),
+                                reset=bool(b_step.get("reset") or b_op == "resetviewport"),
+                            )
+                            meta_lines.append(f"# viewport size={vw_new}x{vh_new}")
+                            viewport_changed_in_batch = True
+                        elif b_op == "clearerrors":
+                            sess.clear_diagnostics()
+                    except Exception as host_exc:
+                        combined_errors.append(f"step {b_idx + 1} ({b_op}): {host_exc}")
+                    escalation_ms += (time.perf_counter() - t_esc0) * 1000.0
                 else:
                     pre_steps = active_steps[last_idx : b_idx + 1]
                     t_ip0 = time.perf_counter()
@@ -5203,7 +5543,7 @@ class BrowserEngine:
                     "steps": post_steps,
                     "virtualTools": self.get_macros_for_url(sess.last_url) if navigated_in_batch else virtual_tools,
                     "query": req.get("query") or "",
-                    "diff": False if navigated_in_batch else req.get("diff"),
+                    "diff": False if (navigated_in_batch or (viewport_changed_in_batch and req.get("diff") is None)) else req.get("diff"),
                     "fullTable": req.get("fullTable", False),
                     "fullPage": full_page,
                     "settle": req.get("settle", True),
@@ -5331,13 +5671,21 @@ class BrowserEngine:
         if res.get("webMcpTools"):
             header += f' webmcp={json.dumps(res["webMcpTools"])}'
         if (agent_id not in sess._documented_agents and not sess.documented) or req.get("showDocs"):
-            header += "\n# api: click(uid|text), fill(uid,val), select(uid,val), move(uid|text), press(key), waitFor(text|sel), wait(ms), text(sel?), eval(code), callTool(name,args), saveMacro(name,steps), diff(), snapshot(full=True)"
+            header += "\n# api: click(uid|text), fill(uid,val), select(uid,val), move(uid|text), press(key), waitFor(text|sel), wait(ms), text(sel?), eval(code), screenshot(path?,fullPage?), setViewport(w,h), errors(), callTool(name,args), saveMacro(name,steps), diff(), snapshot(full=True)"
             sess.documented = True
             sess._documented_agents.add(agent_id)
 
         out = [header]
+        if meta_lines:
+            out.extend(meta_lines)
         if res.get("errors"):
             out.append("! errors: " + "; ".join(res["errors"]))
+        new_diags = sess.consume_unreported_diagnostics()
+        if new_diags:
+            diag_preview = "; ".join(f"[{d['kind']}] {d['message']}" for d in new_diags[:3])
+            if len(new_diags) > 3:
+                diag_preview += f" (+{len(new_diags) - 3} more)"
+            out.append(f"! page_errors({len(new_diags)}): {diag_preview}")
         if res.get("evalOutputs"):
             for ev in res["evalOutputs"]:
                 out.append(f"> {_format_eval_output(ev)}")

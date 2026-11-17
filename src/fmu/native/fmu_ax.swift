@@ -1531,27 +1531,72 @@ func performImageFileOCR(
     return lines.joined(separator: "\n")
 }
 
-func performWindowOCR(app: TargetApp, fallbackNodes: [NodeRecord] = []) -> [String] {
+func captureAppWindowCGImage(app: TargetApp) -> (CGImage, CGRect)? {
     _ = CGMainDisplayID()
     var cgImage: CGImage?
     var winFrame = CGRect.zero
-    let sem = DispatchSemaphore(value: 0)
-    if #available(macOS 14.0, *) {
+    if #available(macOS 14.0, *), CGPreflightScreenCaptureAccess() {
+        let sem = DispatchSemaphore(value: 0)
         Task {
             defer { sem.signal() }
             guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return }
-            let win = content.windows.first(where: { $0.windowID == app.windowID && $0.frame.width > 80 })
+            let win = content.windows.first(where: { app.windowID != 0 && $0.windowID == app.windowID && $0.frame.width > 80 })
                 ?? content.windows.first(where: { $0.owningApplication?.processID == app.pid && $0.frame.width > 80 })
             guard let targetWin = win else { return }
             winFrame = targetWin.frame
             let filter = SCContentFilter(desktopIndependentWindow: targetWin)
+            let scale = max(1.0, Double(filter.pointPixelScale))
             let cfg = SCStreamConfiguration()
-            cfg.width = max(Int(targetWin.frame.width * 2), 300)
-            cfg.height = max(Int(targetWin.frame.height * 2), 200)
+            cfg.width = max(Int((Double(targetWin.frame.width) * scale).rounded()), 300)
+            cfg.height = max(Int((Double(targetWin.frame.height) * scale).rounded()), 200)
+            cfg.ignoreShadowsSingleWindow = true
             cfg.showsCursor = false
             cgImage = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
         }
         _ = sem.wait(timeout: .now() + 1.5)
+    }
+    if let img = cgImage {
+        return (img, winFrame)
+    }
+    return nil
+}
+
+func saveAppWindowScreenshot(app: TargetApp, requestedPath: String?) -> (path: String?, w: Int, h: Int, error: String?) {
+    if !CGPreflightScreenCaptureAccess() {
+        return (nil, 0, 0, "Screen Recording permission not granted to host process")
+    }
+    guard let (img, _) = captureAppWindowCGImage(app: app) else {
+        return (nil, 0, 0, "could not capture window image for app \"\(app.name)\" (pid=\(app.pid))")
+    }
+    let rawPath = (requestedPath ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let destPath: String
+    if !rawPath.isEmpty {
+        destPath = (rawPath as NSString).expandingTildeInPath
+    } else {
+        let tsMs = Int(Date().timeIntervalSince1970 * 1000.0)
+        destPath = "/tmp/fmu-app-screenshot-\(app.pid)-\(tsMs).png"
+    }
+    let destUrl = URL(fileURLWithPath: destPath).standardizedFileURL
+    let parentDir = destUrl.deletingLastPathComponent().path
+    try? FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+    let rep = NSBitmapImageRep(cgImage: img)
+    guard let pngData = rep.representation(using: .png, properties: [:]) else {
+        return (nil, 0, 0, "failed to encode PNG for app \"\(app.name)\"")
+    }
+    do {
+        try pngData.write(to: destUrl, options: .atomic)
+        return (destUrl.path, img.width, img.height, nil)
+    } catch {
+        return (nil, 0, 0, "failed to write screenshot to \(destUrl.path): \(error.localizedDescription)")
+    }
+}
+
+func performWindowOCR(app: TargetApp, fallbackNodes: [NodeRecord] = []) -> [String] {
+    var cgImage: CGImage?
+    var winFrame = CGRect.zero
+    if let captured = captureAppWindowCGImage(app: app) {
+        cgImage = captured.0
+        winFrame = captured.1
     }
     var ocrLines: [String] = []
     if let img = cgImage {
@@ -4137,7 +4182,7 @@ func executeRequest(_ req: BatchRequest) -> String {
             }
             let op = step.effectiveOp
             if op.isEmpty {
-                stepErrors.append("step \(i+1): missing 'op' (or 'action') field in step; supported ops: click, set, move, type, key, menu, wait, settle, ocr")
+                stepErrors.append("step \(i+1): missing 'op' (or 'action') field in step; supported ops: click, set, move, type, key, menu, wait, settle, ocr, screenshot")
                 continue
             }
             lastExecutedOp = op
@@ -4151,7 +4196,7 @@ func executeRequest(_ req: BatchRequest) -> String {
                 stepErrors.append("step \(i+1): op 'upload' is only supported on surface=\"web\" via the MV3 extension CDP bridge (DOM.setFileInputFiles)")
                 continue
             }
-            if op != "move" && op != "ocr" && op != "snapshot" && op != "diff" {
+            if op != "move" && op != "ocr" && op != "screenshot" && op != "snapshot" && op != "diff" {
                 didMutate = true
             }
             switch op {
@@ -4167,6 +4212,17 @@ func executeRequest(_ req: BatchRequest) -> String {
                 }
             case "ocr":
                 ocrOutput.append(contentsOf: performWindowOCR(app: app, fallbackNodes: currentNodes))
+            case "screenshot":
+                if didMutate {
+                    _ = interruptibleSleep(ms: 25)
+                }
+                let rawShotPath = step.value ?? step.target ?? step.files?.first
+                let shotRes = saveAppWindowScreenshot(app: app, requestedPath: rawShotPath)
+                if let savedPath = shotRes.path {
+                    ocrOutput.append("# screenshot path=\"\(savedPath)\" size=\(shotRes.w)x\(shotRes.h)")
+                } else if let errMsg = shotRes.error, !(step.optional ?? false) {
+                    stepErrors.append("step \(i+1) (screenshot): \(errMsg)")
+                }
             case "key":
                 guard let chord = step.effectiveKey else {
                     if !(step.optional ?? false) {
@@ -4564,7 +4620,7 @@ func executeRequest(_ req: BatchRequest) -> String {
                 }
             default:
                 if !(step.optional ?? false) {
-                    stepErrors.append("step \(i+1): unsupported op '\(op)'; supported ops: click, set, move, type, key, menu, wait, settle, ocr")
+                    stepErrors.append("step \(i+1): unsupported op '\(op)'; supported ops: click, set, move, type, key, menu, wait, settle, ocr, screenshot")
                 }
             }
         }
@@ -4652,7 +4708,7 @@ func executeRequest(_ req: BatchRequest) -> String {
     }
     header += " els=\(currentNodes.count) crc=\(newCrc) obs=\(state.currentPidSeq(app.pid)) ms=\(String(format: "%.1f", elapsedMs))"
     if isFirstDoc || (req.showDocs == true) {
-        header += "\n# api: click(uid|name), set(uid|name,value), move(uid|name), type(value), key(chord), menu([path]), ocr()"
+        header += "\n# api: click(uid|name), set(uid|name,value), move(uid|name), type(value), key(chord), menu([path]), ocr(), screenshot(path?)"
     }
     out.append(header)
 

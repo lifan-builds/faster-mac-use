@@ -36,7 +36,7 @@ _NON_NETWORK_SCHEMES = {
 _SCHEME_PREFIX_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 _PATH_TOKEN_RE = re.compile(r"/(?:Users|private|var|tmp)/[^\s\"';)]+")
 
-_log_queue: queue.SimpleQueue[tuple[Path, str]] = queue.SimpleQueue()
+_log_queue: queue.SimpleQueue[tuple[Path | None, str | threading.Event]] = queue.SimpleQueue()
 _writer_started = False
 _writer_lock = threading.Lock()
 _pruned_dirs: set[str] = set()
@@ -173,8 +173,13 @@ def _append_line(file_path: Path, line: str) -> None:
 
 def _writer_loop() -> None:
     while True:
-        file_path, line = _log_queue.get()
-        _append_line(file_path, line)
+        file_path, item = _log_queue.get()
+        if file_path is None:
+            if isinstance(item, threading.Event):
+                item.set()
+            continue
+        if isinstance(item, str):
+            _append_line(file_path, item)
 
 
 def _ensure_writer() -> None:
@@ -215,11 +220,13 @@ def record_perf_event(event: dict[str, Any], *, sync: bool = False) -> None:
         pass
 
 
-def flush_telemetry(timeout: float = 0.25) -> None:
-    """Wait briefly for queued background telemetry lines to flush (useful in tests/shutdown)."""
-    deadline = time.perf_counter() + timeout
-    while not _log_queue.empty() and time.perf_counter() < deadline:
-        time.sleep(0.005)
+def flush_telemetry(timeout: float = 0.5) -> None:
+    """Wait for all queued background telemetry lines to finish writing to disk."""
+    if not _writer_started:
+        return
+    done = threading.Event()
+    _log_queue.put_nowait((None, done))
+    done.wait(timeout=max(0.05, timeout))
 
 
 def _percentile(sorted_vals: list[float], pct: float) -> float:

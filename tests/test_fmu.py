@@ -2612,6 +2612,140 @@ setInterval(() => {{}}, 1000);
         self.assertEqual(calls, 2)
         self.assertNotIn("t1", be._tabs)
 
+    def test_31_qa_screenshot_viewport_and_runtime_errors(self) -> None:
+        import struct
+
+        qa_url = f"{self.server.base_url}/qa-test"
+        with tempfile.TemporaryDirectory(prefix="fmu-qa-shots-") as tmp_dir:
+            mob_shot = str(Path(tmp_dir) / "mobile.png")
+            full_shot = str(Path(tmp_dir) / "fullpage.png")
+
+            with BackgroundIntrusionGuard() as guard:
+                # 1. Desktop initial state + responsive switch to mobile (390x844) + chained & value screenshots
+                mob_out = self.rt.execute(
+                    {
+                        "code": (
+                            f'const tab = await cua.createBrowserTab("headless", "{qa_url}");\n'
+                            f'await tab.setViewport(390, 844, {{ scale: 2, mobile: true }}).screenshot("{mob_shot}");\n'
+                            "return await tab.snapshot({ full: true });"
+                        )
+                    }
+                )
+                self.assertIn('- @u1 button "Desktop Menu"', mob_out)
+                self.assertIn('+ @u5 button "Mobile Drawer"', mob_out)
+                final_snap = mob_out.split("# web tab=t1")[-1]
+                self.assertIn('@u5 button "Mobile Drawer"', final_snap)
+                self.assertNotIn("Desktop Menu", final_snap)
+                mob_bytes = Path(mob_shot).read_bytes()
+                self.assertEqual(mob_bytes[:8], b"\x89PNG\r\n\x1a\n")
+                mw, mh = struct.unpack(">II", mob_bytes[16:24])
+                self.assertEqual((mw, mh), (780, 1688))
+
+                # 2. Reset viewport back to desktop (1280x800) + value-returned fullPage screenshot
+                ret_path_out = self.rt.execute(
+                    {
+                        "code": (
+                            "const tab = await cua.getTab();\n"
+                            "await tab.resetViewport();\n"
+                            f'const saved = await tab.screenshot("{full_shot}", {{ fullPage: true }});\n'
+                            "const snap = await tab.snapshot({ full: true });\n"
+                            "return JSON.stringify({ saved, hasDesktop: snap.includes('Desktop Menu'), hasMobile: snap.includes('Mobile Drawer') });"
+                        )
+                    }
+                )
+                ret_info = json.loads(ret_path_out.splitlines()[-1])
+                self.assertEqual(Path(ret_info["saved"]).resolve(), Path(full_shot).resolve())
+                self.assertTrue(ret_info["hasDesktop"])
+                self.assertFalse(ret_info["hasMobile"])
+                full_bytes = Path(full_shot).read_bytes()
+                fw, fh = struct.unpack(">II", full_bytes[16:24])
+                self.assertEqual(fw, 1280)
+                self.assertGreaterEqual(fh, 2100)
+
+                # 3. Trigger console.error + HTTP 500 + uncaught pageerror and verify inline ! page_errors & tab.errors()
+                bug_out = self.rt.execute(
+                    {
+                        "code": (
+                            "const tab = await cua.getTab();\n"
+                            'await tab.click("Trigger Bugs").waitFor("Triggered").wait(80);'
+                        )
+                    }
+                )
+                self.assertIn("! page_errors(", bug_out)
+
+                errs_json = self.rt.execute(
+                    {
+                        "code": (
+                            "const tab = await cua.getTab();\n"
+                            "return JSON.stringify(await tab.errors());"
+                        )
+                    }
+                )
+                errs = json.loads(errs_json.splitlines()[-1])
+                kinds = {e["kind"] for e in errs}
+                self.assertIn("console.error", kinds)
+                self.assertIn("http", kinds)
+                self.assertIn("pageerror", kinds)
+                self.assertTrue(any("Hydration mismatch" in e["message"] for e in errs))
+                self.assertTrue(any(e.get("status") == 500 and "/api/qa-fail" in e["message"] for e in errs))
+                self.assertTrue(any("Uncaught checkout crash" in e["message"] for e in errs))
+
+                # 4. Verify clearErrors() clears diagnostics cleanly
+                after_clear = self.rt.execute(
+                    {
+                        "code": (
+                            "const tab = await cua.getTab();\n"
+                            "await tab.clearErrors();\n"
+                            "return JSON.stringify(await tab.errors());"
+                        )
+                    }
+                )
+                self.assertEqual(json.loads(after_clear.splitlines()[-1]), [])
+
+                # 5. Verify MV3 extension tabDiagnostic routing
+                sess = self.rt.browser._tabs.get("t1")
+                self.assertIsNotNone(sess)
+                assert sess is not None
+                sess.is_extension = True
+                setattr(sess._raw_page, "chrome_tab_id", 991)
+                try:
+                    self.rt.browser._on_extension_event(
+                        {
+                            "type": "tabDiagnostic",
+                            "tabId": 991,
+                            "entry": {
+                                "kind": "http",
+                                "status": 503,
+                                "url": "https://api.example.com/v1/pay",
+                                "message": "503 POST https://api.example.com/v1/pay",
+                            },
+                        }
+                    )
+                    ext_errs = self.rt.browser.get_tab_errors("t1", clear=True)
+                    self.assertEqual(len(ext_errs), 1)
+                    self.assertEqual(ext_errs[0]["status"], 503)
+                finally:
+                    sess.is_extension = False
+
+                # 6. Verify macOS native app screenshot step (captures PNG when Screen Recording is granted, or skips cleanly when optional)
+                app_shot = str(Path(tmp_dir) / "calc.png")
+                calc_out = self.rt.execute(
+                    {
+                        "app": "Calculator",
+                        "steps": [
+                            {"op": "key", "name": "escape"},
+                            {"op": "screenshot", "value": app_shot, "optional": True},
+                        ],
+                    }
+                )
+                self.assertNotIn("! errors:", calc_out)
+                if "# screenshot path=" in calc_out:
+                    self.assertTrue(Path(app_shot).is_file())
+                    self.assertEqual(Path(app_shot).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+            rep = guard.stop()
+            self.assertTrue(rep.passed_background_invariant, f"Intrusion detected: {rep}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

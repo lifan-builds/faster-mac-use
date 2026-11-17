@@ -1522,6 +1522,207 @@ def _rewrite_js_length(expr: str) -> str:
         pos = 0
 
 
+_RAW_EVAL_CALL_RE = re.compile(r"\.(?:eval|evaluate|evalValue|evaluateValue|evaluate_value)\s*\(")
+_RAW_JS_FN_START_RE = re.compile(
+    r"^(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[a-zA-Z_$][a-zA-Z0-9_$]*\s*=>)"
+)
+_JS_REGEX_PREV_CHARS = frozenset("=([,:!&|?{};+-*%^~<>")
+
+
+def _scan_js_callback_end(src: str, start: int) -> int:
+    """Scan from right after `.eval(` to the end of the callback arg (`)` at depth 0 or `,` at depth 1)."""
+    n = len(src)
+    i = start
+    depth = 1
+    in_str: str | None = None
+    in_regex = False
+    in_regex_cls = False
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+    last_sig = "("
+    last_word = ""
+
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+                last_sig = '"'
+                last_word = ""
+            i += 1
+            continue
+        if in_regex:
+            if ch == "\\":
+                escape = True
+            elif ch == "[":
+                in_regex_cls = True
+            elif ch == "]" and in_regex_cls:
+                in_regex_cls = False
+            elif ch == "/" and not in_regex_cls:
+                in_regex = False
+                last_sig = "/"
+                last_word = ""
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "/" and (
+            last_sig in _JS_REGEX_PREV_CHARS
+            or last_word in ("return", "typeof", "void", "delete", "throw", "case", "in", "of")
+        ):
+            in_regex = True
+            in_regex_cls = False
+            i += 1
+            continue
+        if ch in ("(", "[", "{"):
+            depth += 1
+            last_sig = ch
+            last_word = ""
+            i += 1
+            continue
+        if ch in (")", "]", "}"):
+            depth -= 1
+            if depth == 0 and ch == ")":
+                return i
+            last_sig = ch
+            last_word = ""
+            i += 1
+            continue
+        if ch == "," and depth == 1:
+            return i
+        if ch.isalpha() or ch in ("_", "$"):
+            w_start = i
+            while i < n and (src[i].isalnum() or src[i] in ("_", "$")):
+                i += 1
+            last_word = src[w_start:i]
+            last_sig = last_word[-1]
+            continue
+        if not ch.isspace():
+            last_sig = ch
+            last_word = ""
+        i += 1
+    return -1
+
+
+def _quote_raw_eval_callbacks(code: str) -> str:
+    """Wrap unquoted Playwright-style JS callbacks in `.eval(() => ...)` as JSON code strings before REPL parsing."""
+    if "eval" not in code:
+        return code
+    out: list[str] = []
+    n = len(code)
+    i = 0
+    in_str: str | None = None
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+
+    while i < n:
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            out.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                out.append("*/")
+                in_block_comment = False
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+            continue
+        if escape:
+            out.append(ch)
+            escape = False
+            i += 1
+            continue
+        if in_str is not None:
+            if len(in_str) == 3 and code[i : i + 3] == in_str:
+                out.append(in_str)
+                in_str = None
+                i += 3
+                continue
+            out.append(ch)
+            if ch == "\\":
+                escape = True
+            elif len(in_str) == 1 and ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if (ch == "/" and nxt == "/") or ch == "#":
+            in_line_comment = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            out.append("/*")
+            i += 2
+            continue
+        if code[i : i + 3] in ('"""', "'''"):
+            in_str = code[i : i + 3]
+            out.append(in_str)
+            i += 3
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ".":
+            m = _RAW_EVAL_CALL_RE.match(code, i)
+            if m:
+                open_paren = m.end() - 1
+                arg_start = open_paren + 1
+                ws_end = arg_start
+                while ws_end < n and code[ws_end].isspace():
+                    ws_end += 1
+                if _RAW_JS_FN_START_RE.match(code[ws_end:]):
+                    arg_end = _scan_js_callback_end(code, arg_start)
+                    if arg_end > ws_end:
+                        cb_src = code[ws_end:arg_end].strip()
+                        out.append(code[i : open_paren + 1])
+                        out.append(json.dumps(f"({cb_src})()", ensure_ascii=False))
+                        i = arg_end
+                        continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 class FasterMacUseRuntime:
     def __init__(self) -> None:
         from concurrent.futures import ThreadPoolExecutor
@@ -1765,7 +1966,7 @@ class FasterMacUseRuntime:
     def execute_repl_code(self, code: str, agent_id: str = "default") -> str:
         sess = self._get_agent_session(agent_id)
         with sess.lock:
-            raw_stmts = self._split_statements(code)
+            raw_stmts = self._split_statements(_quote_raw_eval_callbacks(code))
             lines = [
                 norm
                 for s in raw_stmts

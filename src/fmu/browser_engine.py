@@ -2006,7 +2006,8 @@ IN_PAGE_RUNTIME_JS = r"""
       }
     }
     if (!fn) throw lastSyntaxErr || new SyntaxError("Invalid JavaScript in eval()");
-    return await fn();
+    const out = await fn();
+    return typeof out === "function" ? await out() : out;
   }
 
   async function executeBatch(req) {
@@ -4651,6 +4652,7 @@ class BrowserEngine:
             if any(
                 tok in msg
                 for tok in (
+                    "No tab with id",
                     "No tab with given id",
                     "No target with given id",
                     "Tab not found",

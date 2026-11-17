@@ -571,9 +571,8 @@ class TestFasterMacUse(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
-            (tmp_root / "src" / "native").mkdir(parents=True)
             (tmp_root / "src" / "fmu" / "native").mkdir(parents=True)
-            (tmp_root / "src" / "native" / "fmu_ax.swift").write_text("import Foundation\n")
+            (tmp_root / "src" / "fmu" / "native" / "fmu_ax.swift").write_text("import Foundation\n")
             with (
                 patch.object(mac_engine, "ROOT", tmp_root),
                 patch.object(mac_engine, "PKG_DIR", tmp_root / "src" / "fmu"),
@@ -880,8 +879,7 @@ class TestFasterMacUse(unittest.TestCase):
         from fmu import mac_engine
 
         self.assertTrue(
-            (mac_engine.PKG_DIR / "native" / "fmu_ax.swift").is_file()
-            or (mac_engine.ROOT / "src" / "native" / "fmu_ax.swift").is_file(),
+            (mac_engine.PKG_DIR / "native" / "fmu_ax.swift").is_file(),
             "Bundled fmu_ax.swift must exist",
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2558,6 +2556,50 @@ setInterval(() => {{}}, 1000);
                 node_proc.stdout.close()
             if node_proc.stderr:
                 node_proc.stderr.close()
+
+    def test_repl_raw_arrow_eval_callbacks_and_quoted_arrow_eval(self) -> None:
+        from fmu.cua_runtime import FasterMacUseRuntime
+
+        rt = FasterMacUseRuntime()
+        try:
+            out = rt.execute(
+                {
+                    "code": (
+                        'const tab = await cua.createBrowserTab("headless", "data:text/html,<button>UPGRADE NOW</button>");\n'
+                        "const res = await tab.eval(() => {\n"
+                        '  const btn = [...document.querySelectorAll("button")].find(el => /UPGRADE NOW/i.test(el.textContent || ""));\n'
+                        "  return { tag: btn ? btn.tagName : null };\n"
+                        "});\n"
+                        'const quoted = await tab.eval("() => ({ count: document.querySelectorAll(\'button\').length })");\n'
+                        "return JSON.stringify({ res, quoted });"
+                    )
+                }
+            )
+            parsed = json.loads(out.splitlines()[-1])
+            self.assertEqual(parsed["res"], {"tag": "BUTTON"})
+            self.assertEqual(parsed["quoted"], {"count": 1})
+        finally:
+            rt.shutdown()
+
+    def test_mv3_no_tab_with_id_evicts_stale_tab_and_retries(self) -> None:
+        from fmu.browser_engine import BrowserEngine
+
+        be = BrowserEngine()
+        be._tabs["t1"] = object()  # type: ignore[assignment]
+        calls = 0
+
+        def fake_inner(req: dict) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("No tab with id: 563976657.")
+            return "# recovered"
+
+        be._execute_batch_inner = fake_inner  # type: ignore[method-assign]
+        res = be._execute_batch_with_retry({"session": "t1", "mode": "extension", "url": "https://slh.com"})
+        self.assertEqual(res, "# recovered")
+        self.assertEqual(calls, 2)
+        self.assertNotIn("t1", be._tabs)
 
 
 if __name__ == "__main__":

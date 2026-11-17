@@ -2,10 +2,8 @@
 
 Background-first, multi-cursor browser and native macOS computer-use engine for AI agents, modeled after and extending OpenAI Codex's `cua_repl` architecture.
 
-- **Website & Interactive Benchmark Explorer:** [https://clifan.com/faster-mac-use/](https://clifan.com/faster-mac-use/) (mirror: [lifan-builds.github.io/faster-mac-use](https://lifan-builds.github.io/faster-mac-use/) · [`docs/index.html`](docs/index.html))
+- **Website & Interactive Benchmark Explorer:** [https://clifan.com/faster-mac-use/](https://clifan.com/faster-mac-use/)
 - **Architecture & 5-Workload Benchmark Report:** [`docs/architecture_and_benchmarks.md`](docs/architecture_and_benchmarks.md)
-- **Market Comparison & Positioning Brief:** [`docs/gtm.md`](docs/gtm.md)
-- **Ready-to-Publish Launch Kit (X, RedNote/小红书, Show HN, Reddit, MCP Directories):** [`docs/launch_kit.md`](docs/launch_kit.md)
 
 ![Faster Mac Use 3-Cursor Parallel Swarm vs @playwright/mcp Live Token Counter](docs/assets/swarm-vs-mcp-demo.svg)
 
@@ -55,9 +53,11 @@ Most computer-use tools force a painful choice:
 
 ## Quick Start
 
-### 1. Install (1-Line `pip` / `uvx` / Homebrew)
+### 1. Install (1-Line `uvx` / `uv tool` / `pip` / Homebrew)
 ```bash
-# Option A: Install directly via pip / uv / pipx (includes universal2 fmu-ax binary + auto-compiler fallback)
+# Option A: Run or install directly from GitHub via uv / pip (includes universal2 fmu-ax binary + auto-compiler fallback)
+uvx --from git+https://github.com/lifan-builds/faster-mac-use.git fmu mcp
+uv tool install git+https://github.com/lifan-builds/faster-mac-use.git
 pip install git+https://github.com/lifan-builds/faster-mac-use.git
 
 # Option B: Clone for development

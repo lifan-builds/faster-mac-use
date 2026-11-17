@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-delegated: Static HTML/CSS/JS (`docs/index.html` + `docs/site.css`, deployed at `https://clifan.com/faster-mac-use/` and mirrored via GitHub Pages at `https://lifan-builds.github.io/faster-mac-use/`). Inferred from the repository's existing `/docs` structure and `/self-promoting` static project-site workflow.
+delegated: Canonical static showcase page lives at `https://clifan.com/faster-mac-use/` (`lifan-builds/docs/faster-mac-use/`).
 
 ## Users
 
@@ -25,7 +25,7 @@ The only open-source computer-use engine that unifies unfocused Chrome `"🤖 Ag
 
 ## Operating Context
 
-Evaluated alongside terminal sessions, MCP configuration files (`mcp_config.json`, `config.toml`), reproducible Python/Swift benchmarks (`benchmarks/run_benchmarks.py`), and technical architecture reports (`docs/architecture_and_benchmarks.md`, `docs/gtm.md`).
+Evaluated alongside terminal sessions, MCP configuration files (`mcp_config.json`, `config.toml`), reproducible Python/Swift benchmarks (`benchmarks/run_benchmarks.py`), and the technical architecture report (`docs/architecture_and_benchmarks.md`).
 
 ## Capabilities and Constraints
 
@@ -45,7 +45,7 @@ Evaluated alongside terminal sessions, MCP configuration files (`mcp_config.json
 
 - 14+ unit and integration tests in `tests/test_fmu.py`
 - 5-workload, 15-system benchmark dataset in `benchmarks/results/latest_benchmark.json` and `benchmarks/results/latest_benchmark.md` (measured with `o200k_base` tokenizer and 50Hz `BackgroundIntrusionGuard`)
-- Full architecture writeup in `docs/architecture_and_benchmarks.md` and market/GTM brief in `docs/gtm.md`
+- Full architecture writeup in `docs/architecture_and_benchmarks.md`
 - No external customer testimonials or third-party press exist yet; none may be fabricated.
 
 ## Product Principles

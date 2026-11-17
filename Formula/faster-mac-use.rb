@@ -12,7 +12,7 @@ class FasterMacUse < Formula
   depends_on "python@3.12"
 
   def install
-    system "swiftc", "-O", "src/native/fmu_ax.swift", "-o", "bin/fmu-ax"
+    system "swiftc", "-O", "src/fmu/native/fmu_ax.swift", "-o", "bin/fmu-ax"
     bin.install "bin/fmu-ax"
     virtualenv_install_with_resources
   end

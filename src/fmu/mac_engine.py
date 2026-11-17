@@ -190,79 +190,25 @@ def get_menubar_status(socket_path: str = DEFAULT_SOCK) -> str:
         return f'# fmu-menubar state="{state}" title="{title}" stopped={str(stopped).lower()}'
 
 
-PRIMARY_FMU_ROOT = Path("/Users/lfan/Project/faster-mac-use")
-AGENT_FMU_SWIFT = Path("/Users/lfan/Project/agent/scripts/fmu/native/fmu_ax.swift")
-AGENT_AGY_SWIFT = Path("/Users/lfan/Project/agent/scripts/agy-ax.swift")
-
-
-def _sync_swift_sources(repo_swift: Path, pkg_swift: Path) -> Path:
-    """Ensure repo_swift, pkg_swift, agent/scripts/fmu/native/fmu_ax.swift, and agy-ax.swift never drift."""
-    has_repo = repo_swift.is_file()
-    has_pkg = pkg_swift.is_file()
-    if has_pkg or has_repo:
-        try:
-            all_paths = [
-                pkg_swift,
-                repo_swift,
-                PRIMARY_FMU_ROOT / "src" / "fmu" / "native" / "fmu_ax.swift",
-                PRIMARY_FMU_ROOT / "src" / "native" / "fmu_ax.swift",
-                AGENT_FMU_SWIFT,
-                AGENT_AGY_SWIFT,
-            ]
-            seen_inodes: set[tuple[int, int]] = set()
-            candidates: list[tuple[Path, os.stat_result]] = []
-            for p in all_paths:
-                if p.is_file():
-                    st = p.stat()
-                    if st.st_size > 1024:
-                        inode_key = (st.st_dev, st.st_ino)
-                        if inode_key not in seen_inodes:
-                            seen_inodes.add(inode_key)
-                            candidates.append((p, st))
-            if len(candidates) > 1:
-                mtimes = {st.st_mtime_ns for _, st in candidates}
-                sizes = {st.st_size for _, st in candidates}
-                if len(mtimes) > 1 or len(sizes) > 1:
-                    newest_path, _ = max(candidates, key=lambda item: item[1].st_mtime_ns)
-                    newest_bytes = newest_path.read_bytes()
-                    for target, _ in candidates:
-                        if target == newest_path:
-                            continue
-                        try:
-                            if target.read_bytes() != newest_bytes:
-                                shutil.copy2(newest_path, target)
-                            else:
-                                os.utime(
-                                    target,
-                                    ns=(newest_path.stat().st_atime_ns, newest_path.stat().st_mtime_ns),
-                                )
-                        except OSError:
-                            pass
-            if has_pkg:
-                return pkg_swift
-        except OSError:
-            pass
-    if has_repo:
-        return repo_swift
-    return pkg_swift
-
-
 def _resolve_ax_binary(
     root_dir: Path | None = None,
     cache_dir: Path | None = None,
 ) -> Path:
-    if root_dir is None and (PRIMARY_FMU_ROOT / "src" / "fmu" / "native" / "fmu_ax.swift").is_file():
-        effective_root = PRIMARY_FMU_ROOT
-    else:
-        effective_root = root_dir or ROOT
-    repo_bin = effective_root / "bin" / "fmu-ax"
-    repo_swift = effective_root / "src" / "native" / "fmu_ax.swift"
     pkg_swift = PKG_DIR / "native" / "fmu_ax.swift"
-    swift_src = (
-        _sync_swift_sources(repo_swift, pkg_swift)
-        if root_dir is None
-        else (repo_swift if repo_swift.is_file() else pkg_swift)
-    )
+    if root_dir is not None:
+        repo_bin = root_dir / "bin" / "fmu-ax"
+        repo_swift = root_dir / "src" / "fmu" / "native" / "fmu_ax.swift"
+        swift_src = repo_swift if repo_swift.is_file() else pkg_swift
+        in_checkout = repo_swift.is_file()
+    elif (PKG_DIR.parent / "fmu-ax").is_file() or (PKG_DIR.parent / "agy-ax").is_file():
+        repo_bin = PKG_DIR.parent / "fmu-ax"
+        swift_src = pkg_swift
+        in_checkout = pkg_swift.is_file()
+    else:
+        repo_bin = ROOT / "bin" / "fmu-ax"
+        repo_swift = ROOT / "src" / "fmu" / "native" / "fmu_ax.swift"
+        swift_src = pkg_swift if pkg_swift.is_file() else repo_swift
+        in_checkout = repo_swift.is_file()
 
     user_cache_bin = (
         cache_dir
@@ -279,13 +225,12 @@ def _resolve_ax_binary(
                     pass
             return repo_bin
 
-    if root_dir is None and not repo_swift.is_file():
+    if root_dir is None and not in_checkout:
         which_bin = shutil.which("fmu-ax")
         if which_bin and Path(which_bin).is_file():
             return Path(which_bin)
 
-    # Decide where to compile if swift_src is available
-    target_bin = repo_bin if repo_swift.is_file() else user_cache_bin
+    target_bin = repo_bin if in_checkout else user_cache_bin
     if target_bin.is_file() and (
         not swift_src.is_file() or target_bin.stat().st_mtime >= swift_src.stat().st_mtime
     ):

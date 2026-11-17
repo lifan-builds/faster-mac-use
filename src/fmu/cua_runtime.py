@@ -3,15 +3,14 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import json
-import os
 from pathlib import Path
 import re
 import socket
-import subprocess
 import sys
 import time
 from typing import Any
 
+from .cli import DEFAULT_RUNTIME_SOCK, execute_via_daemon
 from .browser_engine import BrowserEngine, _HAS_SCHEME_RE, _normalize_nav_url
 from .mac_engine import (
     USER_STOPPED_ERROR,
@@ -30,8 +29,6 @@ try:
     _ENC = _tiktoken.get_encoding("o200k_base")
 except Exception:
     _ENC = None
-
-DEFAULT_RUNTIME_SOCK = os.environ.get("FMU_RUNTIME_SOCK", "/tmp/fmu-runtime.sock")
 
 
 def estimate_tokens(text: str) -> int:
@@ -2238,20 +2235,6 @@ class FasterMacUseRuntime:
         flush_telemetry()
 
 
-def can_connect_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> bool:
-    if not Path(socket_path).exists():
-        return False
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.settimeout(0.15)
-        s.connect(socket_path)
-        s.close()
-        return True
-    except OSError:
-        s.close()
-        return False
-
-
 def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
     import fcntl
     import threading
@@ -2328,139 +2311,6 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
             pass
         lock_fp.close()
         lock_path.unlink(missing_ok=True)
-
-
-def execute_via_daemon(
-    req: dict[str, Any],
-    fmu_bin_path: str | Path,
-    socket_path: str = DEFAULT_RUNTIME_SOCK,
-) -> str:
-    is_control = any(
-        req.get(k)
-        for k in (
-            "stop",
-            "resume",
-            "statusBar",
-            "getStatus",
-            "clickStatusBar",
-            "highlightWindow",
-            "togglePreview",
-            "dumpUiSnapshots",
-            "shutdown_daemon",
-            "perfReport",
-            "bridgeStatus",
-            "listTabs",
-        )
-    )
-    if not is_control and is_user_stopped():
-        code_str = str(req.get("code") or "")
-        if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
-            return USER_STOPPED_ERROR
-
-    if req.get("clickStatusBar"):
-        return MacNativeEngine().execute({"clickStatusBar": True})
-    if req.get("highlightWindow"):
-        return highlight_target_window()
-    if req.get("togglePreview"):
-        return MacNativeEngine().execute({"togglePreview": True})
-    if req.get("dumpUiSnapshots"):
-        return MacNativeEngine().execute({"dumpUiSnapshots": str(req["dumpUiSnapshots"])})
-    if req.get("stop"):
-        return engage_user_stop()
-    if req.get("resume") and not req.get("reset") and not req.get("app") and not req.get("url") and not req.get("code"):
-        return clear_user_stop()
-    if req.get("statusBar") or req.get("getStatus"):
-        return get_menubar_status()
-
-    if not can_connect_runtime_daemon(socket_path):
-        if req.get("shutdown_daemon"):
-            return "# fmu daemon stopped"
-        if req.get("reset") and len(req) == 1 or (req.get("reset") and req.get("resume") and len(req) == 2):
-            if req.get("resume"):
-                clear_user_stop()
-            MacNativeEngine().reset()
-            return "# fmu runtime reset"
-        import fcntl
-
-        spawn_lock_path = Path(f"{socket_path}.spawn.lock")
-        with open(spawn_lock_path, "a+", encoding="utf-8") as spawn_lock_fp:
-            fcntl.flock(spawn_lock_fp.fileno(), fcntl.LOCK_EX)
-            try:
-                if not can_connect_runtime_daemon(socket_path):
-                    t_spawn0 = time.perf_counter()
-                    proc = subprocess.Popen(
-                        [sys.executable, str(fmu_bin_path), "--daemon", socket_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        stdin=subprocess.DEVNULL,
-                        start_new_session=True,
-                        close_fds=True,
-                    )
-                    proc._child_created = False
-                    for _ in range(80):
-                        if can_connect_runtime_daemon(socket_path):
-                            break
-                        time.sleep(0.015)
-                    from fmu.telemetry import record_perf_event
-
-                    record_perf_event(
-                        {
-                            "surface": "daemon",
-                            "bridge": "unix_sock",
-                            "target": Path(socket_path).name,
-                            "cold_start": True,
-                            "timings_ms": {"total": round((time.perf_counter() - t_spawn0) * 1000.0, 2)},
-                        },
-                        sync=True,
-                    )
-            finally:
-                try:
-                    fcntl.flock(spawn_lock_fp.fileno(), fcntl.LOCK_UN)
-                except Exception:
-                    pass
-
-    payload = (json.dumps(req) + "\n").encode("utf-8")
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.settimeout(1.0)
-        s.connect(socket_path)
-        s.sendall(payload)
-        s.shutdown(socket.SHUT_WR)
-        chunks: list[bytes] = []
-        s.settimeout(0.05)
-        extra_wait_s = 0.0
-        for st_item in req.get("steps") or []:
-            if isinstance(st_item, dict):
-                extra_wait_s += float(
-                    st_item.get("timeoutMs") or st_item.get("timeout") or st_item.get("ms") or 0
-                ) / 1000.0
-        if isinstance(req.get("parallel"), list):
-            extra_wait_s = max(extra_wait_s, 30.0)
-        deadline = time.perf_counter() + min(120.0, max(45.0, 25.0 + extra_wait_s))
-        while True:
-            if not is_control and is_user_stopped():
-                code_str = str(req.get("code") or "")
-                if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
-                    return USER_STOPPED_ERROR
-            try:
-                buf = s.recv(16384)
-            except socket.timeout:
-                if time.perf_counter() >= deadline:
-                    raise TimeoutError("Timed out waiting for fmu runtime daemon")
-                continue
-            if not buf:
-                break
-            chunks.append(buf)
-        return b"".join(chunks).decode("utf-8", errors="replace").strip()
-    except OSError:
-        rt = FasterMacUseRuntime()
-        rt._is_mcp_stdio = False
-        try:
-            return rt.execute(req)
-        finally:
-            rt.shutdown()
-    finally:
-        s.close()
 
 
 MCP_TOOL_SCHEMA = {

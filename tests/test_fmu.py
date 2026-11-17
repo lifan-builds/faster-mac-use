@@ -220,6 +220,17 @@ class TestFasterMacUse(unittest.TestCase):
         self.assertLess(metrics["peak_context_masked"], metrics["peak_context_unmasked"])
 
     def test_08_cli_warm_daemon_persistence_across_processes(self) -> None:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; import fmu.cli; "
+                "assert not {'fmu.cua_runtime', 'fmu.mac_engine', 'fmu.browser_engine', 'tiktoken'} & sys.modules.keys()",
+            ],
+            cwd=ROOT / "src",
+            check=True,
+            timeout=10,
+        )
         fmu_bin = str(ROOT / "bin" / "fmu")
         url = f"{self.server.base_url}/pricing"
         subprocess.run([fmu_bin, json.dumps({"reset": True})], capture_output=True, text=True, timeout=15)

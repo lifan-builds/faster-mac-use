@@ -144,7 +144,7 @@ class AppHandle:
             self._pending_steps.append({"op": "click", "x": int(target["x"]), "y": int(target["y"])})
         elif isinstance(target, int):
             self._pending_steps.append({"op": "click", "index": target})
-        elif str(target).startswith(("@a", "@u", "@e")):
+        elif str(target).startswith(("@a", "@u", "@e", "@o")):
             self._pending_steps.append({"op": "click", "uid": str(target)})
         else:
             self._pending_steps.append({"op": "click", "name": str(target)})
@@ -156,7 +156,7 @@ class AppHandle:
             self._pending_steps.append({"op": "move", "x": int(target), "y": int(y)})
         elif isinstance(target, dict) and "x" in target and "y" in target:
             self._pending_steps.append({"op": "move", "x": int(target["x"]), "y": int(target["y"])})
-        elif str(target).startswith(("@a", "@u", "@e")):
+        elif str(target).startswith(("@a", "@u", "@e", "@o")):
             self._pending_steps.append({"op": "move", "uid": str(target)})
         else:
             self._pending_steps.append({"op": "move", "name": str(target)})
@@ -164,6 +164,37 @@ class AppHandle:
 
     move = moveCursor
     hover = moveCursor
+
+    def scroll(
+        self,
+        dy: int = -320,
+        dx: int = 0,
+        x: int | None = None,
+        y: int | None = None,
+    ) -> AppHandle:
+        self._fresh = False
+        step: dict[str, Any] = {"op": "scroll", "dy": int(dy), "dx": int(dx)}
+        if x is not None:
+            step["x"] = int(x)
+        if y is not None:
+            step["y"] = int(y)
+        self._pending_steps.append(step)
+        return self
+
+    def swipe(
+        self,
+        from_x: int,
+        from_y: int,
+        to_x: int,
+        to_y: int,
+    ) -> AppHandle:
+        self._fresh = False
+        self._pending_steps.append(
+            {"op": "drag", "x": int(from_x), "y": int(from_y), "toX": int(to_x), "toY": int(to_y)}
+        )
+        return self
+
+    drag = swipe
 
     def set(self, target: str, value: str) -> AppHandle:
         self._fresh = False
@@ -652,6 +683,28 @@ class TabHandle:
         return self.setViewport(reset=True)
 
     reset_viewport = resetViewport
+
+    def layoutAudit(
+        self,
+        widths: list[int] | tuple[int, ...] | dict[str, Any] | None = None,
+        height: int = 812,
+    ) -> dict[str, Any]:
+        self._fresh = False
+        if self.has_pending():
+            flushed = self.flush(diff=True)
+            sess = self.runtime._get_agent_session(self.agent_id)
+            if sess.active_outputs is not None and flushed:
+                sess.active_outputs.append(flushed)
+        if isinstance(widths, dict):
+            h = int(widths.get("height") or height)
+            w_raw = widths.get("widths")
+            w_list = [int(x) for x in w_raw] if w_raw is not None else None
+        else:
+            h = int(height)
+            w_list = [int(x) for x in widths] if widths is not None else None
+        return self.runtime.browser.audit_tab_layout(self.tab_id, widths=w_list, height=h)
+
+    layout_audit = layoutAudit
 
     def errors(self, clear: bool | dict[str, Any] = False) -> list[dict[str, Any]]:
         self._fresh = False
@@ -1443,6 +1496,9 @@ _TAB_CHAIN_METHODS: frozenset[str] = frozenset(
         "callTool",
         "saveMacro",
         "ocr",
+        "scroll",
+        "swipe",
+        "drag",
         "screenshot",
         "screenshotValue",
         "setViewport",
@@ -1450,6 +1506,8 @@ _TAB_CHAIN_METHODS: frozenset[str] = frozenset(
         "set_viewport",
         "resetViewport",
         "reset_viewport",
+        "layoutAudit",
+        "layout_audit",
         "errors",
         "clearErrors",
         "clear_errors",

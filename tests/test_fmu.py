@@ -2746,6 +2746,107 @@ setInterval(() => {{}}, 1000);
             rep = guard.stop()
             self.assertTrue(rep.passed_background_invariant, f"Intrusion detected: {rep}")
 
+    def test_32_layout_audit_and_inline_layout_issues(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fmu-layout-audit-") as tmp_dir:
+            clean_html = Path(tmp_dir) / "clean.html"
+            clean_html.write_text(
+                """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                  body { margin: 0; font-family: sans-serif; }
+                  header { position: sticky; top: 0; display: flex; gap: 12px; padding: 12px; background: #111; }
+                  main { padding: 16px; height: 1800px; }
+                  input { font-size: 16px; padding: 8px; }
+                </style></head><body>
+                  <header>
+                    <button type="button">Forecast</button>
+                    <button type="button" aria-label="Search"><svg width="16" height="16"></svg></button>
+                  </header>
+                  <main>
+                    <button type="button">Compare Resorts</button>
+                    <input type="text" aria-label="Resort filter" placeholder="Filter..." />
+                  </main>
+                </body></html>""",
+                encoding="utf-8",
+            )
+            broken_html = Path(tmp_dir) / "broken.html"
+            broken_html.write_text(
+                """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                  body { margin: 0; font-family: sans-serif; }
+                  .row { display: flex; align-items: center; gap: 12px; padding: 12px; position: relative; }
+                  .wide-banner { width: 300px; height: 24px; }
+                  .search-inp { font-size: 16px; }
+                  @media (max-width: 1023px) {
+                    .cta-label { display: none; }
+                  }
+                  @media (max-width: 767px) {
+                    .overlap-b { margin-left: -48px; }
+                    .wide-banner { width: 520px; }
+                    .search-inp { font-size: 13px; }
+                  }
+                </style></head><body>
+                  <div class="row">
+                    <button type="button" class="overlap-a">Accuracy Lab</button>
+                    <button type="button" class="overlap-b">Command Search</button>
+                    <button type="button" aria-label="Install App to Home Screen">
+                      <svg width="16" height="16"></svg><span class="cta-label">Install App</span>
+                    </button>
+                    <input class="search-inp" type="text" aria-label="Resort query" />
+                  </div>
+                  <div class="wide-banner">Wide</div>
+                </body></html>""",
+                encoding="utf-8",
+            )
+
+            clean_url = clean_html.resolve().as_uri()
+            broken_url = broken_html.resolve().as_uri()
+
+            clean_out = self.rt.execute(
+                {
+                    "code": (
+                        f'const tab = await cua.createBrowserTab("headless", "{clean_url}");\n'
+                        "await tab.eval('window.scrollTo(0, 120)');\n"
+                        "return JSON.stringify(await tab.layoutAudit([320, 375, 768, 1280]));"
+                    )
+                }
+            )
+            clean_rep = json.loads(clean_out.splitlines()[-1])
+            self.assertTrue(clean_rep["clean"], f"Unexpected layout false positives: {clean_rep}")
+            self.assertEqual(clean_rep["issueCount"], 0)
+
+            inline_out = self.rt.execute(
+                {
+                    "code": (
+                        f'const tab = await cua.createBrowserTab("headless", "{broken_url}");\n'
+                        "await tab.setViewport(375, 812, { mobile: true });\n"
+                        "return await tab.snapshot({ full: true });"
+                    )
+                }
+            )
+            self.assertIn("! layout_issues(", inline_out)
+
+            broken_out = self.rt.execute(
+                {
+                    "code": (
+                        "const tab = await cua.getTab();\n"
+                        "await tab.resetViewport();\n"
+                        "const audit = await tab.layoutAudit([375, 1280]);\n"
+                        "const vwAfter = await tab.evalValue('window.innerWidth');\n"
+                        "return JSON.stringify({ audit, vwAfter });"
+                    )
+                }
+            )
+            broken_data = json.loads(broken_out.splitlines()[-1])
+            audit = broken_data["audit"]
+            self.assertEqual(broken_data["vwAfter"], 1280)
+            self.assertFalse(audit["clean"])
+            self.assertEqual(audit["widths"]["1280"], [])
+            mob_issues = "\n".join(audit["widths"]["375"])
+            self.assertIn("doc_overflow(", mob_issues)
+            self.assertIn("overlap(", mob_issues)
+            self.assertIn("ios_input_zoom(", mob_issues)
+            self.assertIn("unlabeled_touch_cta(", mob_issues)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

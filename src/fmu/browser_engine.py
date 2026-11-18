@@ -300,11 +300,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.4.1"
+_FMU_RUNTIME_VERSION = "0.4.2"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.4.1";
+  const FMU_RUNTIME_VERSION = "0.4.2";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -1344,7 +1344,127 @@ IN_PAGE_RUNTIME_JS = r"""
       allFullLines.push(item.fullLine);
     }
     const newCrc = crc32(allFullLines.join("\n"));
-    return { currentMap, lines, canvases, newCrc, totalCount: currentMap.size };
+    const layoutIssues = query ? [] : collectLayoutIssues(stagedItems);
+    return { currentMap, lines, canvases, newCrc, totalCount: currentMap.size, layoutIssues };
+  }
+
+  const UNIVERSAL_ICON_RE = /\b(logo|search|find|close|dismiss|cancel|menu|nav|navigation|hamburger|refresh|reload|sync|back|forward|previous|prev|next|more|options|settings|clear|reset|copy|share|star|favorite|pin|unpin|bookmark|play|pause|stop|mute|unmute|volume|expand|collapse|fullscreen|zoom|theme|dark|light|avatar|profile|account|notifications?|help|info|filter|sort|delete|remove|trash|edit|plus|minus)\b/i;
+
+  function collectLayoutIssues(stagedItems) {
+    const issues = [];
+    const vw = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1280;
+    const vh = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 800;
+    let modalRoot = null;
+    const modals = document.querySelectorAll("[aria-modal='true'], dialog[open]");
+    for (let i = modals.length - 1; i >= 0; i--) {
+      if (isVisible(modals[i])) {
+        modalRoot = modals[i];
+        break;
+      }
+    }
+
+    if (!modalRoot && document.documentElement) {
+      const rootOx = window.getComputedStyle(document.documentElement).overflowX;
+      const bodyOx = document.body ? window.getComputedStyle(document.body).overflowX : "visible";
+      if (rootOx !== "hidden" && rootOx !== "clip" && bodyOx !== "hidden" && bodyOx !== "clip") {
+        const docOverflow = Math.round(document.documentElement.scrollWidth - vw);
+        if (docOverflow > 2) {
+          issues.push(`doc_overflow(+${docOverflow}px at ${vw}x${vh})`);
+        }
+      }
+    }
+
+    const styleCache = new Map();
+    const getStyle = (node) => {
+      let s = styleCache.get(node);
+      if (!s) {
+        s = window.getComputedStyle(node);
+        styleCache.set(node, s);
+      }
+      return s;
+    };
+
+    const controls = [];
+    for (const item of stagedItems) {
+      const el = item.el;
+      if (!el || !el.getBoundingClientRect) continue;
+      const rRole = item.role || "";
+      const isAtomic = (
+        rRole === "button"
+        || rRole === "link"
+        || rRole === "tab"
+        || rRole === "checkbox"
+        || rRole === "radio"
+        || rRole === "switch"
+        || rRole === "select"
+        || rRole === "combobox"
+        || rRole === "textbox"
+        || rRole.startsWith("input")
+      );
+      if (!isAtomic) continue;
+      if (modalRoot && !modalRoot.contains(el)) continue;
+
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2 || r.right <= 0 || r.left >= vw) continue;
+
+      let fixedRoot = null;
+      let scrollRoot = null;
+      let cur = el;
+      while (cur && cur !== document.documentElement) {
+        const cs = getStyle(cur);
+        if (!fixedRoot && (cs.position === "fixed" || cs.position === "sticky")) {
+          fixedRoot = cur;
+        }
+        if (
+          !scrollRoot
+          && cur !== document.body
+          && (cs.overflowX === "auto" || cs.overflowX === "scroll" || cs.overflowY === "auto" || cs.overflowY === "scroll")
+        ) {
+          scrollRoot = cur;
+        }
+        cur = cur.parentElement;
+      }
+
+      if (vw < 768) {
+        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+        const inpType = (el.getAttribute && el.getAttribute("type")) || "text";
+        if (
+          tag === "textarea"
+          || tag === "select"
+          || (tag === "input" && !/^(checkbox|radio|button|submit|reset|range|color|file|hidden|image)$/i.test(inpType))
+        ) {
+          const fs = parseFloat(getStyle(el).fontSize || "16");
+          if (fs > 0 && fs < 15.5) {
+            issues.push(`ios_input_zoom(${item.uid} "${cleanStr(item.label || tag, 22)}" ${Math.round(fs)}px<16px)`);
+          }
+        }
+      }
+
+      if (vw < 1024 && (rRole === "button" || rRole === "tab")) {
+        const visTxt = String(el.innerText || "").replace(/\s+/g, " ").trim();
+        const hasRasterImg = Boolean(el.querySelector && el.querySelector("img[src]"));
+        if (!hasRasterImg && visTxt.length === 0 && item.label && item.label.length >= 4 && !UNIVERSAL_ICON_RE.test(item.label)) {
+          issues.push(`unlabeled_touch_cta(${item.uid} "${cleanStr(item.label, 28)}")`);
+        }
+      }
+
+      controls.push({ el, uid: item.uid, label: item.label || rRole, r, fixedRoot, scrollRoot });
+    }
+
+    for (let i = 0; i < controls.length && issues.length < 20; i++) {
+      const a = controls[i];
+      for (let j = i + 1; j < controls.length && issues.length < 20; j++) {
+        const b = controls[j];
+        if (a.fixedRoot !== b.fixedRoot || a.scrollRoot !== b.scrollRoot) continue;
+        if (a.el.contains(b.el) || b.el.contains(a.el)) continue;
+        const ix = Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left);
+        const iy = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
+        if (ix > 3 && iy > 3) {
+          issues.push(`overlap(${a.uid} "${cleanStr(a.label, 20)}" <-> ${b.uid} "${cleanStr(b.label, 20)}", ${Math.round(ix)}x${Math.round(iy)}px)`);
+        }
+      }
+    }
+    return issues;
   }
 
   function computeDiff(prevMap, curMap) {
@@ -2404,6 +2524,7 @@ IN_PAGE_RUNTIME_JS = r"""
       cursor: st.cursor,
       webMcpTools,
       canvases: snap.canvases || [],
+      layoutIssues: snap.layoutIssues || [],
       useDiff,
       errors,
       evalOutputs,
@@ -2999,6 +3120,8 @@ class BrowserTabSession:
         self.last_preview_path: str | None = None
         self.last_vw: int = 1280
         self.last_vh: int = 800
+        self._custom_viewport: bool = False
+        self._last_layout_sig: str = ""
         self._diag_lock = threading.Lock()
         self._diagnostics: list[dict[str, Any]] = []
         self._unreported_diags: list[dict[str, Any]] = []
@@ -3243,6 +3366,8 @@ class BrowserTabSession:
         reset: bool = False,
     ) -> tuple[int, int]:
         if reset or width is None or height is None:
+            self._custom_viewport = False
+            self._last_layout_sig = ""
             try:
                 self._raw_cdp.send("Emulation.clearDeviceMetricsOverride", {})
             except Exception:
@@ -3284,6 +3409,8 @@ class BrowserTabSession:
             self._raw_page.evaluate("() => { if (window.__fmuStore) window.__fmuStore.mutationSeq++; }")
         except Exception:
             pass
+        self._custom_viewport = True
+        self._last_layout_sig = ""
         self.last_vw = w
         self.last_vh = h
         return w, h
@@ -4056,7 +4183,11 @@ class BrowserEngine:
         )
         if tid in self._tabs:
             sess = self._tabs[tid]
-            if self._is_session_alive(sess) and (not must_use_ext or sess.is_extension):
+            if (
+                self._is_session_alive(sess)
+                and (not must_use_ext or sess.is_extension)
+                and not (mode == "headless" and sess.is_extension)
+            ):
                 if (
                     url
                     and url != "about:blank"
@@ -4876,6 +5007,51 @@ class BrowserEngine:
         if sess is not None:
             sess.clear_diagnostics()
 
+    def audit_tab_layout(
+        self,
+        tab_id: str,
+        *,
+        widths: list[int] | None = None,
+        height: int = 812,
+    ) -> dict[str, Any]:
+        target_widths = [max(200, int(w)) for w in (widths or [320, 375, 768, 1024, 1280])]
+        h = max(160, int(height))
+
+        def _audit() -> dict[str, Any]:
+            sess = self._tabs.get(tab_id)
+            if sess is None or not self._is_session_alive(sess):
+                raise RuntimeError(f"Tab not found: {tab_id}")
+            sess.ensure_runtime(force=sess.is_extension)
+            had_custom = sess._custom_viewport
+            prev_vw, prev_vh = sess.last_vw, sess.last_vh
+            by_width: dict[str, list[str]] = {}
+            total = 0
+            try:
+                for w in target_widths:
+                    sess.set_viewport(width=w, height=h, mobile=(w < 768))
+                    issues = sess._raw_page.evaluate(
+                        "async () => { window.dispatchEvent(new Event('resize')); await new Promise((r) => setTimeout(r, 24)); return window.__fmu ? (window.__fmu.collectSnapshot('', 180, true, false).layoutIssues || []) : []; }"
+                    )
+                    issue_list = [str(x) for x in (issues or [])]
+                    by_width[str(w)] = issue_list
+                    total += len(issue_list)
+            finally:
+                if had_custom:
+                    sess.set_viewport(width=prev_vw, height=prev_vh, mobile=(prev_vw < 768))
+                else:
+                    sess.set_viewport(reset=True)
+                try:
+                    sess._raw_page.evaluate("() => { window.dispatchEvent(new Event('resize')); }")
+                except Exception:
+                    pass
+            return {
+                "clean": total == 0,
+                "issueCount": total,
+                "widths": by_width,
+            }
+
+        return self._run_sync(_audit)
+
     def execute_batch(self, req: dict[str, Any]) -> str:
         if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension", "listTabs")) and is_user_stopped():
             return USER_STOPPED_ERROR
@@ -5280,14 +5456,14 @@ class BrowserEngine:
             )
         ]
 
+        navigated_in_batch = False
+        viewport_changed_in_batch = False
         if boundary_indices:
             last_idx = 0
             combined_errors: list[str] = []
             combined_evals: list[str] = []
             res: dict[str, Any] = {}
             had_pre_on_current_page = False
-            navigated_in_batch = False
-            viewport_changed_in_batch = False
             initial_batch_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
             for b_idx in boundary_indices:
                 if is_user_stopped():
@@ -5552,6 +5728,8 @@ class BrowserEngine:
                 tab_id=tab_id,
             )
             _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+            if res.get("didNavigate"):
+                navigated_in_batch = True
             t_esc0 = time.perf_counter()
             self._handle_eval_escalations(
                 sess,
@@ -5584,6 +5762,8 @@ class BrowserEngine:
                 tab_id=tab_id,
             )
             _accum_in_page(res, (time.perf_counter() - t_ip0) * 1000.0)
+            if res.get("didNavigate"):
+                navigated_in_batch = True
             t_esc0 = time.perf_counter()
             self._handle_eval_escalations(
                 sess,
@@ -5671,7 +5851,7 @@ class BrowserEngine:
         if res.get("webMcpTools"):
             header += f' webmcp={json.dumps(res["webMcpTools"])}'
         if (agent_id not in sess._documented_agents and not sess.documented) or req.get("showDocs"):
-            header += "\n# api: click(uid|text), fill(uid,val), select(uid,val), move(uid|text), press(key), waitFor(text|sel), wait(ms), text(sel?), eval(code), screenshot(path?,fullPage?), setViewport(w,h), errors(), callTool(name,args), saveMacro(name,steps), diff(), snapshot(full=True)"
+            header += "\n# api: click(uid|text), fill(uid,val), select(uid,val), move(uid|text), press(key), waitFor(text|sel), wait(ms), text(sel?), eval(code), screenshot(path?,fullPage?), setViewport(w,h), layoutAudit(widths?), errors(), callTool(name,args), saveMacro(name,steps), diff(), snapshot(full=True)"
             sess.documented = True
             sess._documented_agents.add(agent_id)
 
@@ -5686,6 +5866,23 @@ class BrowserEngine:
             if len(new_diags) > 3:
                 diag_preview += f" (+{len(new_diags) - 3} more)"
             out.append(f"! page_errors({len(new_diags)}): {diag_preview}")
+        cur_url_low = str(sess.last_url or "").lower()
+        is_dev_url = any(
+            tok in cur_url_low
+            for tok in ("://localhost", "://127.0.0.1", "://[::1]", ".local/", ".local:", ".localhost", "file://")
+        )
+        if sess._custom_viewport or viewport_changed_in_batch or is_dev_url:
+            layout_issues = [str(x) for x in (res.get("layoutIssues") or []) if x]
+            if layout_issues:
+                sig = f"{sess.last_vw}x{sess.last_vh}|" + "|".join(layout_issues)
+                if viewport_changed_in_batch or navigated_in_batch or sig != sess._last_layout_sig:
+                    sess._last_layout_sig = sig
+                    l_prev = "; ".join(layout_issues[:3])
+                    if len(layout_issues) > 3:
+                        l_prev += f" (+{len(layout_issues) - 3} more)"
+                    out.append(f"! layout_issues({len(layout_issues)}): {l_prev}")
+            else:
+                sess._last_layout_sig = ""
         if res.get("evalOutputs"):
             for ev in res["evalOutputs"]:
                 out.append(f"> {_format_eval_output(ev)}")
@@ -5809,6 +6006,11 @@ class BrowserEngine:
             except Exception:
                 pass
         self._tabs.clear()
+        if self._context is not None and not self._is_cdp_chrome:
+            try:
+                self._context.clear_cookies()
+            except Exception:
+                pass
         self._tab_last_urls.clear()
         self._tab_last_titles.clear()
         self._last_tab_steps.clear()

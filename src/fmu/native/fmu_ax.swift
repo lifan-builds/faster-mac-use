@@ -51,6 +51,18 @@ func parseNormalizedAxUid(_ raw: String?) -> String? {
     guard let c = raw?.trimmingCharacters(in: .whitespacesAndNewlines), c.count >= 3 else {
         return nil
     }
+    if c.hasPrefix("@ocr") {
+        let suffix = c.dropFirst(4)
+        if !suffix.isEmpty && suffix.allSatisfy({ $0.isNumber }) {
+            return "@o" + String(suffix)
+        }
+    }
+    if c.hasPrefix("@o") {
+        let suffix = c.dropFirst(2)
+        if !suffix.isEmpty && suffix.allSatisfy({ $0.isNumber }) {
+            return "@o" + String(suffix)
+        }
+    }
     if c.hasPrefix("@a") || c.hasPrefix("@u") || c.hasPrefix("@e") {
         let suffix = c.dropFirst(2)
         if !suffix.isEmpty && suffix.allSatisfy({ $0.isNumber }) {
@@ -94,10 +106,14 @@ struct StepSpec: Codable {
     let ms: Int?
     let x: Int?
     let y: Int?
+    let dx: Int?
+    let dy: Int?
+    let toX: Int?
+    let toY: Int?
     let optional: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case op, action, uid, ref, target, selector, index, role, name, label, text, key, value, path, menu, files, ms, x, y, optional
+        case op, action, uid, ref, target, selector, index, role, name, label, text, key, value, path, menu, files, ms, x, y, dx, dy, toX, toY, optional
     }
 
     init(from decoder: Decoder) throws {
@@ -150,6 +166,10 @@ struct StepSpec: Codable {
         self.ms = decodeInt(.ms)
         self.x = decodeInt(.x)
         self.y = decodeInt(.y)
+        self.dx = decodeInt(.dx)
+        self.dy = decodeInt(.dy)
+        self.toX = decodeInt(.toX)
+        self.toY = decodeInt(.toY)
         self.optional = try? c.decodeIfPresent(Bool.self, forKey: .optional)
     }
 
@@ -173,6 +193,10 @@ struct StepSpec: Codable {
         try c.encodeIfPresent(ms, forKey: .ms)
         try c.encodeIfPresent(x, forKey: .x)
         try c.encodeIfPresent(y, forKey: .y)
+        try c.encodeIfPresent(dx, forKey: .dx)
+        try c.encodeIfPresent(dy, forKey: .dy)
+        try c.encodeIfPresent(toX, forKey: .toX)
+        try c.encodeIfPresent(toY, forKey: .toY)
         try c.encodeIfPresent(optional, forKey: .optional)
     }
 
@@ -213,6 +237,10 @@ struct StepSpec: Codable {
             return "wait"
         case "hotkey", "shortcut":
             return "key"
+        case "scroll", "wheel":
+            return "scroll"
+        case "drag", "swipe":
+            return "drag"
         default:
             return raw
         }
@@ -403,6 +431,8 @@ final class EngineState {
     var windowCrc: [String: String] = [:]
     var latestWindowNodes: [String: [NodeRecord]] = [:]
     var latestWindowElements: [String: [AXUIElement]] = [:]
+    var latestOCRRecords: [String: [NodeRecord]] = [:]
+    var lastReportedWinOrigin: [String: (x: Int, y: Int)] = [:]
     var windowSyncedSeq: [String: UInt64] = [:]
     var cachedAppWindows: [String: (AXUIElement, String)] = [:]
     var appCache: [String: TargetApp] = [:]
@@ -1480,6 +1510,211 @@ func postBackgroundClickToPid(_ pid: pid_t, x: Int, y: Int) -> Bool {
     return true
 }
 
+func isContinuityStreamApp(_ app: TargetApp) -> Bool {
+    if app.name.lowercased() == "iphone mirroring" { return true }
+    return NSRunningApplication(processIdentifier: app.pid)?.bundleIdentifier == "com.apple.ScreenContinuity"
+}
+
+final class ContinuityHIDSession {
+    let app: TargetApp
+    let rootWin: AXUIElement
+    let reportedOrigin: (x: Int, y: Int)
+    private var settledOrigin: (x: Int, y: Int)
+    private var activated = false
+    private var prevFrontmostPid: pid_t?
+    private var savedCursorTopLeft: CGPoint?
+    private let src = CGEventSource(stateID: .hidSystemState)
+
+    init(app: TargetApp, rootWin: AXUIElement, reportedOrigin: (x: Int, y: Int)) {
+        self.app = app
+        self.rootWin = rootWin
+        self.reportedOrigin = reportedOrigin
+        self.settledOrigin = reportedOrigin
+        self.src?.localEventsSuppressionInterval = 0.0
+    }
+
+    func translate(_ x: Int, _ y: Int) -> CGPoint {
+        let tx = settledOrigin.x + (x - reportedOrigin.x)
+        let ty = settledOrigin.y + (y - reportedOrigin.y)
+        return CGPoint(x: Double(tx), y: Double(ty))
+    }
+
+    func ensureReady() {
+        guard !activated else { return }
+        activated = true
+        let mouse = NSEvent.mouseLocation
+        let mainH = NSScreen.screens.first?.frame.height ?? 1440
+        savedCursorTopLeft = CGPoint(x: mouse.x, y: mainH - mouse.y)
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != app.pid {
+            prevFrontmostPid = front.processIdentifier
+        }
+        let axApp = AXUIElementCreateApplication(app.pid)
+        _ = AXUIElementSetAttributeValue(axApp, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementPerformAction(rootWin, kAXRaiseAction as CFString)
+        // Wait for macOS Stage Manager / Spaces window slide animation to settle completely
+        var prev = readBatchedAttrs(rootWin)
+        var stableTicks = 0
+        for _ in 0..<18 {
+            usleep(35_000)
+            let cur = readBatchedAttrs(rootWin)
+            if cur.x == prev.x && cur.y == prev.y {
+                stableTicks += 1
+                if stableTicks >= 3 {
+                    prev = cur
+                    break
+                }
+            } else {
+                stableTicks = 0
+                prev = cur
+            }
+        }
+        settledOrigin = (x: prev.x, y: prev.y)
+    }
+
+    func click(x: Int, y: Int) {
+        ensureReady()
+        let pt = translate(x, y)
+        CGWarpMouseCursorPosition(pt)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        usleep(35_000)
+        CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(25_000)
+        if let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
+           let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+            down.setIntegerValueField(.mouseEventClickState, value: 1)
+            up.setIntegerValueField(.mouseEventClickState, value: 1)
+            down.post(tap: .cghidEventTap)
+            usleep(70_000)
+            up.post(tap: .cghidEventTap)
+            usleep(120_000)
+        }
+    }
+
+    func scroll(x: Int, y: Int, dx: Int, dy: Int) {
+        ensureReady()
+        let pt = translate(x, y)
+        CGWarpMouseCursorPosition(pt)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        usleep(30_000)
+        CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(20_000)
+        let steps = 5
+        let stepDy = Int32(dy / steps)
+        let stepDx = Int32(dx / steps)
+        for _ in 0..<steps {
+            if let ev = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: stepDy, wheel2: stepDx, wheel3: 0) {
+                ev.location = pt
+                ev.post(tap: .cghidEventTap)
+            }
+            usleep(20_000)
+        }
+        usleep(120_000)
+    }
+
+    func drag(fromX: Int, fromY: Int, toX: Int, toY: Int) {
+        ensureReady()
+        let start = translate(fromX, fromY)
+        let end = translate(toX, toY)
+        CGWarpMouseCursorPosition(start)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        usleep(30_000)
+        CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: start, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(25_000)
+        CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(50_000)
+        let segments = 10
+        for s in 1...segments {
+            let t = Double(s) / Double(segments)
+            let p = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
+            CGWarpMouseCursorPosition(p)
+            CGEvent(mouseEventSource: src, mouseType: .leftMouseDragged, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+            usleep(20_000)
+        }
+        CGWarpMouseCursorPosition(end)
+        CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(120_000)
+    }
+
+    func keyChord(_ chord: String) {
+        ensureReady()
+        let parts = chord.lowercased().split(separator: "+").map { String($0).trimmingCharacters(in: .whitespaces) }
+        var flags: CGEventFlags = []
+        var mainKey: CGKeyCode?
+        for p in parts {
+            switch p {
+            case "cmd", "command", "super", "meta": flags.insert(.maskCommand)
+            case "shift": flags.insert(.maskShift)
+            case "alt", "opt", "option": flags.insert(.maskAlternate)
+            case "ctrl", "control": flags.insert(.maskControl)
+            default: mainKey = keyMap[p]
+            }
+        }
+        guard let code = mainKey,
+              let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true),
+              let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false) else { return }
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        usleep(20_000)
+        up.post(tap: .cghidEventTap)
+        usleep(25_000)
+    }
+
+    func typeText(_ text: String) {
+        ensureReady()
+        let shiftChars: [Character: CGKeyCode] = [
+            "?": 44, "!": 18, "@": 19, "#": 20, "$": 21, "%": 23, "^": 22, "&": 26, "*": 28, "(": 25, ")": 29,
+            "_": 27, "+": 24, ":": 41, "\"": 39, "<": 43, ">": 47
+        ]
+        let plainPunct: [Character: CGKeyCode] = [
+            " ": 49, "-": 27, "=": 24, ";": 41, "'": 39, ",": 43, ".": 47, "/": 44
+        ]
+        for ch in text {
+            let lower = String(ch).lowercased()
+            if let sc = shiftChars[ch],
+               let d = CGEvent(keyboardEventSource: src, virtualKey: sc, keyDown: true),
+               let u = CGEvent(keyboardEventSource: src, virtualKey: sc, keyDown: false) {
+                d.flags = .maskShift; u.flags = .maskShift
+                d.post(tap: .cghidEventTap); usleep(15_000)
+                u.post(tap: .cghidEventTap); usleep(20_000)
+            } else if let pc = plainPunct[ch],
+                      let d = CGEvent(keyboardEventSource: src, virtualKey: pc, keyDown: true),
+                      let u = CGEvent(keyboardEventSource: src, virtualKey: pc, keyDown: false) {
+                d.post(tap: .cghidEventTap); usleep(15_000)
+                u.post(tap: .cghidEventTap); usleep(20_000)
+            } else if let kc = keyMap[lower],
+                      let d = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: true),
+                      let u = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: false) {
+                if ch.isUppercase { d.flags = .maskShift; u.flags = .maskShift }
+                d.post(tap: .cghidEventTap); usleep(15_000)
+                u.post(tap: .cghidEventTap); usleep(20_000)
+            } else {
+                var u16 = Array(String(ch).utf16)
+                if let d = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
+                   let u = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+                    d.keyboardSetUnicodeString(stringLength: u16.count, unicodeString: &u16)
+                    u.keyboardSetUnicodeString(stringLength: u16.count, unicodeString: &u16)
+                    d.post(tap: .cghidEventTap); usleep(15_000)
+                    u.post(tap: .cghidEventTap); usleep(20_000)
+                }
+            }
+        }
+    }
+
+    func restore() {
+        guard activated else { return }
+        if let saved = savedCursorTopLeft {
+            CGWarpMouseCursorPosition(saved)
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
+        if let prevPid = prevFrontmostPid {
+            let axPrev = AXUIElementCreateApplication(prevPid)
+            _ = AXUIElementSetAttributeValue(axPrev, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        }
+        activated = false
+    }
+}
+
 func performImageFileOCR(
     imagePath: String,
     clipX: Double = 0.0,
@@ -1591,7 +1826,7 @@ func saveAppWindowScreenshot(app: TargetApp, requestedPath: String?) -> (path: S
     }
 }
 
-func performWindowOCR(app: TargetApp, fallbackNodes: [NodeRecord] = []) -> [String] {
+func performWindowOCR(app: TargetApp, winKey: String? = nil, fallbackNodes: [NodeRecord] = []) -> [String] {
     var cgImage: CGImage?
     var winFrame = CGRect.zero
     if let captured = captureAppWindowCGImage(app: app) {
@@ -1599,10 +1834,13 @@ func performWindowOCR(app: TargetApp, fallbackNodes: [NodeRecord] = []) -> [Stri
         winFrame = captured.1
     }
     var ocrLines: [String] = []
+    var ocrRecords: [NodeRecord] = []
+    let useAccurate = isContinuityStreamApp(app)
     if let img = cgImage {
         let req = VNRecognizeTextRequest { request, _ in
             guard let results = request.results as? [VNRecognizedTextObservation] else { return }
-            for obs in results.prefix(60) {
+            var seq = 1
+            for obs in results.prefix(80) {
                 if let top = obs.topCandidates(1).first {
                     let text = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !text.isEmpty {
@@ -1611,15 +1849,39 @@ func performWindowOCR(app: TargetApp, fallbackNodes: [NodeRecord] = []) -> [Stri
                         let h = winFrame.height > 0 ? Double(winFrame.height) : Double(img.height)
                         let rx = Int(Double(winFrame.origin.x) + bbox.midX * w)
                         let ry = Int(Double(winFrame.origin.y) + (1.0 - bbox.midY) * h)
-                        ocrLines.append("@ocr text \"\(text)\" (\(rx),\(ry))")
+                        let rw = max(8, Int(round(Double(bbox.width) * w)))
+                        let rh = max(8, Int(round(Double(bbox.height) * h)))
+                        let uid = "@o\(seq)"
+                        seq += 1
+                        ocrRecords.append(NodeRecord(
+                            uid: uid,
+                            structKey: "ocr|\(seq)|\(text)",
+                            role: "ocr",
+                            label: text,
+                            value: "",
+                            enabled: true,
+                            x: rx - rw / 2,
+                            y: ry - rh / 2,
+                            w: rw,
+                            h: rh
+                        ))
+                        ocrLines.append("@ocr text \"\(text)\" (\(rx),\(ry)) [\(uid)]")
                     }
                 }
             }
         }
-        req.recognitionLevel = .fast
-        req.usesLanguageCorrection = false
+        req.recognitionLevel = useAccurate ? .accurate : .fast
+        req.usesLanguageCorrection = useAccurate
         let handler = VNImageRequestHandler(cgImage: img, options: [:])
         try? handler.perform([req])
+    }
+    if let wk = winKey {
+        if winFrame.width > 0 {
+            EngineState.shared.lastReportedWinOrigin[wk] = (x: Int(winFrame.origin.x), y: Int(winFrame.origin.y))
+        }
+        if !ocrRecords.isEmpty {
+            EngineState.shared.latestOCRRecords[wk] = ocrRecords
+        }
     }
     if ocrLines.isEmpty && !fallbackNodes.isEmpty {
         for n in fallbackNodes.prefix(60) {
@@ -4174,6 +4436,13 @@ func executeRequest(_ req: BatchRequest) -> String {
     var stepErrors: [String] = []
     var ocrOutput: [String] = []
     var didMutate = false
+    let continuityMode = isContinuityStreamApp(app)
+    let initRootAttrs = readBatchedAttrs(root)
+    let repOrig = state.lastReportedWinOrigin[winKey] ?? (x: initRootAttrs.x, y: initRootAttrs.y)
+    let hidSession = ContinuityHIDSession(app: app, rootWin: root, reportedOrigin: repOrig)
+    defer {
+        hidSession.restore()
+    }
 
     if let steps = req.steps, !steps.isEmpty {
         for (i, step) in steps.enumerated() {
@@ -4211,7 +4480,26 @@ func executeRequest(_ req: BatchRequest) -> String {
                     return userStoppedErrorMessage
                 }
             case "ocr":
-                ocrOutput.append(contentsOf: performWindowOCR(app: app, fallbackNodes: currentNodes))
+                ocrOutput.append(contentsOf: performWindowOCR(app: app, winKey: winKey, fallbackNodes: currentNodes))
+            case "scroll":
+                let rAttrs = readBatchedAttrs(root)
+                let sx = step.x ?? (rAttrs.x + max(100, rAttrs.w) / 2)
+                let sy = step.y ?? (rAttrs.y + max(100, rAttrs.h) / 2)
+                let dx = step.dx ?? 0
+                let dy = step.dy ?? -320
+                if continuityMode {
+                    hidSession.scroll(x: sx, y: sy, dx: dx, dy: dy)
+                } else if let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0) {
+                    ev.location = CGPoint(x: Double(sx), y: Double(sy))
+                    ev.postToPid(app.pid)
+                }
+            case "drag":
+                let rAttrs = readBatchedAttrs(root)
+                let fx = step.x ?? (rAttrs.x + max(100, rAttrs.w) / 2)
+                let fy = step.y ?? (rAttrs.y + Int(Double(max(100, rAttrs.h)) * 0.72))
+                let tx = step.toX ?? fx
+                let ty = step.toY ?? (rAttrs.y + Int(Double(max(100, rAttrs.h)) * 0.28))
+                hidSession.drag(fromX: fx, fromY: fy, toX: tx, toY: ty)
             case "screenshot":
                 if didMutate {
                     _ = interruptibleSleep(ms: 25)
@@ -4275,7 +4563,9 @@ func executeRequest(_ req: BatchRequest) -> String {
                     }
                 }
                 if !handledViaAX {
-                    if rootIsMain {
+                    if continuityMode {
+                        hidSession.keyChord(chord)
+                    } else if rootIsMain {
                         postKeyChordToPid(app.pid, chord: chord)
                         Thread.sleep(forTimeInterval: 0.012)
                     } else if !(step.optional ?? false) {
@@ -4289,7 +4579,9 @@ func executeRequest(_ req: BatchRequest) -> String {
                     }
                     continue
                 }
-                if rootIsMain {
+                if continuityMode {
+                    hidSession.typeText(text)
+                } else if rootIsMain {
                     postBatchedUnicodeTextToPid(app.pid, text: text)
                 } else {
                     var insertedViaAX = false
@@ -4352,7 +4644,11 @@ func executeRequest(_ req: BatchRequest) -> String {
                         }
                     }
                     if !clickedViaAX {
-                        _ = postBackgroundClickToPid(app.pid, x: cx, y: cy)
+                        if continuityMode {
+                            hidSession.click(x: cx, y: cy)
+                        } else {
+                            _ = postBackgroundClickToPid(app.pid, x: cx, y: cy)
+                        }
                     }
                     continue
                 }
@@ -4429,6 +4725,59 @@ func executeRequest(_ req: BatchRequest) -> String {
                             targetEl = found.0
                             targetNode = found.1
                         }
+                    }
+                }
+
+                if targetEl == nil && (op == "click" || op == "move" || op == "set") {
+                    func matchOCRRecord() -> NodeRecord? {
+                        let recs = state.latestOCRRecords[winKey] ?? []
+                        if let uid = step.effectiveUid, uid.hasPrefix("@o") {
+                            return recs.first(where: { $0.uid == uid })
+                        }
+                        if let rawName = step.effectiveName?.lowercased() {
+                            let cands = rawName.split(separator: "|").map { String($0).trimmingCharacters(in: .whitespaces) }
+                            for cand in cands {
+                                if let ex = recs.first(where: { $0.label.lowercased() == cand }) { return ex }
+                                if let sub = recs.first(where: { $0.label.lowercased().contains(cand) }) { return sub }
+                            }
+                        }
+                        return nil
+                    }
+                    var ocrRec = matchOCRRecord()
+                    if ocrRec == nil && (currentNodes.isEmpty || step.effectiveUid?.hasPrefix("@o") == true) {
+                        _ = performWindowOCR(app: app, winKey: winKey, fallbackNodes: currentNodes)
+                        ocrRec = matchOCRRecord()
+                    }
+                    if let rec = ocrRec {
+                        let vx = rec.x + rec.w / 2
+                        let vy = rec.y + rec.h / 2
+                        state.agentCursors[agentId] = VirtualCursorState(
+                            agent: agentId,
+                            app: app.name,
+                            window: winTitle,
+                            uid: rec.uid,
+                            label: rec.label,
+                            x: vx,
+                            y: vy,
+                            lastOp: op
+                        )
+                        if op == "click" {
+                            if continuityMode {
+                                hidSession.click(x: vx, y: vy)
+                            } else {
+                                _ = postBackgroundClickToPid(app.pid, x: vx, y: vy)
+                            }
+                        } else if op == "set", let val = step.effectiveValue {
+                            if continuityMode {
+                                hidSession.click(x: vx, y: vy)
+                                usleep(150_000)
+                                hidSession.typeText(val)
+                            } else {
+                                _ = postBackgroundClickToPid(app.pid, x: vx, y: vy)
+                                postBatchedUnicodeTextToPid(app.pid, text: val)
+                            }
+                        }
+                        continue
                     }
                 }
 
@@ -4658,7 +5007,10 @@ func executeRequest(_ req: BatchRequest) -> String {
     }
 
     if req.ocr == true || (currentNodes.isEmpty && ocrOutput.isEmpty && !hasQuery) {
-        ocrOutput.append(contentsOf: performWindowOCR(app: app, fallbackNodes: currentNodes))
+        if didMutate && continuityMode {
+            _ = interruptibleSleep(ms: 220)
+        }
+        ocrOutput.append(contentsOf: performWindowOCR(app: app, winKey: winKey, fallbackNodes: currentNodes))
     }
 
     if !hasQuery && !currentNodes.isEmpty {

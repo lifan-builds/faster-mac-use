@@ -55,10 +55,10 @@ Most computer-use tools force a painful choice:
 
 ### 1. Install (1-Line `uvx` / `uv tool` / `pip` / Homebrew)
 ```bash
-# Option A: Run or install directly from GitHub via uv / pip (includes universal2 fmu-ax binary + auto-compiler fallback)
-uvx --from git+https://github.com/lifan-builds/faster-mac-use.git fmu mcp
-uv tool install git+https://github.com/lifan-builds/faster-mac-use.git
-pip install git+https://github.com/lifan-builds/faster-mac-use.git
+# Option A: Run or install directly from PyPI via uv / pip (auto-compiles universal2 fmu-ax binary on macOS)
+uvx --from faster-mac-use fmu mcp
+uv tool install faster-mac-use
+pip install faster-mac-use
 
 # Option B: Clone for development
 git clone https://github.com/lifan-builds/faster-mac-use.git

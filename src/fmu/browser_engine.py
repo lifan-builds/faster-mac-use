@@ -300,11 +300,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.4.2"
+_FMU_RUNTIME_VERSION = "0.4.3"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.4.2";
+  const FMU_RUNTIME_VERSION = "0.4.3";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -339,8 +339,13 @@ IN_PAGE_RUNTIME_JS = r"""
     }
   }
 
+  function tagOf(el) {
+    return (el && typeof el.tagName === "string") ? el.tagName.toLowerCase() : "";
+  }
+
   function getShadowRoot(el) {
-    return (el && (el.shadowRoot || el._sr || el._shadowRoot || el.__shadowRoot)) || null;
+    const sr = el && (el.shadowRoot || el._sr || el._shadowRoot || el.__shadowRoot);
+    return (sr && typeof sr.querySelectorAll === "function" && (sr.nodeType === 11 || sr.nodeType === 1)) ? sr : null;
   }
 
   function queryAllDeep(sel, root = document) {
@@ -349,10 +354,12 @@ IN_PAGE_RUNTIME_JS = r"""
     let extra = null;
     for (let i = 0; i < all.length; i++) {
       const sr = getShadowRoot(all[i]);
-      if (sr && sr.querySelectorAll) {
-        if (!extra) extra = Array.from(base);
+      if (sr) {
+        if (!extra) extra = Array.from(base).filter(n => n && n.nodeType === 1);
         const sub = queryAllDeep(sel, sr);
-        for (let j = 0; j < sub.length; j++) extra.push(sub[j]);
+        for (let j = 0; j < sub.length; j++) {
+          if (sub[j] && sub[j].nodeType === 1) extra.push(sub[j]);
+        }
       }
     }
     return extra || base;
@@ -698,8 +705,8 @@ IN_PAGE_RUNTIME_JS = r"""
   const CARD_CLASS_RE = /\b(MuiCard-root|MuiCardActionArea-root|[a-zA-Z0-9_-]*[Cc]ard(?:-root|-container|-item|-box|-body)?|[a-zA-Z0-9_-]*[Rr]ate-?(?:card|box|option|tile)|[a-zA-Z0-9_-]*[Vv]ehicle-?(?:card|item|tile))\b/;
 
   function isCardElement(el) {
-    if (!el || !el.tagName) return false;
-    const tag = el.tagName.toLowerCase();
+    const tag = tagOf(el);
+    if (!tag) return false;
     if (tag === "article") return true;
     const cls = typeof el.className === "string" ? el.className : "";
     if (cls && CARD_CLASS_RE.test(cls)) return true;
@@ -707,10 +714,10 @@ IN_PAGE_RUNTIME_JS = r"""
   }
 
   function getRole(el) {
-    const tag = el.tagName.toLowerCase();
+    const tag = tagOf(el);
     if (tag === "iframe") return "iframe";
-    const explicit = el.getAttribute("role");
-    if (explicit) return explicit.toLowerCase();
+    const explicit = el && el.getAttribute ? el.getAttribute("role") : "";
+    if (typeof explicit === "string" && explicit) return explicit.toLowerCase();
     if (isContentEditableEl(el)) return "textbox";
     if (tag === "a") return "link";
     if (tag === "button" || tag === "summary") return "button";
@@ -718,7 +725,7 @@ IN_PAGE_RUNTIME_JS = r"""
     if (tag === "textarea") return "textbox";
     if (tag === "canvas") return "canvas";
     if (tag === "input") {
-      const type = (el.getAttribute("type") || "text").toLowerCase();
+      const type = String((el.getAttribute && el.getAttribute("type")) || "text").toLowerCase();
       if (type === "submit" || type === "button" || type === "reset") return "button";
       if (type === "checkbox") return "checkbox";
       if (type === "radio") return "radio";
@@ -781,7 +788,7 @@ IN_PAGE_RUNTIME_JS = r"""
       elToStableLabel.set(el, fallback);
       return fallback;
     }
-    const tag = el.tagName.toLowerCase();
+    const tag = tagOf(el);
     if (tag === "input" || tag === "textarea" || tag === "select" || tag === "canvas") {
       return cleanStr(el.name || el.id || tag, maxLen);
     }
@@ -792,7 +799,7 @@ IN_PAGE_RUNTIME_JS = r"""
   }
 
   function getCrossOriginIframeInfo(el) {
-    if (!el || !el.tagName || el.tagName.toLowerCase() !== "iframe") return null;
+    if (tagOf(el) !== "iframe") return null;
     if (el.getAttribute("aria-hidden") === "true") return null;
     const style = window.getComputedStyle(el);
     if (style.pointerEvents === "none") return null;
@@ -928,7 +935,7 @@ IN_PAGE_RUNTIME_JS = r"""
     for (let i = 0; i < maxScan && results.length < maxPointerItems; i++) {
       const el = all[i];
       if (!el || semanticSet.has(el)) continue;
-      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      const tag = tagOf(el);
       if (!tag || NON_POINTER_SCAN_TAGS.has(tag)) continue;
       if (el.getAttribute && (el.getAttribute("aria-hidden") === "true" || el.hasAttribute("disabled"))) continue;
       if (el.getAttribute && el.getAttribute("role")) continue;
@@ -1009,9 +1016,9 @@ IN_PAGE_RUNTIME_JS = r"""
     if (isContentEditableEl(el)) {
       return cleanStr(el.innerText || el.textContent || "", 80);
     }
-    const tag = el.tagName.toLowerCase();
+    const tag = tagOf(el);
     if (tag === "input") {
-      const type = (el.getAttribute("type") || "text").toLowerCase();
+      const type = String((el.getAttribute && el.getAttribute("type")) || "text").toLowerCase();
       if (type === "checkbox" || type === "radio") return el.checked ? "checked" : "unchecked";
       return cleanStr(el.value || "", 60);
     }
@@ -1071,7 +1078,7 @@ IN_PAGE_RUNTIME_JS = r"""
       const uncoveredParts = [];
       let rowHasInteractive = false;
       for (const cell of cells) {
-        if (cell.tagName.toLowerCase() === "td") hasTd = true;
+        if (tagOf(cell) === "td") hasTd = true;
         const cellHasInteractive = Array.from(cell.querySelectorAll("*")).some(ch => capturedSet.has(ch)) || capturedSet.has(cell);
         if (cellHasInteractive) {
           rowHasInteractive = true;
@@ -1117,7 +1124,7 @@ IN_PAGE_RUNTIME_JS = r"""
         if (capturedSet.has(el)) continue;
         if (el.closest(BLOCK_SKIP_SEL)) continue;
         if (usingBodyFallback && el.closest("header, [role='banner'], aside")) continue;
-        const tag = el.tagName.toLowerCase();
+        const tag = tagOf(el);
         if (tag === "label" || el.closest("label")) continue;
         if (el.querySelector("button, a[href], input, select, textarea, div, p, ul, ol, dl, table, section, article, form, h1, h2, h3, h4")) {
           continue;
@@ -1126,7 +1133,7 @@ IN_PAGE_RUNTIME_JS = r"""
         if (childEls.length > 4) continue;
         let onlyInlineChildren = true;
         for (let c = 0; c < childEls.length; c++) {
-          if (!INLINE_TAGS.has(childEls[c].tagName.toLowerCase())) {
+          if (!INLINE_TAGS.has(tagOf(childEls[c]))) {
             onlyInlineChildren = false;
             break;
           }
@@ -1180,7 +1187,7 @@ IN_PAGE_RUNTIME_JS = r"""
         el.parentElement
         && el.parentElement.closest("[contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']")
       ) {
-        const tag = el.tagName.toLowerCase();
+        const tag = tagOf(el);
         if (tag !== "button" && tag !== "a" && tag !== "input" && tag !== "select") {
           continue;
         }
@@ -1286,9 +1293,9 @@ IN_PAGE_RUNTIME_JS = r"""
         }
       }
       if (!isFolded && foldTables && !q) {
-        const tr = el.tagName && el.tagName.toLowerCase() === "tr" ? el : (el.closest ? el.closest("tbody tr") : null);
+        const tr = tagOf(el) === "tr" ? el : (el.closest ? el.closest("tbody tr") : null);
         const tbody = tr ? tr.parentElement : null;
-        if (tbody && tbody.tagName && tbody.tagName.toLowerCase() === "tbody" && tr) {
+        if (tbody && tagOf(tbody) === "tbody" && tr) {
           let rowSet = tbodyRows.get(tbody);
           if (!rowSet) {
             rowSet = new Set();
@@ -1426,7 +1433,7 @@ IN_PAGE_RUNTIME_JS = r"""
       }
 
       if (vw < 768) {
-        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+        const tag = tagOf(el);
         const inpType = (el.getAttribute && el.getAttribute("type")) || "text";
         if (
           tag === "textarea"
@@ -1507,7 +1514,7 @@ IN_PAGE_RUNTIME_JS = r"""
 
   function setNativeValue(el, value, append = false) {
     let target = el;
-    const tag0 = target.tagName ? target.tagName.toLowerCase() : "";
+    const tag0 = tagOf(target);
     if (tag0 !== "input" && tag0 !== "textarea" && tag0 !== "select" && !isContentEditableEl(target)) {
       const inner = target.querySelector && target.querySelector("[contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], textarea, input");
       if (inner) target = inner;
@@ -1619,7 +1626,7 @@ IN_PAGE_RUNTIME_JS = r"""
       return;
     }
 
-    const tag = target.tagName.toLowerCase();
+    const tag = tagOf(target);
     const finalVal = append ? (String(target.value || "") + strVal) : strVal;
     const proto = tag === "textarea"
       ? window.HTMLTextAreaElement.prototype
@@ -1678,7 +1685,7 @@ IN_PAGE_RUNTIME_JS = r"""
       // Exclude boilerplate footer/nav when summarizing body without explicit selector
       const parts = [];
       for (const child of Array.from(root.children)) {
-        const tag = child.tagName ? child.tagName.toLowerCase() : "";
+        const tag = tagOf(child);
         const role = child.getAttribute ? (child.getAttribute("role") || "") : "";
         if (tag === "script" || tag === "style" || tag === "noscript" || tag === "svg" || tag === "footer" || role === "contentinfo") {
           continue;
@@ -1939,7 +1946,7 @@ IN_PAGE_RUNTIME_JS = r"""
     "text", "readtext", "readmain",
     "eval", "evaluate", "webmcp", "calltool",
     "goto", "navigate", "open", "close", "snapshot", "diff", "ocr",
-    "screenshot", "viewport", "setviewport", "resetviewport", "clearerrors"
+    "screenshot", "viewport", "setviewport", "resetviewport", "errors", "clearerrors"
   ]);
 
   const NON_EXPR_STMT_RE = /^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b/;
@@ -2253,7 +2260,7 @@ IN_PAGE_RUNTIME_JS = r"""
         if (
           op === "snapshot" || op === "diff" || op === "ocr"
           || op === "screenshot" || op === "viewport" || op === "setviewport"
-          || op === "resetviewport" || op === "clearerrors"
+          || op === "resetviewport" || op === "errors" || op === "clearerrors"
         ) {
           continue;
         }
@@ -2360,16 +2367,16 @@ IN_PAGE_RUNTIME_JS = r"""
         if (op === "move") {
           continue;
         } else if (op === "click" || op === "upload") {
-          let fileEl = (el.tagName.toLowerCase() === "input" && (el.type || "").toLowerCase() === "file") ? el : null;
+          let fileEl = (tagOf(el) === "input" && String(el.type || "").toLowerCase() === "file") ? el : null;
           if (!fileEl && (s.files || op === "upload")) {
             fileEl = el.querySelector && el.querySelector("input[type='file']");
             if (!fileEl) {
-              const lbl = el.tagName.toLowerCase() === "label" ? el : (el.closest && el.closest("label"));
+              const lbl = tagOf(el) === "label" ? el : (el.closest && el.closest("label"));
               if (lbl) {
                 fileEl = lbl.querySelector && lbl.querySelector("input[type='file']");
                 if (!fileEl && lbl.htmlFor) {
                   const forEl = document.getElementById(lbl.htmlFor);
-                  if (forEl && forEl.tagName.toLowerCase() === "input" && (forEl.type || "").toLowerCase() === "file") {
+                  if (forEl && tagOf(forEl) === "input" && String(forEl.type || "").toLowerCase() === "file") {
                     fileEl = forEl;
                   }
                 }
@@ -5396,6 +5403,7 @@ class BrowserEngine:
                 "viewport",
                 "setviewport",
                 "resetviewport",
+                "errors",
                 "clearerrors",
             )
         ]
@@ -5410,7 +5418,7 @@ class BrowserEngine:
         full_page = bool(req.get("fullPage", False))
         has_mutating_steps = any(
             str(s.get("op") or s.get("action") or "").lower()
-            not in ("wait", "sleep", "delay", "settle", "waitfor", "wait_for", "waituntil", "text", "readtext", "readmain")
+            not in ("wait", "sleep", "delay", "settle", "waitfor", "wait_for", "waituntil", "text", "readtext", "readmain", "errors", "clearerrors")
             for s in active_steps
         )
 
@@ -5446,6 +5454,7 @@ class BrowserEngine:
                     "viewport",
                     "setviewport",
                     "resetviewport",
+                    "errors",
                     "clearerrors",
                 )
                 or (
@@ -5580,7 +5589,7 @@ class BrowserEngine:
                         virtual_tools = self.get_macros_for_url(sess.last_url)
                         had_pre_on_current_page = False
                         navigated_in_batch = True
-                elif b_op in ("screenshot", "viewport", "setviewport", "resetviewport", "clearerrors"):
+                elif b_op in ("screenshot", "viewport", "setviewport", "resetviewport", "errors", "clearerrors"):
                     pre_steps = active_steps[last_idx:b_idx]
                     if pre_steps:
                         t_ip0 = time.perf_counter()
@@ -5638,6 +5647,10 @@ class BrowserEngine:
                             )
                             meta_lines.append(f"# viewport size={vw_new}x{vh_new}")
                             viewport_changed_in_batch = True
+                        elif b_op == "errors":
+                            combined_evals.append(
+                                json.dumps(sess.get_diagnostics(clear=bool(b_step.get("clear"))), ensure_ascii=False)
+                            )
                         elif b_op == "clearerrors":
                             sess.clear_diagnostics()
                     except Exception as host_exc:

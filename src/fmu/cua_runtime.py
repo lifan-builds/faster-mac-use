@@ -304,6 +304,11 @@ class AppHandle:
         )
 
 
+class _CallableStr(str):
+    def __call__(self) -> str:
+        return str(self)
+
+
 class TabHandle:
     def __init__(
         self,
@@ -359,15 +364,15 @@ class TabHandle:
     def url(self) -> str:
         sess = self.runtime.browser._tabs.get(self.tab_id)
         if sess is not None and sess.last_url:
-            return sess.last_url
-        return self.runtime.browser._tab_last_urls.get(self.tab_id, "")
+            return _CallableStr(sess.last_url)
+        return _CallableStr(self.runtime.browser._tab_last_urls.get(self.tab_id, ""))
 
     @property
     def title(self) -> str:
         sess = self.runtime.browser._tabs.get(self.tab_id)
         if sess is not None and sess.last_title:
-            return sess.last_title
-        return self.runtime.browser._tab_last_titles.get(self.tab_id, "")
+            return _CallableStr(sess.last_title)
+        return _CallableStr(self.runtime.browser._tab_last_titles.get(self.tab_id, ""))
 
     def goto(self, url: str) -> TabHandle:
         self._fresh = False

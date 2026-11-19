@@ -2847,6 +2847,64 @@ setInterval(() => {{}}, 1000);
             self.assertIn("ios_input_zoom(", mob_issues)
             self.assertIn("unlabeled_touch_cta(", mob_issues)
 
+    def test_dom_clobbered_tagname_and_declarative_errors_op(self) -> None:
+        """Pages with non-Element _sr shims, DOM-clobbered form.tagName, and declarative errors steps succeed cleanly."""
+        with tempfile.TemporaryDirectory() as td:
+            clobber_html = Path(td) / "clobber.html"
+            clobber_html.write_text(
+                """<!doctype html><html><body>
+<main>
+  <h1>Security Verification</h1>
+  <div id="px-host"></div>
+  <form id="clobbered-form" role="button" aria-label="Clobbered Form">
+    <input name="tagName" placeholder="Card number" />
+    <button type="button" id="apply-btn">Save card</button>
+  </form>
+</main>
+<script>
+  const host = document.getElementById("px-host");
+  host._sr = { querySelectorAll: () => [{ isConnected: true, getBoundingClientRect: () => ({ width: 80, height: 30, left: 10, top: 10 }) }] };
+  console.error("synthetic console warning");
+</script>
+</body></html>""",
+                encoding="utf-8",
+            )
+            clobber_url = clobber_html.resolve().as_uri()
+            snap_out = self.rt.execute(
+                {
+                    "mode": "headless",
+                    "url": clobber_url,
+                    "steps": [
+                        {"action": "fill", "target": "Card number", "value": "6051"},
+                        {"action": "errors"},
+                    ],
+                }
+            )
+            self.assertNotIn("toLowerCase", snap_out)
+            self.assertNotIn("unsupported op 'errors'", snap_out)
+            self.assertIn("Save card", snap_out)
+            self.assertIn("synthetic console warning", snap_out)
+
+    def test_repl_tab_url_and_title_work_as_properties_and_methods(self) -> None:
+        """Playwright-style tab.url()/tab.title() and property access tab.url/tab.title both work in REPL code."""
+        with tempfile.TemporaryDirectory() as td:
+            page = Path(td) / "meta.html"
+            page.write_text("<!doctype html><html><head><title>Portal Login</title></head><body><h1>Sign in</h1></body></html>", encoding="utf-8")
+            page_url = page.resolve().as_uri()
+            out = self.rt.execute(
+                {
+                    "code": (
+                        f'const tab = await cua.createBrowserTab("headless", "{page_url}");\n'
+                        "return JSON.stringify({ urlMethod: tab.url(), titleMethod: tab.title(), urlProp: tab.url, titleProp: tab.title });"
+                    )
+                }
+            )
+            data = json.loads(out.splitlines()[-1])
+            self.assertEqual(data["urlMethod"], page_url)
+            self.assertEqual(data["urlProp"], page_url)
+            self.assertEqual(data["titleMethod"], "Portal Login")
+            self.assertEqual(data["titleProp"], "Portal Login")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -628,7 +628,8 @@ async function evalInTab(tabId, expression, awaitPromise = true) {
     returnByValue: true
   });
   if (res && res.exceptionDetails) {
-    const desc = (res.result && res.result.description) || res.exceptionDetails.text || "Runtime.evaluate error";
+    const exc = res.exceptionDetails.exception;
+    const desc = (res.result && res.result.description) || (exc && exc.description) || res.exceptionDetails.text || "Runtime.evaluate error";
     throw new Error(desc);
   }
   return res && res.result ? res.result.value : undefined;

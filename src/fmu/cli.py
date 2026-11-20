@@ -218,13 +218,15 @@ def serve_mcp(bin_path: Path | None = None) -> None:
         mid = msg.get("id")
         method = msg.get("method")
         if method == "initialize":
+            from fmu import __version__
+
             resp = {
                 "jsonrpc": "2.0",
                 "id": mid,
                 "result": {
                     "protocolVersion": "2025-03-26",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "faster-mac-use", "version": "0.1.0"},
+                    "serverInfo": {"name": "faster-mac-use", "version": __version__},
                 },
             }
             sys.stdout.write(json.dumps(resp) + "\n")

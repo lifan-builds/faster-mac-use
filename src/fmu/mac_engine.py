@@ -319,8 +319,14 @@ class MacNativeEngine:
                 check=False,
             )
             sock_path.unlink(missing_ok=True)
+            launchctl_bin = Path("/bin/launchctl")
+            spawn_cmd = (
+                [str(launchctl_bin), "asuser", str(os.getuid()), str(ax_bin), "--daemon", self.socket_path]
+                if launchctl_bin.is_file()
+                else [str(ax_bin), "--daemon", self.socket_path]
+            )
             proc = subprocess.Popen(
-                [str(ax_bin), "--daemon", self.socket_path],
+                spawn_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,

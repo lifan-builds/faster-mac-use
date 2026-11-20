@@ -1,6 +1,15 @@
-# Faster Mac Use (`fmu`) Performance & Field Audit Report (`v0.4.0`)
+# Faster Mac Use (`fmu`) Performance & Field Audit Report (`v0.4.4`)
 
-**Latest Audit Window**: 7 days (`~/.fmu/logs/perf-2026-11-08.jsonl` .. `perf-2026-11-15.jsonl`, `731` calls, `1,100s` wall time, `402,937` est. tokens across Hertz, Avis, Enterprise, National, Expedia, Capital One Shopping, GitHub, Gmail, X, RedNote, and Calculator)
+**Latest Field Audit (`2026-11-20` — `3,963` calls cleared after shipping fixes)**:
+- **True Parallel MV3 Dispatch + Daemon Timeout Cascade Fix**: Bypassed Playwright's single-threaded `_run_sync` worker queue for MV3 extension sessions (`3x 380ms` parallel MV3 tabs drop from `~1,140ms` serialized to `<500ms` concurrent; 4-tab `25s` Google Flights swarm drops from `54.4s` serialized to `~25s`), extended `cli.py` wait-budget estimation across `parallel[]` and `code` `waitFor()`, and stopped catching `TimeoutError` inside `except OSError:` so live warm daemons on `:19222` are never shadowed by fallback-port runtimes.
+- **MV3 `DOMContentLoaded` Load Settlement & `nav_wait` Phase Separation**: `waitForTabLoad` / `waitForNavigationSettlement` in `extension/background.js` now resolve once `document.readyState` is `interactive`/`complete` with a populated `<body>` instead of stalling up to `10,000ms` on third-party subresources (`status === "complete"`), and separate `nav_wait` from `bridge_overhead` (`rpc_timeout` raised to `max(18s, step_wait_s + 12s)`).
+- **Zero-Config MV3 File Uploads (`inlineFiles` `DataTransfer`)**: Local files (`<= 25MB`) now upload automatically via in-page `File` + `DataTransfer` injection even when Chrome's `"Allow access to file URLs"` toggle is disabled.
+- **`setNativeValue` `Illegal invocation` Fix & JS REPL `!` Operator**: Unwraps `<label>.control` and Shadow DOM hosts (`getShadowRoot(root)`), resolves realm-accurate prototypes strictly for `<input>`/`<textarea>`/`<select>`, falls back to synthetic `InputEvent`s on custom `role="textbox"` widgets, and transpiles unary `!` in JS-flavored REPL `code`.
+- **`16,000`-Char Default `eval` Cap, Strict-CSP Host Cache, Bot/CAPTCHA Fast-Fail & Browser `AXWebArea` Pruning**: Default `eval` output capped at `16,000` chars (with per-step `maxChars` override), strict-CSP domains cached after first `eval_csp` (`eval_csp_cached`), `/sorry`/`/captcha`/`/help/bots` interstitials aborted immediately during `waitFor` with title/heading timeout context, dedicated browser `AXWebArea` subtrees pruned in `fmu_ax.swift` (with `axTrusted` status diagnostics + single-verb shorthand steps), and session logs upgraded with `entrypoint`/`batch_id` correlation, `evalValue`/`screenshot`/`layoutAudit` coverage, and `fmu --perf --clear`.
+
+---
+
+## Earlier `v0.4.0` Audit (`~/.fmu/logs/perf-2026-11-08.jsonl` .. `perf-2026-11-15.jsonl`, `731` calls)
 
 ## 1. YYC Car Rental Field Audit Telemetry (`731` calls — Before `v0.4.0`)
 

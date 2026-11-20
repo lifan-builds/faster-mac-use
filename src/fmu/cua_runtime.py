@@ -505,9 +505,14 @@ class TabHandle:
         )
         return "" if val is None else str(val)
 
-    def eval(self, code: str) -> TabHandle:
+    def eval(self, code: str, options: int | dict[str, Any] | None = None) -> TabHandle:
         self._fresh = False
-        self._pending_steps.append({"op": "eval", "code": str(code)})
+        step_obj: dict[str, Any] = {"op": "eval", "code": str(code)}
+        if isinstance(options, int):
+            step_obj["maxChars"] = options
+        elif isinstance(options, dict) and options.get("maxChars") is not None:
+            step_obj["maxChars"] = int(options["maxChars"])
+        self._pending_steps.append(step_obj)
         return self
 
     evaluate = eval
@@ -1271,15 +1276,24 @@ class CuaNamespace:
         return self.runtime.browser.execute_batch({"reloadExtension": True})
 
     def getPerfReport(self, options: dict[str, Any] | int | None = None) -> str:
-        from fmu.telemetry import build_perf_report
+        from fmu.telemetry import build_perf_report, clear_perf_logs, get_log_dir
 
         if isinstance(options, int):
             return build_perf_report(days=options)
         if isinstance(options, dict):
+            if options.get("clear"):
+                removed = clear_perf_logs()
+                return f'# fmu-perf cleared={removed} logs="{get_log_dir()}"'
             days = int(options.get("days", 7))
             fmt = str(options.get("format", "markdown"))
             return build_perf_report(days=days, fmt=fmt)
         return build_perf_report()
+
+    def clearPerfLogs(self) -> str:
+        from fmu.telemetry import clear_perf_logs, get_log_dir
+
+        removed = clear_perf_logs()
+        return f'# fmu-perf cleared={removed} logs="{get_log_dir()}"'
 
     def getApp(
         self,
@@ -2203,6 +2217,7 @@ class FasterMacUseRuntime:
         masked = re.sub(r"^(?:let|const|var)\s+", "", masked)
         masked = re.sub(r"\bawait\s+", "", masked)
         masked = masked.replace("!==", "!=").replace("===", "==")
+        masked = re.sub(r"!(?!=)\s*", " not ", masked)
         masked = masked.replace("&&", " and ").replace("||", " or ")
         masked = re.sub(r"\btrue\b", "True", masked)
         masked = re.sub(r"\bfalse\b", "False", masked)
@@ -2226,8 +2241,14 @@ class FasterMacUseRuntime:
         return masked.strip()
 
     def execute_repl_code(self, code: str, agent_id: str = "default") -> str:
+        from fmu.telemetry import _telemetry_ctx, reset_telemetry_context, set_telemetry_context
+
         sess = self._get_agent_session(agent_id)
         with sess.lock:
+            outer_ep = getattr(_telemetry_ctx, "entrypoint", None)
+            outer_bid = getattr(_telemetry_ctx, "batch_id", None)
+            bid = outer_bid or f"repl-{int(time.time() * 1000) % 1_000_000_000:x}"
+            prev_ctx = set_telemetry_context(entrypoint=outer_ep or "repl", batch_id=bid)
             raw_stmts = self._split_statements(_quote_raw_eval_callbacks(code))
             lines = [
                 norm
@@ -2342,16 +2363,20 @@ class FasterMacUseRuntime:
                     outputs.append(last_handle.initial_state)
             finally:
                 sess.active_outputs = None
+                reset_telemetry_context(prev_ctx)
 
             result = "\n".join(outputs).strip()
             sess.context_tracker.record_turn("repl", result)
             return result
 
     def execute_parallel(self, tasks: list[dict[str, Any]]) -> str:
+        from fmu.telemetry import reset_telemetry_context, set_telemetry_context
+
         if is_user_stopped():
             return USER_STOPPED_ERROR
         if not tasks:
             return "# parallel tasks=0"
+        par_bid = f"par-{int(time.time() * 1000) % 1_000_000_000:x}"
         notify_menubar_status(
             "working",
             surface="parallel",
@@ -2360,13 +2385,21 @@ class FasterMacUseRuntime:
             agent="parallel",
             step_count=len(tasks),
         )
+
+        def _run_subtask(sub_payload: dict[str, Any]) -> str:
+            prev_c = set_telemetry_context(entrypoint="parallel", batch_id=par_bid)
+            try:
+                return self.execute(sub_payload)
+            finally:
+                reset_telemetry_context(prev_c)
+
         try:
             futures = []
             for idx, sub_req in enumerate(tasks):
                 req_copy = dict(sub_req)
                 if not req_copy.get("agent") and not req_copy.get("cursor"):
                     req_copy["agent"] = f"agent-{idx + 1}"
-                futures.append((req_copy["agent"], self._pool.submit(self.execute, req_copy)))
+                futures.append((req_copy["agent"], self._pool.submit(_run_subtask, req_copy)))
             parts: list[str] = []
             for aid, fut in futures:
                 try:
@@ -2421,10 +2454,13 @@ class FasterMacUseRuntime:
             return self.browser.execute_batch(req)
 
         if "perfReport" in req and req["perfReport"]:
-            from fmu.telemetry import build_perf_report
+            from fmu.telemetry import build_perf_report, clear_perf_logs, get_log_dir
 
             pr = req["perfReport"]
             if isinstance(pr, dict):
+                if pr.get("clear"):
+                    removed = clear_perf_logs()
+                    return f'# fmu-perf cleared={removed} logs="{get_log_dir()}"'
                 return build_perf_report(
                     days=int(pr.get("days", 7)),
                     fmt=str(pr.get("format", "markdown")),

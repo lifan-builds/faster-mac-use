@@ -114,6 +114,7 @@ struct StepSpec: Codable {
 
     enum CodingKeys: String, CodingKey {
         case op, action, uid, ref, target, selector, index, role, name, label, text, key, value, path, menu, files, ms, x, y, dx, dy, toX, toY, optional
+        case click, tap, fill, set, type, move, hover, press, wait, sleep, settle, ocr, screenshot, scroll, drag
     }
 
     init(from decoder: Decoder) throws {
@@ -125,6 +126,10 @@ struct StepSpec: Codable {
             if let b = try? c.decodeIfPresent(Bool.self, forKey: k) { return String(b) }
             return nil
         }
+        func decodeNonBoolStr(_ k: CodingKeys) -> String? {
+            if (try? c.decodeIfPresent(Bool.self, forKey: k)) != nil { return nil }
+            return decodeStr(k)
+        }
         func decodeInt(_ k: CodingKeys) -> Int? {
             if let i = try? c.decodeIfPresent(Int.self, forKey: k) { return i }
             if let d = try? c.decodeIfPresent(Double.self, forKey: k) { return Int(d.rounded()) }
@@ -135,19 +140,60 @@ struct StepSpec: Codable {
             }
             return nil
         }
-        self.op = decodeStr(.op)
-        self.action = decodeStr(.action)
+        var parsedOp = decodeStr(.op)
+        let parsedAction = decodeStr(.action)
+        var parsedTarget = decodeStr(.target)
+        var parsedText = decodeStr(.text)
+        var parsedKey = decodeStr(.key)
+        var parsedValue = decodeStr(.value)
+        var parsedMs = decodeInt(.ms)
+        var parsedDy = decodeInt(.dy)
+
+        if (parsedOp ?? parsedAction ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let shorthandOrder: [(CodingKeys, String)] = [
+                (.click, "click"), (.tap, "click"), (.fill, "set"), (.set, "set"),
+                (.type, "type"), (.move, "move"), (.hover, "move"), (.press, "press"),
+                (.key, "key"), (.menu, "menu"), (.wait, "wait"), (.sleep, "wait"),
+                (.settle, "settle"), (.ocr, "ocr"), (.screenshot, "screenshot"),
+                (.scroll, "scroll"), (.drag, "drag")
+            ]
+            for (k, opName) in shorthandOrder where c.contains(k) {
+                parsedOp = opName
+                switch opName {
+                case "click", "move":
+                    if parsedTarget == nil { parsedTarget = decodeNonBoolStr(k) }
+                case "set":
+                    if parsedValue == nil { parsedValue = decodeNonBoolStr(k) }
+                case "type":
+                    if parsedText == nil { parsedText = decodeNonBoolStr(k) }
+                case "press":
+                    if parsedKey == nil { parsedKey = decodeNonBoolStr(k) }
+                case "wait":
+                    if parsedMs == nil { parsedMs = decodeInt(k) }
+                case "screenshot":
+                    if parsedValue == nil { parsedValue = decodeNonBoolStr(k) }
+                case "scroll":
+                    if parsedDy == nil { parsedDy = decodeInt(k) }
+                default:
+                    break
+                }
+                break
+            }
+        }
+
+        self.op = parsedOp
+        self.action = parsedAction
         self.uid = decodeStr(.uid)
         self.ref = decodeStr(.ref)
-        self.target = decodeStr(.target)
+        self.target = parsedTarget
         self.selector = decodeStr(.selector)
         self.index = decodeInt(.index)
         self.role = decodeStr(.role)
         self.name = decodeStr(.name)
         self.label = decodeStr(.label)
-        self.text = decodeStr(.text)
-        self.key = decodeStr(.key)
-        self.value = decodeStr(.value)
+        self.text = parsedText
+        self.key = parsedKey
+        self.value = parsedValue
         if let arr = (try? c.decodeIfPresent([String].self, forKey: .path)) ?? (try? c.decodeIfPresent([String].self, forKey: .menu)) {
             self.path = arr
         } else if let str = decodeStr(.path) ?? decodeStr(.menu) {
@@ -163,11 +209,11 @@ struct StepSpec: Codable {
         } else {
             self.files = nil
         }
-        self.ms = decodeInt(.ms)
+        self.ms = parsedMs
         self.x = decodeInt(.x)
         self.y = decodeInt(.y)
         self.dx = decodeInt(.dx)
-        self.dy = decodeInt(.dy)
+        self.dy = parsedDy
         self.toX = decodeInt(.toX)
         self.toY = decodeInt(.toY)
         self.optional = try? c.decodeIfPresent(Bool.self, forKey: .optional)
@@ -342,6 +388,8 @@ struct BatchRequest: Codable {
     let query: String?
     let steps: [StepSpec]?
     let diff: Bool?
+    let fullPage: Bool?
+    let includeWebArea: Bool?
     let settle: Bool?
     let reset: Bool?
     let showDocs: Bool?
@@ -437,6 +485,7 @@ final class EngineState {
     var cachedAppWindows: [String: (AXUIElement, String)] = [:]
     var appCache: [String: TargetApp] = [:]
     var appPidByKey: [String: pid_t] = [:]
+    var prunedWebAreaWindows: Set<String> = []
     var wokenPids: Set<pid_t> = []
     var documentedApps: Set<String> = []
     var agentCursors: [String: VirtualCursorState] = [:]
@@ -885,7 +934,45 @@ func detectDisabledNSOpenPanel(nodes: [NodeRecord]) -> NodeRecord? {
     }
 }
 
-func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxElements: Int = 300) -> ([NodeRecord], [AXUIElement]) {
+let dedicatedBrowserBundleIds: Set<String> = [
+    "com.google.chrome",
+    "com.google.chrome.canary",
+    "com.google.chrome.beta",
+    "org.chromium.chromium",
+    "com.brave.browser",
+    "company.thebrowser.browser",
+    "com.microsoft.edgemac",
+    "com.apple.safari",
+    "org.mozilla.firefox"
+]
+
+let dedicatedBrowserNames: Set<String> = [
+    "google chrome",
+    "google chrome canary",
+    "chromium",
+    "brave browser",
+    "arc",
+    "microsoft edge",
+    "safari",
+    "firefox"
+]
+
+func isDedicatedWebBrowserApp(_ app: TargetApp) -> Bool {
+    if let running = NSRunningApplication(processIdentifier: app.pid),
+       let bid = running.bundleIdentifier?.lowercased(),
+       dedicatedBrowserBundleIds.contains(bid) {
+        return true
+    }
+    return dedicatedBrowserNames.contains(app.name.lowercased())
+}
+
+func walkAXTree(
+    _ root: AXUIElement,
+    winKey: String,
+    query: String? = nil,
+    maxElements: Int = 300,
+    skipWebArea: Bool = false
+) -> ([NodeRecord], [AXUIElement]) {
     var records: [NodeRecord] = []
     var elements: [AXUIElement] = []
     var stack: [AXUIElement] = [root]
@@ -893,6 +980,7 @@ func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxEl
     var visitedHashes: Set<UInt> = []
     var structCounts: [String: Int] = [:]
     var usedInPass: Set<String> = []
+    var didPruneWebArea = false
     let q = query?.lowercased()
     let state = EngineState.shared
 
@@ -906,6 +994,10 @@ func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxEl
         let attrs = readBatchedAttrs(el)
         let role = attrs.role
         if role == "menubar" || role == "menubaritem" {
+            continue
+        }
+        if skipWebArea && role == "webarea" {
+            didPruneWebArea = true
             continue
         }
         var label = !attrs.title.isEmpty ? attrs.title : attrs.desc
@@ -972,6 +1064,11 @@ func walkAXTree(_ root: AXUIElement, winKey: String, query: String? = nil, maxEl
                 stack.insert(contentsOf: children, at: 0)
             }
         }
+    }
+    if didPruneWebArea {
+        state.prunedWebAreaWindows.insert(winKey)
+    } else {
+        state.prunedWebAreaWindows.remove(winKey)
     }
     return (records, elements)
 }
@@ -3540,7 +3637,7 @@ final class MenuBarController: NSObject {
         statusLock.unlock()
         let escTarget = info.target.replacingOccurrences(of: "\"", with: "'")
         let escTitle = info.plainTitle.replacingOccurrences(of: "\"", with: "'")
-        return "# fmu-menubar state=\"\(info.state)\" title=\"\(escTitle)\" stopped=\(info.stopped ? "true" : "false") surface=\"\(info.surface)\" target=\"\(escTarget)\" op=\"\(info.op)\" agent=\"\(info.agent)\" visible=\(visible ? "true" : "false") hud=\(hudVis ? "true" : "false") preview=\(prevVis ? "true" : "false") hasFrame=\(hasFrame ? "true" : "false") zoomed=\(zoomed ? "true" : "false") highlight=\(hlVis ? "true" : "false")"
+        return "# fmu-menubar state=\"\(info.state)\" title=\"\(escTitle)\" stopped=\(info.stopped ? "true" : "false") surface=\"\(info.surface)\" target=\"\(escTarget)\" op=\"\(info.op)\" agent=\"\(info.agent)\" visible=\(visible ? "true" : "false") hud=\(hudVis ? "true" : "false") preview=\(prevVis ? "true" : "false") hasFrame=\(hasFrame ? "true" : "false") zoomed=\(zoomed ? "true" : "false") highlight=\(hlVis ? "true" : "false") axTrusted=\(AXIsProcessTrusted() ? "true" : "false")"
     }
 
     private func refreshUIAsync(immediateIfMain: Bool = false) {
@@ -4143,18 +4240,19 @@ func settleAndWalkAXTree(
     cachedElements: [AXUIElement],
     prevCrc: String,
     query: String?,
-    shouldSettle: Bool
+    shouldSettle: Bool,
+    skipWebArea: Bool = false
 ) -> ([NodeRecord], [AXUIElement], String) {
     let state = EngineState.shared
     if shouldSettle {
         _ = interruptibleSleep(ms: 10)
     }
-    var (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
+    var (nodes, els) = walkAXTree(root, winKey: winKey, query: query, skipWebArea: skipWebArea)
     var curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
     if shouldSettle {
         for _ in 0..<2 where curCrc == prevCrc {
             if !interruptibleSleep(ms: 15) { break }
-            (nodes, els) = walkAXTree(root, winKey: winKey, query: query)
+            (nodes, els) = walkAXTree(root, winKey: winKey, query: query, skipWebArea: skipWebArea)
             curCrc = crc32(nodes.map { $0.compactLine }.joined(separator: "\n"))
         }
     }
@@ -4303,6 +4401,9 @@ func executeRequest(_ req: BatchRequest) -> String {
         return "Error: missing `app` parameter"
     }
     guard let app = findApp(nameOrBundle: appName) else {
+        if !AXIsProcessTrusted() {
+            return "Error: macOS Accessibility permission not granted (AXIsProcessTrusted=false) for fmu-ax (pid=\(getpid())); grant Accessibility to the host app (e.g. Devin.app / Antigravity.app) in System Settings > Privacy & Security > Accessibility"
+        }
         return "Error: app not found (\(appName))"
     }
 
@@ -4337,7 +4438,8 @@ func executeRequest(_ req: BatchRequest) -> String {
     }
 
     let rootIsMain = isWindowMain(app.pid, root)
-    let winKey = "\(app.name.lowercased()):\(winTitle)"
+    let skipWebArea = isDedicatedWebBrowserApp(app) && req.fullPage != true && req.includeWebArea != true
+    let winKey = "\(app.name.lowercased()):\(winTitle)\(skipWebArea ? ":native" : "")"
     let baselineKey = "\(agentId)|\(winKey)"
     let pidChanged = (state.appPidByKey[winKey] != nil && state.appPidByKey[winKey] != app.pid)
     if let oldPid = state.appPidByKey[winKey], pidChanged {
@@ -4403,19 +4505,19 @@ func executeRequest(_ req: BatchRequest) -> String {
                         currentElements = cachedEls
                         state.windowSyncedSeq[winKey] = dirtyInfo.seq
                     } else {
-                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
                         _ = state.consumeDirtyState(app.pid)
                         state.windowSyncedSeq[winKey] = state.currentPidSeq(app.pid)
                     }
                 }
             }
         } else {
-            (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+            (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
             _ = state.consumeDirtyState(app.pid)
             state.windowSyncedSeq[winKey] = state.currentPidSeq(app.pid)
         }
     } else {
-        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
         if !hasQuery {
             _ = state.consumeDirtyState(app.pid)
             state.windowSyncedSeq[winKey] = state.currentPidSeq(app.pid)
@@ -4658,13 +4760,13 @@ func executeRequest(_ req: BatchRequest) -> String {
                     targetEl = state.uidToElement[uid]
                     targetNode = state.uidToRecord[uid]
                     if targetEl == nil {
-                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
                         targetEl = state.uidToElement[uid]
                         targetNode = state.uidToRecord[uid]
                     }
                 } else if let idx = step.index, idx >= 1 {
                     if idx > currentElements.count {
-                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
                     }
                     if idx <= currentElements.count {
                         targetEl = currentElements[idx - 1]
@@ -4720,7 +4822,7 @@ func executeRequest(_ req: BatchRequest) -> String {
                         targetEl = found.0
                         targetNode = found.1
                     } else {
-                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
                         if let found = matchInCurrentNodes() {
                             targetEl = found.0
                             targetNode = found.1
@@ -4786,6 +4888,8 @@ func executeRequest(_ req: BatchRequest) -> String {
                         let requestedTarget = step.effectiveUid ?? step.effectiveName ?? (step.index != nil ? String(step.index!) : "")
                         if requestedTarget.isEmpty {
                             stepErrors.append("step \(i+1) (\(op)): missing target (uid, name, or target)")
+                        } else if skipWebArea && state.prunedWebAreaWindows.contains(winKey) {
+                            stepErrors.append("step \(i+1): target not found (\(requestedTarget)) — AXWebArea is pruned on browser apps; use surface=\"web\" / cua.listTabs() for page DOM or pass fullPage=true")
                         } else {
                             stepErrors.append("step \(i+1): target not found (\(requestedTarget))")
                         }
@@ -4827,7 +4931,7 @@ func executeRequest(_ req: BatchRequest) -> String {
                     }
                     var err = AXUIElementPerformAction(el, kAXPressAction as CFString)
                     if err == .invalidUIElement || err == .cannotComplete {
-                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                        (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
                         if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
                             el = refreshed
                             targetNode = state.uidToRecord[uid]
@@ -4880,7 +4984,7 @@ func executeRequest(_ req: BatchRequest) -> String {
                         _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
                         var err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, textStr as CFTypeRef)
                         if err == .invalidUIElement || err == .cannotComplete {
-                            (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query)
+                            (currentNodes, currentElements) = walkAXTree(root, winKey: winKey, query: req.query, skipWebArea: skipWebArea)
                             if let uid = step.effectiveUid ?? targetNode?.uid, let refreshed = state.uidToElement[uid] {
                                 el = refreshed
                                 targetNode = state.uidToRecord[uid]
@@ -4989,7 +5093,8 @@ func executeRequest(_ req: BatchRequest) -> String {
             cachedElements: currentElements,
             prevCrc: prevCrc,
             query: req.query,
-            shouldSettle: req.settle ?? true
+            shouldSettle: req.settle ?? true,
+            skipWebArea: skipWebArea
         )
         currentNodes = settled.0
         currentElements = settled.1
@@ -5063,6 +5168,9 @@ func executeRequest(_ req: BatchRequest) -> String {
         header += "\n# api: click(uid|name), set(uid|name,value), move(uid|name), type(value), key(chord), menu([path]), ocr(), screenshot(path?)"
     }
     out.append(header)
+    if skipWebArea && state.prunedWebAreaWindows.contains(winKey) {
+        out.append("# web_area: pruned (use surface=\"web\" / cua.listTabs() for page DOM, or pass fullPage=true to include AXWebArea)")
+    }
 
     if !stepErrors.isEmpty {
         out.append("! errors: \(stepErrors.joined(separator: "; "))")

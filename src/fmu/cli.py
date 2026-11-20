@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -15,6 +16,29 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 DEFAULT_RUNTIME_SOCK = os.environ.get("FMU_RUNTIME_SOCK", "/tmp/fmu-runtime.sock")
+_CODE_WAIT_MS_RE = re.compile(
+    r"(?:waitFor|wait_for|waitUntil|wait)\s*\([^)]*?(\b\d{3,6}\b)|timeoutMs\s*[:=]\s*(\d{3,6})"
+)
+
+
+def _estimate_request_wait_s(req: dict[str, Any]) -> float:
+    extra_s = 0.0
+    for st_item in req.get("steps") or []:
+        if isinstance(st_item, dict):
+            extra_s += float(
+                st_item.get("timeoutMs") or st_item.get("timeout") or st_item.get("ms") or st_item.get("wait") or 0
+            ) / 1000.0
+    code_str = str(req.get("code") or "")
+    if code_str:
+        for m in _CODE_WAIT_MS_RE.finditer(code_str):
+            raw_ms = m.group(1) or m.group(2)
+            if raw_ms:
+                extra_s += min(30.0, float(raw_ms) / 1000.0)
+    par = req.get("parallel")
+    if isinstance(par, list) and par:
+        sub_waits = [_estimate_request_wait_s(sub) for sub in par if isinstance(sub, dict)]
+        extra_s = max(extra_s, 30.0, (max(sub_waits) + 15.0) if sub_waits else 30.0)
+    return extra_s
 
 
 def can_connect_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> bool:
@@ -132,22 +156,18 @@ def execute_via_daemon(
 
     payload = (json.dumps(req) + "\n").encode("utf-8")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connected_to_daemon = False
     try:
-        s.settimeout(1.0)
+        s.settimeout(1.5)
         s.connect(socket_path)
+        connected_to_daemon = True
         s.sendall(payload)
         s.shutdown(socket.SHUT_WR)
         chunks: list[bytes] = []
         s.settimeout(0.05)
-        extra_wait_s = 0.0
-        for st_item in req.get("steps") or []:
-            if isinstance(st_item, dict):
-                extra_wait_s += float(
-                    st_item.get("timeoutMs") or st_item.get("timeout") or st_item.get("ms") or 0
-                ) / 1000.0
-        if isinstance(req.get("parallel"), list):
-            extra_wait_s = max(extra_wait_s, 30.0)
-        deadline = time.perf_counter() + min(120.0, max(45.0, 25.0 + extra_wait_s))
+        extra_wait_s = _estimate_request_wait_s(req)
+        timeout_budget_s = min(180.0, max(45.0, 25.0 + extra_wait_s))
+        deadline = time.perf_counter() + timeout_budget_s
         while True:
             if not is_control and is_user_stopped():
                 code_str = str(req.get("code") or "")
@@ -157,13 +177,19 @@ def execute_via_daemon(
                 buf = s.recv(16384)
             except socket.timeout:
                 if time.perf_counter() >= deadline:
-                    raise TimeoutError("Timed out waiting for fmu runtime daemon")
+                    raise TimeoutError(
+                        f"Timed out after {timeout_budget_s:.0f}s waiting for fmu runtime daemon"
+                    )
                 continue
             if not buf:
                 break
             chunks.append(buf)
         return b"".join(chunks).decode("utf-8", errors="replace").strip()
+    except TimeoutError:
+        raise
     except OSError:
+        if connected_to_daemon:
+            raise
         from fmu.cua_runtime import FasterMacUseRuntime
 
         rt = FasterMacUseRuntime()
@@ -247,6 +273,7 @@ USAGE_TEXT = """Usage:
   fmu --stop              Immediately stop active fmu agent work (same as menu bar ⏹ Stop)
   fmu --resume            Clear user stop latch and resume fmu (same as menu bar ▶ Resume)
   fmu --perf [days]       Summarize recent fmu performance & error logs (~/.fmu/logs)
+  fmu --perf --clear      Remove all recorded fmu session/perf logs (~/.fmu/logs/perf-*.jsonl)
   fmu --reset             Reset warm browser & macOS AX daemon state
   fmu --shutdown          Stop background runtime daemon
   fmu --daemon [sock]     Run the warm runtime socket daemon
@@ -284,9 +311,19 @@ def main(bin_path: Path | None = None) -> None:
 
         print(clear_user_stop())
         return
-    if len(sys.argv) >= 2 and sys.argv[1] in ("--perf", "--stats", "perf", "stats"):
-        from fmu.telemetry import build_perf_report
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--clear-logs", "clear-logs"):
+        from fmu.telemetry import clear_perf_logs, get_log_dir
 
+        removed = clear_perf_logs()
+        sys.stdout.write(f'# fmu-perf cleared={removed} logs="{get_log_dir()}"\n')
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--perf", "--stats", "perf", "stats"):
+        from fmu.telemetry import build_perf_report, clear_perf_logs, get_log_dir
+
+        if "--clear" in sys.argv[2:] or "clear" in sys.argv[2:]:
+            removed = clear_perf_logs()
+            sys.stdout.write(f'# fmu-perf cleared={removed} logs="{get_log_dir()}"\n')
+            return
         days = 7
         fmt = "json" if "--json" in sys.argv[2:] else "markdown"
         for arg in sys.argv[2:]:

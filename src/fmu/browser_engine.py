@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import mimetypes
 import os
 from pathlib import Path
 import queue
@@ -21,7 +22,15 @@ from fmu.mac_engine import (
     is_user_stopped,
     notify_menubar_status,
 )
-from fmu.telemetry import flush_telemetry, record_perf_event, sanitize_error, sanitize_url_target
+from fmu.telemetry import (
+    _telemetry_ctx,
+    flush_telemetry,
+    record_perf_event,
+    reset_telemetry_context,
+    sanitize_error,
+    sanitize_url_target,
+    set_telemetry_context,
+)
 
 
 _HAS_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
@@ -130,25 +139,120 @@ def _write_web_preview_b64(b64_data: str | None) -> str | None:
         return None
 
 
-DEFAULT_MAX_EVAL_CHARS = 65536
+DEFAULT_MAX_EVAL_CHARS = 16000
+MAX_INLINE_UPLOAD_BYTES = 25 * 1024 * 1024
+
+_SHORTHAND_STEP_VERBS: tuple[tuple[str, str], ...] = (
+    ("click", "target"),
+    ("tap", "target"),
+    ("fill", "value"),
+    ("set", "value"),
+    ("type", "text"),
+    ("select", "value"),
+    ("upload", "files"),
+    ("move", "target"),
+    ("hover", "target"),
+    ("press", "key"),
+    ("key", "key"),
+    ("menu", "menu"),
+    ("waitFor", "target"),
+    ("wait_for", "target"),
+    ("waitUntil", "target"),
+    ("wait", "ms"),
+    ("sleep", "ms"),
+    ("delay", "ms"),
+    ("settle", "ms"),
+    ("eval", "code"),
+    ("evaluate", "code"),
+    ("screenshot", "path"),
+    ("ocr", ""),
+    ("scroll", "dy"),
+    ("drag", ""),
+    ("errors", ""),
+    ("clearErrors", ""),
+    ("goto", "url"),
+    ("navigate", "url"),
+    ("open", "url"),
+)
+
+
+def normalize_step_dict(step: dict[str, Any]) -> dict[str, Any]:
+    """Expand single-verb shorthand steps (e.g. {'click': '@u1'}, {'wait': 300}, {'key': 'Enter'})."""
+    if not isinstance(step, dict) or step.get("op") or step.get("action"):
+        return step
+    for verb, param_key in _SHORTHAND_STEP_VERBS:
+        matched_key = verb if verb in step else (verb.lower() if verb.lower() in step else None)
+        if matched_key is None:
+            continue
+        raw_val = step[matched_key]
+        out = {k: v for k, v in step.items() if k != matched_key}
+        out["op"] = verb
+        if isinstance(raw_val, dict):
+            for rk, rv in raw_val.items():
+                out.setdefault(rk, rv)
+        elif param_key and not isinstance(raw_val, bool) and raw_val is not None:
+            out.setdefault(param_key, raw_val)
+        return out
+    return step
+
+
+def _build_inline_files_payload(
+    file_list: list[str],
+    max_total_bytes: int = MAX_INLINE_UPLOAD_BYTES,
+) -> list[dict[str, str]]:
+    """Read local files into base64 File payloads when all exist and fit within max_total_bytes."""
+    if not file_list:
+        return []
+    total_bytes = 0
+    items: list[dict[str, str]] = []
+    for raw_f in file_list:
+        p = Path(str(raw_f)).expanduser()
+        try:
+            if not p.is_file():
+                return []
+            sz = p.stat().st_size
+            total_bytes += sz
+            if total_bytes > max_total_bytes:
+                return []
+            data = p.read_bytes()
+        except OSError:
+            return []
+        mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        items.append(
+            {
+                "name": p.name,
+                "type": mime,
+                "dataB64": base64.b64encode(data).decode("ascii"),
+            }
+        )
+    return items
+
 
 _JS_NON_EXPR_STMT_RE = re.compile(
     r"^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b"
 )
 
 
-def _format_eval_output(val: Any) -> str:
+def _format_eval_output_with_flag(val: Any, max_chars_override: int | None = None) -> tuple[str, bool]:
     s = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
-    try:
-        max_chars = int(os.environ.get("FMU_MAX_EVAL_CHARS", str(DEFAULT_MAX_EVAL_CHARS)))
-    except ValueError:
-        max_chars = DEFAULT_MAX_EVAL_CHARS
+    if max_chars_override is not None:
+        max_chars = int(max_chars_override)
+    else:
+        try:
+            max_chars = int(os.environ.get("FMU_MAX_EVAL_CHARS", str(DEFAULT_MAX_EVAL_CHARS)))
+        except ValueError:
+            max_chars = DEFAULT_MAX_EVAL_CHARS
     if max_chars > 0 and len(s) > max_chars:
         return (
             f"{s[:max_chars]}... "
-            f"[truncated: showing {max_chars} of {len(s)} chars; set FMU_MAX_EVAL_CHARS to increase]"
+            f"[truncated: showing {max_chars} of {len(s)} chars; set FMU_MAX_EVAL_CHARS to increase]",
+            True,
         )
-    return s
+    return s, False
+
+
+def _format_eval_output(val: Any, max_chars_override: int | None = None) -> str:
+    return _format_eval_output_with_flag(val, max_chars_override=max_chars_override)[0]
 
 
 def _is_navigation_error(exc_or_msg: Any) -> bool:
@@ -300,11 +404,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.4.3"
+_FMU_RUNTIME_VERSION = "0.4.4"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.4.3";
+  const FMU_RUNTIME_VERSION = "0.4.4";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -317,6 +421,7 @@ IN_PAGE_RUNTIME_JS = r"""
     ocrTargets: new Map(),
     waiters: new Set(),
     nextUid: 1,
+    strictCsp: false,
     mutationSeq: 1,
     observerAttached: false,
     waiterObserverAttached: false,
@@ -352,6 +457,14 @@ IN_PAGE_RUNTIME_JS = r"""
     const base = root.querySelectorAll(sel);
     const all = root.querySelectorAll("*");
     let extra = null;
+    const ownSr = getShadowRoot(root);
+    if (ownSr) {
+      extra = Array.from(base).filter(n => n && n.nodeType === 1);
+      const ownSub = queryAllDeep(sel, ownSr);
+      for (let j = 0; j < ownSub.length; j++) {
+        if (ownSub[j] && ownSub[j].nodeType === 1) extra.push(ownSub[j]);
+      }
+    }
     for (let i = 0; i < all.length; i++) {
       const sr = getShadowRoot(all[i]);
       if (sr) {
@@ -366,9 +479,14 @@ IN_PAGE_RUNTIME_JS = r"""
   }
 
   function queryOneDeep(sel, root = document) {
-    const hit = root.querySelector(sel);
+    const hit = root.querySelector ? root.querySelector(sel) : null;
     if (hit) return hit;
-    const all = root.querySelectorAll("*");
+    const ownSr = getShadowRoot(root);
+    if (ownSr && ownSr.querySelector) {
+      const ownHit = queryOneDeep(sel, ownSr);
+      if (ownHit) return ownHit;
+    }
+    const all = root.querySelectorAll ? root.querySelectorAll("*") : [];
     for (let i = 0; i < all.length; i++) {
       const sr = getShadowRoot(all[i]);
       if (sr && sr.querySelector) {
@@ -1514,9 +1632,15 @@ IN_PAGE_RUNTIME_JS = r"""
 
   function setNativeValue(el, value, append = false) {
     let target = el;
+    if (tagOf(target) === "label" && target.control) {
+      target = target.control;
+    }
     const tag0 = tagOf(target);
     if (tag0 !== "input" && tag0 !== "textarea" && tag0 !== "select" && !isContentEditableEl(target)) {
-      const inner = target.querySelector && target.querySelector("[contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], textarea, input");
+      const inner = queryOneDeep(
+        "[contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only'], textarea, input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([type='checkbox']):not([type='radio']):not([type='file']), select",
+        target
+      );
       if (inner) target = inner;
     }
 
@@ -1627,17 +1751,62 @@ IN_PAGE_RUNTIME_JS = r"""
     }
 
     const tag = tagOf(target);
-    const finalVal = append ? (String(target.value || "") + strVal) : strVal;
-    const proto = tag === "textarea"
-      ? window.HTMLTextAreaElement.prototype
-      : window.HTMLInputElement.prototype;
-    const desc = Object.getOwnPropertyDescriptor(proto, "value");
-    if (desc && desc.set) {
-      desc.set.call(target, finalVal);
-    } else {
-      target.value = finalVal;
+    const win = (target && target.ownerDocument && target.ownerDocument.defaultView) || window;
+    if (tag === "select") {
+      let matchedOptVal = strVal;
+      if (target.options) {
+        for (const opt of target.options) {
+          if (opt.value === strVal || cleanStr(opt.text).toLowerCase() === strVal.toLowerCase()) {
+            matchedOptVal = opt.value;
+            break;
+          }
+        }
+      }
+      const selProto = win.HTMLSelectElement && win.HTMLSelectElement.prototype;
+      const selDesc = selProto ? Object.getOwnPropertyDescriptor(selProto, "value") : null;
+      try {
+        if (selDesc && selDesc.set) selDesc.set.call(target, matchedOptVal);
+        else target.value = matchedOptVal;
+      } catch (_) {
+        target.value = matchedOptVal;
+      }
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      store.mutationSeq++;
+      return;
     }
-    target.dispatchEvent(new InputEvent("input", { bubbles: true, data: finalVal }));
+
+    const finalVal = append ? (String(target.value || "") + strVal) : strVal;
+    if (tag === "input" || tag === "textarea") {
+      const proto = tag === "textarea"
+        ? (win.HTMLTextAreaElement && win.HTMLTextAreaElement.prototype)
+        : (win.HTMLInputElement && win.HTMLInputElement.prototype);
+      const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+      try {
+        if (desc && desc.set) {
+          desc.set.call(target, finalVal);
+        } else {
+          target.value = finalVal;
+        }
+      } catch (_) {
+        target.value = finalVal;
+      }
+      target.dispatchEvent(new InputEvent("input", { bubbles: true, data: finalVal }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      store.mutationSeq++;
+      return;
+    }
+
+    try {
+      target.focus({ preventScroll: true });
+    } catch (_) {}
+    try {
+      target.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: finalVal }));
+    } catch (_) {}
+    if ("value" in target) {
+      try { target.value = finalVal; } catch (_) {}
+    }
+    target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: finalVal }));
     target.dispatchEvent(new Event("change", { bubbles: true }));
     store.mutationSeq++;
   }
@@ -1718,6 +1887,52 @@ IN_PAGE_RUNTIME_JS = r"""
     try { el = queryOneDeep(s); } catch (_) {}
     if (!el) el = resolveEl(s);
     return Boolean(el && (!requireVisible || isVisible(el)));
+  }
+
+  function detectBotChallenge(descLower = "") {
+    if (
+      descLower.includes("sorry")
+      || descLower.includes("captcha")
+      || descLower.includes("challenge")
+      || descLower.includes("bots")
+    ) {
+      return "";
+    }
+    const host = String(location.hostname || "").toLowerCase();
+    const path = String(location.pathname || "");
+    const title = String(document.title || "").trim();
+    if ((host.startsWith("google.") || host.includes(".google.")) && path.startsWith("/sorry")) {
+      return "google_sorry_captcha";
+    }
+    if (/\/help\/bots(?:\.html|\/|$)/i.test(path)) {
+      return "bot_block_page";
+    }
+    if (/\/captcha(?:-v\d+)?(?:\/|\.html|$)/i.test(path) || /\/cdn-cgi\/challenge-platform/i.test(path)) {
+      return "captcha_interstitial";
+    }
+    if (
+      (title === "Just a moment..." || title === "Attention Required! | Cloudflare")
+      && document.querySelector("#challenge-running, #challenge-stage, .cf-turnstile, iframe[src*='challenges.cloudflare.com']")
+    ) {
+      return "cloudflare_challenge";
+    }
+    return "";
+  }
+
+  function summarizeWaitTimeoutContext() {
+    const parts = [];
+    const title = cleanStr(document.title || "", 60);
+    if (title) parts.push(`title=${JSON.stringify(title)}`);
+    const headCands = document.querySelectorAll("h1, h2, [role='alert'], [role='heading']");
+    for (const h of headCands) {
+      if (!isVisible(h)) continue;
+      const ht = cleanStr(h.innerText || h.textContent || "", 70);
+      if (ht && ht !== title) {
+        parts.push(`heading=${JSON.stringify(ht)}`);
+        break;
+      }
+    }
+    return parts.length > 0 ? ` [${parts.join(", ")}]` : "";
   }
 
   async function waitForCondition(s) {
@@ -1820,8 +2035,13 @@ IN_PAGE_RUNTIME_JS = r"""
     };
 
     const t0 = performance.now();
+    const descLower = desc.toLowerCase();
     if (await checkOnce()) {
       return { ok: true, elapsedMs: +(performance.now() - t0).toFixed(2) };
+    }
+    const initialChallenge = detectBotChallenge(descLower);
+    if (initialChallenge) {
+      return { ok: false, botChallenge: initialChallenge, elapsedMs: +(performance.now() - t0).toFixed(2), desc };
     }
     while (performance.now() - t0 < timeoutMs) {
       if (store.navigating) return { navigating: true };
@@ -1842,8 +2062,12 @@ IN_PAGE_RUNTIME_JS = r"""
       if (await checkOnce()) {
         return { ok: true, elapsedMs: +(performance.now() - t0).toFixed(2) };
       }
+      const midChallenge = detectBotChallenge(descLower);
+      if (midChallenge) {
+        return { ok: false, botChallenge: midChallenge, elapsedMs: +(performance.now() - t0).toFixed(2), desc };
+      }
     }
-    return { ok: false, timedOut: true, timeoutMs, desc };
+    return { ok: false, timedOut: true, timeoutMs, desc, contextHint: summarizeWaitTimeoutContext() };
   }
 
   function interpolateTemplate(val, args) {
@@ -2208,8 +2432,40 @@ IN_PAGE_RUNTIME_JS = r"""
       lines: []
     });
 
+    const SHORTHAND_VERBS = [
+      ["click", "target"], ["tap", "target"], ["fill", "value"], ["set", "value"],
+      ["type", "text"], ["select", "value"], ["upload", "files"], ["move", "target"],
+      ["hover", "target"], ["press", "key"], ["key", "key"], ["waitFor", "target"],
+      ["wait_for", "target"], ["waitUntil", "target"], ["wait", "ms"], ["sleep", "ms"],
+      ["delay", "ms"], ["settle", "ms"], ["eval", "code"], ["evaluate", "code"],
+      ["screenshot", "path"], ["ocr", ""], ["errors", ""], ["clearErrors", ""]
+    ];
+
+    function normalizeStepInPage(rawStep) {
+      if (!rawStep || typeof rawStep !== "object" || rawStep.op || rawStep.action) return rawStep || {};
+      for (let v = 0; v < SHORTHAND_VERBS.length; v++) {
+        const [verb, paramKey] = SHORTHAND_VERBS[v];
+        const mk = Object.prototype.hasOwnProperty.call(rawStep, verb)
+          ? verb
+          : (Object.prototype.hasOwnProperty.call(rawStep, verb.toLowerCase()) ? verb.toLowerCase() : null);
+        if (!mk) continue;
+        const val = rawStep[mk];
+        const out = { ...rawStep, op: verb };
+        delete out[mk];
+        if (val && typeof val === "object" && !Array.isArray(val)) {
+          for (const [rk, rv] of Object.entries(val)) {
+            if (out[rk] === undefined) out[rk] = rv;
+          }
+        } else if (paramKey && typeof val !== "boolean" && val !== undefined && val !== null && out[paramKey] === undefined) {
+          out[paramKey] = val;
+        }
+        return out;
+      }
+      return rawStep;
+    }
+
     for (let i = 0; i < steps.length; i++) {
-      const s = steps[i] || {};
+      const s = normalizeStepInPage(steps[i] || {});
       let op = String(s.op || s.action || "").trim().toLowerCase();
       const targetRef = s.uid || s.ref || s.target || s.selector || s.name;
       const stepValue = s.value !== undefined ? s.value : s.text;
@@ -2240,8 +2496,15 @@ IN_PAGE_RUNTIME_JS = r"""
         if (op === "waitfor" || op === "wait_for" || op === "waituntil" || (op === "wait" && hasWaitCond)) {
           const wRes = await waitForCondition(s);
           if (wRes.navigating || store.navigating) return makeNavigatedEarlyReturn(i + 1);
+          if (wRes.botChallenge) {
+            escalations.push({ step: i + 1, reason: "bot_challenge", kind: wRes.botChallenge });
+            if (!s.optional) {
+              errors.push(`step ${i + 1} (waitFor): aborted early after ${wRes.elapsedMs}ms — bot/CAPTCHA interstitial detected (${wRes.botChallenge} at ${location.host}${location.pathname}); use mode="chrome" MV3 tab instead of headless while waiting for ${wRes.desc}`);
+            }
+            continue;
+          }
           if (!wRes.ok && !s.optional) {
-            errors.push(`step ${i + 1} (waitFor): timed out after ${wRes.timeoutMs}ms waiting for ${wRes.desc}`);
+            errors.push(`step ${i + 1} (waitFor): timed out after ${wRes.timeoutMs}ms waiting for ${wRes.desc}${wRes.contextHint || ""}`);
           }
           continue;
         }
@@ -2266,6 +2529,10 @@ IN_PAGE_RUNTIME_JS = r"""
         }
         if (op === "eval" || op === "evaluate") {
           const code = String(s.code || stepValue || "");
+          if (store.strictCsp) {
+            escalations.push({ step: i + 1, reason: "eval_csp", code, cached: true, maxChars: s.maxChars });
+            continue;
+          }
           try {
             const res = await runInPageEval(code);
             if (res !== undefined) evalOutputs.push(safeStringifyEval(res));
@@ -2277,7 +2544,8 @@ IN_PAGE_RUNTIME_JS = r"""
               || msg.includes("Content Security Policy")
               || msg.includes("unsafe-eval")
             ) {
-              escalations.push({ step: i + 1, reason: "eval_csp", code });
+              store.strictCsp = true;
+              escalations.push({ step: i + 1, reason: "eval_csp", code, maxChars: s.maxChars });
             } else {
               throw evalErr;
             }
@@ -2984,10 +3252,18 @@ class _ExtensionPageAdapter:
 
     def set_input_files(self, selector: str, files: str | list[str]) -> dict[str, Any]:
         file_list = [str(files)] if isinstance(files, (str, Path)) else [str(f) for f in files]
+        inline_files = _build_inline_files_payload(file_list)
+        rpc_params: dict[str, Any] = {
+            "tabId": self.chrome_tab_id,
+            "selector": selector,
+            "files": file_list,
+        }
+        if inline_files:
+            rpc_params["inlineFiles"] = inline_files
         res = self._bridge.call_rpc(
             "setInputFiles",
-            {"tabId": self.chrome_tab_id, "selector": selector, "files": file_list},
-            timeout=10.0,
+            rpc_params,
+            timeout=15.0,
         )
         return res if isinstance(res, dict) else {"ok": True}
 
@@ -3003,17 +3279,30 @@ class _ExtensionPageAdapter:
             if not _preview_enabled():
                 batch_arg["skipPreview"] = True
             step_wait_s = 0.0
+            norm_steps: list[Any] = []
             for st in batch_arg.get("steps") or []:
                 if isinstance(st, dict):
-                    sop = str(st.get("op") or st.get("action") or "").lower()
+                    st_norm = normalize_step_dict(st)
+                    sop = str(st_norm.get("op") or st_norm.get("action") or "").lower()
                     if sop in ("waitfor", "wait_for", "waituntil"):
                         step_wait_s += max(
                             0.2,
-                            float(st.get("timeoutMs") or st.get("timeout") or st.get("ms") or 5000) / 1000.0,
+                            float(st_norm.get("timeoutMs") or st_norm.get("timeout") or st_norm.get("ms") or 5000) / 1000.0,
                         )
                     elif sop in ("wait", "sleep", "delay", "settle"):
-                        step_wait_s += max(0.0, float(st.get("ms") or 30) / 1000.0)
-            rpc_timeout = max(12.0, step_wait_s + 8.0)
+                        step_wait_s += max(0.0, float(st_norm.get("ms") or 30) / 1000.0)
+                    raw_files = st_norm.get("files") or (st_norm.get("value") if sop == "upload" else None)
+                    if raw_files and "inlineFiles" not in st_norm and not batch_arg.get("skipSnapshot"):
+                        flist = [str(raw_files)] if isinstance(raw_files, (str, Path)) else [str(f) for f in raw_files]
+                        inline_f = _build_inline_files_payload(flist)
+                        if inline_f:
+                            st_norm = {**st_norm, "inlineFiles": inline_f}
+                    norm_steps.append(st_norm)
+                else:
+                    norm_steps.append(st)
+            if norm_steps:
+                batch_arg["steps"] = norm_steps
+            rpc_timeout = max(18.0, step_wait_s + 12.0)
             rpc_payload: dict[str, Any] = {
                 **batch_arg,
                 "tabId": self.chrome_tab_id,
@@ -3114,6 +3403,7 @@ class BrowserTabSession:
         self.last_url = last_url
         self.last_title = last_title
         self.is_extension = is_extension
+        self._exec_lock = threading.RLock()
         self.documented = False
         self._documented_agents: set[str] = set()
         self._focus_emulated = False
@@ -3460,6 +3750,8 @@ class BrowserEngine:
         self._next_tab_num: int = 1
         self.cursors: dict[str, dict[str, Any]] = {}
         self._agent_colors: dict[str, str] = {}
+        self._strict_csp_hosts: set[str] = set()
+        self._state_lock = threading.RLock()
         self._ext_bridge_inst: ExtensionWebSocketBridge | None = None
         self._bridge_lock = threading.Lock()
         self._init_mono: float = time.monotonic()
@@ -3904,6 +4196,19 @@ class BrowserEngine:
     def _run_sync(self, fn: Callable[[], Any]) -> Any:
         if threading.get_ident() == self._worker_tid:
             return fn()
+        caller_ep = getattr(_telemetry_ctx, "entrypoint", None)
+        caller_bid = getattr(_telemetry_ctx, "batch_id", None)
+        if caller_ep or caller_bid:
+            orig_fn = fn
+
+            def _wrapped_fn() -> Any:
+                prev_c = set_telemetry_context(entrypoint=caller_ep, batch_id=caller_bid)
+                try:
+                    return orig_fn()
+                finally:
+                    reset_telemetry_context(prev_c)
+
+            fn = _wrapped_fn
         ev = threading.Event()
         box: list[Any] = []
         self._cmd_q.put((fn, ev, box))
@@ -4061,6 +4366,20 @@ class BrowserEngine:
         except Exception:
             pass
 
+    def _can_run_direct_mv3(self, *, mode: str = "chrome", tab_id: str | None = None) -> bool:
+        if mode == "headless":
+            return False
+        if tab_id:
+            with self._state_lock:
+                existing = self._tabs.get(tab_id)
+            if existing is not None:
+                return bool(existing.is_extension)
+        if os.environ.get("FMU_USE_EXTENSION", "1") == "0":
+            return False
+        if self._ext_bridge_inst is not None and self._ext_bridge.is_connected() and not self._find_chrome_devtools_ws():
+            return True
+        return False
+
     def create_tab(
         self,
         url: str = "about:blank",
@@ -4074,27 +4393,31 @@ class BrowserEngine:
         reuse_existing: bool = False,
         require_extension: bool = False,
     ) -> BrowserTabSession:
-        return self._run_sync(
-            lambda: self._create_tab_inner(
-                url,
-                mode,
-                session_name,
-                tab_id,
-                group_color,
-                window=window,
-                window_id=window_id,
-                chrome_tab_id=chrome_tab_id,
-                reuse_existing=reuse_existing,
-                require_extension=require_extension,
-            )
+        fn = lambda: self._create_tab_inner(
+            url,
+            mode,
+            session_name,
+            tab_id,
+            group_color,
+            window=window,
+            window_id=window_id,
+            chrome_tab_id=chrome_tab_id,
+            reuse_existing=reuse_existing,
+            require_extension=require_extension,
         )
+        if self._can_run_direct_mv3(mode=mode, tab_id=tab_id):
+            return fn()
+        return self._run_sync(fn)
 
     def _extension_diagnostic_error(self) -> str:
         ext_dir = Path(__file__).resolve().parents[2] / "extension"
         port_note = ""
         if self._ext_bridge.port != self._ext_bridge.preferred_port:
             reason = self._ext_bridge.port_fallback_reason or "port in use"
-            port_note = f" (daemon bound to fallback port {self._ext_bridge.port} because {self._ext_bridge.preferred_port} was busy: {reason})"
+            port_note = (
+                f" (port {self._ext_bridge.preferred_port} already held by warm daemon: {reason}; "
+                f"this instance fell back to port {self._ext_bridge.port} — route calls through the warm daemon socket)"
+            )
         return (
             f"MV3 extension not connected on ws://127.0.0.1:{self._ext_bridge.preferred_port}/ext{port_note}; "
             f"load {ext_dir} in Chrome or pass mode='headless'"
@@ -4165,13 +4488,15 @@ class BrowserEngine:
         schedule_preview: bool = True,
     ) -> BrowserTabSession:
         self._cancel_pending_preview()
-        if tab_id:
-            tid = tab_id
-        else:
-            while f"t{self._next_tab_num}" in self._tabs:
+        with self._state_lock:
+            if tab_id:
+                tid = tab_id
+            else:
+                while f"t{self._next_tab_num}" in self._tabs:
+                    self._next_tab_num += 1
+                tid = f"t{self._next_tab_num}"
                 self._next_tab_num += 1
-            tid = f"t{self._next_tab_num}"
-        effective_url = url or self._tab_last_urls.get(tid) or "about:blank"
+            effective_url = url or self._tab_last_urls.get(tid) or "about:blank"
         must_use_ext = (
             mode in ("extension", "chrome-extension", "live")
             or require_extension
@@ -4276,10 +4601,13 @@ class BrowserEngine:
                     is_extension=True,
                 )
                 sess_holder.append(sess)
-                self._tabs[tid] = sess
-                self._tab_last_urls[tid] = actual_url
-                if actual_title:
-                    self._tab_last_titles[tid] = actual_title
+                with self._state_lock:
+                    if tab_id:
+                        self._next_tab_num += 1
+                    self._tabs[tid] = sess
+                    self._tab_last_urls[tid] = actual_url
+                    if actual_title:
+                        self._tab_last_titles[tid] = actual_title
                 if isinstance(ext_res.get("preview"), dict):
                     self._apply_inline_preview(sess, ext_res["preview"], url_hint=actual_url, push_frame=True)
                 sess.ensure_runtime()
@@ -4288,40 +4616,49 @@ class BrowserEngine:
                 if USER_STOPPED_ERROR in str(exc) or is_user_stopped() or must_use_ext:
                     raise
 
-        self._ensure_browser_inner(mode=mode)
-        self._next_tab_num += 1
-        page = self._context.new_page()
-        cdp = self._context.new_cdp_session(page)
-        norm_eff_url = _normalize_nav_url(effective_url) if effective_url and effective_url != "about:blank" else "about:blank"
-        sess = BrowserTabSession(
-            engine=self,
-            tab_id=tid,
-            page=page,
-            cdp_session=cdp,
-            group_name=session_name,
-            group_color=group_color,
-            last_url=norm_eff_url,
-            is_extension=False,
-        )
-        sess.enable_background_focus_emulation()
-        sess.start_playwright_screencast()
-        self._tabs[tid] = sess
+        def _create_pw_session() -> BrowserTabSession:
+            self._ensure_browser_inner(mode=mode)
+            if tab_id:
+                with self._state_lock:
+                    self._next_tab_num += 1
+            page = self._context.new_page()
+            cdp = self._context.new_cdp_session(page)
+            norm_eff_url = _normalize_nav_url(effective_url) if effective_url and effective_url != "about:blank" else "about:blank"
+            pw_sess = BrowserTabSession(
+                engine=self,
+                tab_id=tid,
+                page=page,
+                cdp_session=cdp,
+                group_name=session_name,
+                group_color=group_color,
+                last_url=norm_eff_url,
+                is_extension=False,
+            )
+            pw_sess.enable_background_focus_emulation()
+            pw_sess.start_playwright_screencast()
+            with self._state_lock:
+                self._tabs[tid] = pw_sess
 
-        if norm_eff_url and norm_eff_url != "about:blank":
-            page.goto(norm_eff_url, wait_until="domcontentloaded", timeout=15000)
-            sess.last_url = page.url or norm_eff_url
-            self._tab_last_urls[tid] = sess.last_url
-            self._try_assign_chrome_tab_group(page.url, session_name, color=group_color)
-            if schedule_preview:
-                self._schedule_async_preview(
-                    sess,
-                    target=_short_menubar_target(page.url),
-                    op="goto",
-                    cur_info=None,
-                    is_headless=(not self._is_cdp_chrome),
-                )
-        sess.ensure_runtime()
-        return sess
+            if norm_eff_url and norm_eff_url != "about:blank":
+                page.goto(norm_eff_url, wait_until="domcontentloaded", timeout=15000)
+                pw_sess.last_url = page.url or norm_eff_url
+                with self._state_lock:
+                    self._tab_last_urls[tid] = pw_sess.last_url
+                self._try_assign_chrome_tab_group(page.url, session_name, color=group_color)
+                if schedule_preview:
+                    self._schedule_async_preview(
+                        pw_sess,
+                        target=_short_menubar_target(page.url),
+                        op="goto",
+                        cur_info=None,
+                        is_headless=(not self._is_cdp_chrome),
+                    )
+            pw_sess.ensure_runtime()
+            return pw_sess
+
+        if threading.get_ident() != self._worker_tid:
+            return self._run_sync(_create_pw_session)
+        return _create_pw_session()
 
     def attach_existing_tab(
         self,
@@ -4334,17 +4671,18 @@ class BrowserEngine:
         session_name: str | None = None,
         group_color: str = "blue",
     ) -> BrowserTabSession | None:
-        return self._run_sync(
-            lambda: self._attach_existing_tab_inner(
-                tab_id=tab_id,
-                chrome_tab_id=chrome_tab_id,
-                url_pattern=url_pattern,
-                window=window,
-                window_id=window_id,
-                session_name=session_name,
-                group_color=group_color,
-            )
+        fn = lambda: self._attach_existing_tab_inner(
+            tab_id=tab_id,
+            chrome_tab_id=chrome_tab_id,
+            url_pattern=url_pattern,
+            window=window,
+            window_id=window_id,
+            session_name=session_name,
+            group_color=group_color,
         )
+        if self._can_run_direct_mv3(tab_id=tab_id):
+            return fn()
+        return self._run_sync(fn)
 
     def _attach_existing_tab_inner(
         self,
@@ -4423,13 +4761,14 @@ class BrowserEngine:
                     self._tab_last_titles[existing.tab_id] = actual_title
                 return existing
 
-        if tab_id:
-            tid = tab_id
-        else:
-            while f"t{self._next_tab_num}" in self._tabs:
-                self._next_tab_num += 1
-            tid = f"t{self._next_tab_num}"
-        self._next_tab_num += 1
+        with self._state_lock:
+            if tab_id:
+                tid = tab_id
+            else:
+                while f"t{self._next_tab_num}" in self._tabs:
+                    self._next_tab_num += 1
+                tid = f"t{self._next_tab_num}"
+            self._next_tab_num += 1
         eff_group = str(ext_res.get("groupTitle") or session_name or "🤖 Agent")
         sess_holder: list[BrowserTabSession] = []
 
@@ -4458,10 +4797,11 @@ class BrowserEngine:
             is_extension=True,
         )
         sess_holder.append(sess)
-        self._tabs[tid] = sess
-        self._tab_last_urls[tid] = actual_url
-        if actual_title:
-            self._tab_last_titles[tid] = actual_title
+        with self._state_lock:
+            self._tabs[tid] = sess
+            self._tab_last_urls[tid] = actual_url
+            if actual_title:
+                self._tab_last_titles[tid] = actual_title
         if isinstance(ext_res.get("preview"), dict):
             self._apply_inline_preview(sess, ext_res["preview"], url_hint=actual_url, push_frame=True)
         return sess
@@ -4678,6 +5018,12 @@ class BrowserEngine:
             ran_any = True
             esc["handled"] = True
             try:
+                cur_host = (urlparse(_normalize_nav_url(sess.last_url)).hostname or "").lower()
+                if cur_host:
+                    self._strict_csp_hosts.add(cur_host)
+            except Exception:
+                pass
+            try:
                 has_val, val = self._eval_step_via_cdp(sess, str(esc.get("code") or ""))
                 if has_val:
                     eval_outs.append(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
@@ -4869,6 +5215,7 @@ class BrowserEngine:
             raise RuntimeError(USER_STOPPED_ERROR)
 
         def _run_once(force_reattach: bool = False) -> Any:
+            t0 = time.perf_counter()
             agent_id = str(agent or "default").strip() or "default"
             default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
             tab_id = str(session or default_tab)
@@ -4906,36 +5253,143 @@ class BrowserEngine:
                 )
             else:
                 sess = self._tabs[tab_id]
-            sess.enable_background_focus_emulation()
-            sess.ensure_runtime()
-            step_item = dict(step_override) if step_override is not None else {"op": "eval", "code": str(code)}
-            res = self._eval_batch_handling_navigation(
-                sess,
-                {
-                    "agent": agent_id,
-                    "steps": [step_item],
-                    "settle": False,
-                    "skipSnapshot": True,
-                    "returnRawEval": True,
-                },
-                tab_id=tab_id,
-            )
-            self._handle_eval_escalations(
-                sess,
-                res,
-                agent_id=agent_id,
-                skip_snapshot=True,
-            )
-            errs = res.get("errors") or []
-            if errs:
-                raise RuntimeError("; ".join(str(e) for e in errs))
-            raw_vals = res.get("rawEvalValues")
-            if isinstance(raw_vals, list) and raw_vals:
-                return raw_vals[-1]
-            eval_outs = res.get("evalOutputs")
-            if isinstance(eval_outs, list) and eval_outs:
-                return eval_outs[-1]
-            return None
+            t_att_ms = (time.perf_counter() - t0) * 1000.0
+            with sess._exec_lock:
+                sess.enable_background_focus_emulation()
+                sess.ensure_runtime()
+                step_item = normalize_step_dict(dict(step_override)) if step_override is not None else {"op": "eval", "code": str(code)}
+                op_name = str(step_item.get("op") or "eval").lower()
+                cur_host = ""
+                try:
+                    cur_host = (urlparse(_normalize_nav_url(sess.last_url)).hostname or "").lower()
+                except Exception:
+                    pass
+                bridge_kind = "mv3" if sess.is_extension else ("cdp" if self._is_cdp_chrome else "playwright")
+                if op_name in ("eval", "evaluate") and cur_host and cur_host in self._strict_csp_hosts:
+                    t_esc0 = time.perf_counter()
+                    try:
+                        has_val, val = self._eval_step_via_cdp(sess, str(step_item.get("code") or code))
+                        esc_ms = (time.perf_counter() - t_esc0) * 1000.0
+                        out_val = val if has_val else None
+                        out_str = "" if out_val is None else (out_val if isinstance(out_val, str) else json.dumps(out_val, ensure_ascii=False))
+                        record_perf_event(
+                            {
+                                "surface": "web",
+                                "bridge": bridge_kind,
+                                "agent": agent_id,
+                                "session": sess.tab_id,
+                                "target": sanitize_url_target(sess.last_url),
+                                "ops": [op_name],
+                                "step_count": 1,
+                                "els": 0,
+                                "mode_out": "unchanged",
+                                "out_chars": len(out_str),
+                                "est_tokens": max(1, (len(out_str) + 3) // 4) if out_str else 1,
+                                "escalations": ["eval_csp_cached"],
+                                "error_count": 0,
+                                "errors": [],
+                                "timings_ms": {
+                                    "total": round((time.perf_counter() - t0) * 1000.0, 2),
+                                    "tab_attach": round(t_att_ms, 2),
+                                    "bridge_overhead": 0.0,
+                                    "in_page_exec": 0.0,
+                                    "in_page_settle": 0.0,
+                                    "in_page_snap": 0.0,
+                                    "escalation": round(esc_ms, 2),
+                                    "ocr": 0.0,
+                                },
+                            }
+                        )
+                        return out_val
+                    except Exception as csp_exc:
+                        record_perf_event(
+                            {
+                                "surface": "web",
+                                "bridge": bridge_kind,
+                                "agent": agent_id,
+                                "session": sess.tab_id,
+                                "target": sanitize_url_target(sess.last_url),
+                                "ops": [op_name],
+                                "step_count": 1,
+                                "escalations": ["eval_csp_cached"],
+                                "error_count": 1,
+                                "errors": [sanitize_error(f"step 1 (eval): {csp_exc}")],
+                                "timings_ms": {"total": round((time.perf_counter() - t0) * 1000.0, 2)},
+                            }
+                        )
+                        raise RuntimeError(f"step 1 (eval): {csp_exc}") from csp_exc
+
+                t_ip0 = time.perf_counter()
+                res = self._eval_batch_handling_navigation(
+                    sess,
+                    {
+                        "agent": agent_id,
+                        "steps": [step_item],
+                        "settle": False,
+                        "skipSnapshot": True,
+                        "returnRawEval": True,
+                    },
+                    tab_id=tab_id,
+                )
+                ip_wall_ms = (time.perf_counter() - t_ip0) * 1000.0
+                t_esc0 = time.perf_counter()
+                self._handle_eval_escalations(
+                    sess,
+                    res,
+                    agent_id=agent_id,
+                    skip_snapshot=True,
+                )
+                esc_ms = (time.perf_counter() - t_esc0) * 1000.0
+                errs = res.get("errors") or []
+                raw_vals = res.get("rawEvalValues")
+                eval_outs = res.get("evalOutputs")
+                ret_val: Any = None
+                if isinstance(raw_vals, list) and raw_vals:
+                    ret_val = raw_vals[-1]
+                elif isinstance(eval_outs, list) and eval_outs:
+                    ret_val = eval_outs[-1]
+                out_str = "" if ret_val is None else (ret_val if isinstance(ret_val, str) else json.dumps(ret_val, ensure_ascii=False))
+                tm = res.get("timings") if isinstance(res.get("timings"), dict) else {}
+                exec_ms = float(tm.get("execMs") or 0.0)
+                tot_js_ms = float(tm.get("totalInPageMs") or 0.0)
+                nav_w_ms = float(res.get("navWaitMs") or 0.0)
+                escs_logged = [
+                    str(e["reason"])
+                    for e in (res.get("escalations") or [])
+                    if isinstance(e, dict) and e.get("reason")
+                ]
+                record_perf_event(
+                    {
+                        "surface": "web",
+                        "bridge": bridge_kind,
+                        "agent": agent_id,
+                        "session": sess.tab_id,
+                        "target": sanitize_url_target(sess.last_url),
+                        "ops": [op_name],
+                        "step_count": 1,
+                        "els": 0,
+                        "mode_out": "unchanged",
+                        "out_chars": len(out_str),
+                        "est_tokens": max(1, (len(out_str) + 3) // 4) if out_str else 1,
+                        "escalations": escs_logged,
+                        "error_count": len(errs),
+                        "errors": [sanitize_error(e) for e in errs[:3]],
+                        "timings_ms": {
+                            "total": round((time.perf_counter() - t0) * 1000.0, 2),
+                            "tab_attach": round(t_att_ms, 2),
+                            "bridge_overhead": round(max(0.0, ip_wall_ms - tot_js_ms - nav_w_ms), 2),
+                            "nav_wait": round(nav_w_ms, 2),
+                            "in_page_exec": round(exec_ms, 2),
+                            "in_page_settle": 0.0,
+                            "in_page_snap": 0.0,
+                            "escalation": round(esc_ms, 2),
+                            "ocr": 0.0,
+                        },
+                    }
+                )
+                if errs:
+                    raise RuntimeError("; ".join(str(e) for e in errs))
+                return ret_val
 
         def _run() -> Any:
             try:
@@ -4945,6 +5399,7 @@ class BrowserEngine:
                 if any(
                     tok in msg
                     for tok in (
+                        "No tab with id",
                         "No tab with given id",
                         "No target with given id",
                         "Tab not found",
@@ -4956,10 +5411,15 @@ class BrowserEngine:
                     agent_id = str(agent or "default").strip() or "default"
                     default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
                     tab_id = str(session or default_tab)
-                    self._tabs.pop(tab_id, None)
+                    with self._state_lock:
+                        self._tabs.pop(tab_id, None)
                     return _run_once(True)
                 raise
 
+        eff_agent = str(agent or "default").strip() or "default"
+        eff_tid = str(session or ("t1" if eff_agent == "default" else f"{eff_agent}:t1"))
+        if self._can_run_direct_mv3(mode=mode, tab_id=eff_tid):
+            return _run()
         return self._run_sync(_run)
 
     def screenshot_tab(
@@ -4980,6 +5440,7 @@ class BrowserEngine:
             raise RuntimeError(USER_STOPPED_ERROR)
 
         def _capture() -> str:
+            t0 = time.perf_counter()
             agent_id = str(agent or "default").strip() or "default"
             default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
             tab_id = str(session or default_tab)
@@ -4998,9 +5459,33 @@ class BrowserEngine:
                     reattach=tab_id not in self._tab_last_urls,
                     schedule_preview=False,
                 )
-            saved_path, _, _ = sess.capture_screenshot(path=path, full_page=full_page)
+            with sess._exec_lock:
+                saved_path, _, _ = sess.capture_screenshot(path=path, full_page=full_page)
+            bridge_kind = "mv3" if sess.is_extension else ("cdp" if self._is_cdp_chrome else "playwright")
+            record_perf_event(
+                {
+                    "surface": "web",
+                    "bridge": bridge_kind,
+                    "agent": agent_id,
+                    "session": sess.tab_id,
+                    "target": sanitize_url_target(sess.last_url),
+                    "ops": ["screenshot"],
+                    "step_count": 1,
+                    "els": 0,
+                    "mode_out": "unchanged",
+                    "out_chars": len(saved_path),
+                    "est_tokens": max(1, (len(saved_path) + 3) // 4),
+                    "error_count": 0,
+                    "errors": [],
+                    "timings_ms": {"total": round((time.perf_counter() - t0) * 1000.0, 2)},
+                }
+            )
             return saved_path
 
+        eff_agent = str(agent or "default").strip() or "default"
+        eff_tid = str(session or ("t1" if eff_agent == "default" else f"{eff_agent}:t1"))
+        if self._can_run_direct_mv3(mode=mode, tab_id=eff_tid):
+            return _capture()
         return self._run_sync(_capture)
 
     def get_tab_errors(self, tab_id: str, *, clear: bool = False) -> list[dict[str, Any]]:
@@ -5051,17 +5536,50 @@ class BrowserEngine:
                     sess._raw_page.evaluate("() => { window.dispatchEvent(new Event('resize')); }")
                 except Exception:
                     pass
-            return {
+            out_audit = {
                 "clean": total == 0,
                 "issueCount": total,
                 "widths": by_width,
             }
+            bridge_kind = "mv3" if sess.is_extension else ("cdp" if self._is_cdp_chrome else "playwright")
+            out_json = json.dumps(out_audit)
+            record_perf_event(
+                {
+                    "surface": "web",
+                    "bridge": bridge_kind,
+                    "agent": "default",
+                    "session": sess.tab_id,
+                    "target": sanitize_url_target(sess.last_url),
+                    "ops": ["layoutaudit"],
+                    "step_count": len(target_widths),
+                    "els": total,
+                    "mode_out": "unchanged",
+                    "out_chars": len(out_json),
+                    "est_tokens": max(1, (len(out_json) + 3) // 4),
+                    "error_count": 0,
+                    "errors": [],
+                    "timings_ms": {"total": round((time.perf_counter() - t_aud0) * 1000.0, 2)},
+                }
+            )
+            return out_audit
 
+        t_aud0 = time.perf_counter()
+        if self._can_run_direct_mv3(tab_id=tab_id):
+            return _audit()
         return self._run_sync(_audit)
 
     def execute_batch(self, req: dict[str, Any]) -> str:
         if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension", "listTabs")) and is_user_stopped():
             return USER_STOPPED_ERROR
+        if req.get("bridgeStatus") or req.get("reloadExtension"):
+            return self._execute_batch_with_retry(req)
+        if not req.get("reset") and not req.get("listTabs"):
+            agent_id = str(req.get("agent") or req.get("cursor") or "default").strip() or "default"
+            default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
+            tab_id = str(req.get("session") or req.get("tab") or default_tab)
+            mode = str(req.get("mode") or "chrome")
+            if self._can_run_direct_mv3(mode=mode, tab_id=tab_id):
+                return self._execute_batch_with_retry(req)
         return self._run_sync(lambda: self._execute_batch_with_retry(req))
 
     def _execute_batch_with_retry(self, req: dict[str, Any]) -> str:
@@ -5191,7 +5709,10 @@ class BrowserEngine:
         chrome_tab_id = int(req["chromeTabId"]) if req.get("chromeTabId") is not None else None
         reuse_existing = bool(req.get("reuseExisting"))
         url = req.get("url")
-        steps = list(req.get("steps") or [])
+        steps = [
+            normalize_step_dict(s) if isinstance(s, dict) else s
+            for s in (req.get("steps") or [])
+        ]
 
         if any((s.get("op") or s.get("action")) == "close" for s in steps) and len(steps) == 1:
             return self._close_tab_inner(tab_id)
@@ -5360,11 +5881,43 @@ class BrowserEngine:
                     sess._documented_agents.clear()
                     self._last_tab_steps.pop(tab_id, None)
 
+        sess._exec_lock.acquire()
+        try:
+            return self._execute_batch_session(
+                sess=sess,
+                req=req,
+                t0=t0,
+                agent_id=agent_id,
+                tab_id=tab_id,
+                mode=mode,
+                require_ext=require_ext,
+                steps=steps,
+                mb_op=mb_op,
+                done_payload=done_payload,
+            )
+        finally:
+            sess._exec_lock.release()
+
+    def _execute_batch_session(
+        self,
+        *,
+        sess: BrowserTabSession,
+        req: dict[str, Any],
+        t0: float,
+        agent_id: str,
+        tab_id: str,
+        mode: str,
+        require_ext: bool,
+        steps: list[dict[str, Any]],
+        mb_op: str,
+        done_payload: dict[str, Any],
+    ) -> str:
         sess.enable_background_focus_emulation()
         sess.start_playwright_screencast()
         sess.ensure_runtime()
         tab_attach_ms = (time.perf_counter() - t0) * 1000.0
         in_page_wall_ms = 0.0
+        nav_wait_ms = 0.0
         in_page_exec_ms = 0.0
         in_page_settle_ms = 0.0
         in_page_snap_ms = 0.0
@@ -5374,9 +5927,10 @@ class BrowserEngine:
         all_escalations: list[str] = []
 
         def _accum_in_page(r: Any, dt_ms: float) -> None:
-            nonlocal in_page_wall_ms, in_page_exec_ms, in_page_settle_ms, in_page_snap_ms, in_page_total_js_ms
+            nonlocal in_page_wall_ms, nav_wait_ms, in_page_exec_ms, in_page_settle_ms, in_page_snap_ms, in_page_total_js_ms
             in_page_wall_ms += dt_ms
             if isinstance(r, dict):
+                nav_wait_ms += float(r.get("navWaitMs") or 0.0)
                 tm = r.get("timings")
                 if isinstance(tm, dict):
                     in_page_exec_ms += float(tm.get("execMs") or 0.0)
@@ -5896,9 +6450,19 @@ class BrowserEngine:
                     out.append(f"! layout_issues({len(layout_issues)}): {l_prev}")
             else:
                 sess._last_layout_sig = ""
+        any_eval_truncated = False
         if res.get("evalOutputs"):
-            for ev in res["evalOutputs"]:
-                out.append(f"> {_format_eval_output(ev)}")
+            eval_max_overrides = [
+                int(s["maxChars"]) if isinstance(s, dict) and s.get("maxChars") is not None else None
+                for s in active_steps
+                if isinstance(s, dict) and str(s.get("op") or s.get("action") or "").lower() in ("eval", "evaluate")
+            ]
+            for idx_ev, ev in enumerate(res["evalOutputs"]):
+                ov = eval_max_overrides[idx_ev] if idx_ev < len(eval_max_overrides) else None
+                fmt_ev, was_trunc = _format_eval_output_with_flag(ev, max_chars_override=ov)
+                if was_trunc:
+                    any_eval_truncated = True
+                out.append(f"> {fmt_ev}")
         out.extend(res.get("lines") or [])
         final_out = "\n".join(out)
 
@@ -5911,40 +6475,42 @@ class BrowserEngine:
             mode_out = "snapshot"
 
         bridge_kind = "mv3" if sess.is_extension else ("cdp" if self._is_cdp_chrome else "playwright")
-        bridge_overhead_ms = max(0.0, in_page_wall_ms - in_page_total_js_ms)
+        bridge_overhead_ms = max(0.0, in_page_wall_ms - in_page_total_js_ms - nav_wait_ms)
         errs_list = res.get("errors") or []
-        record_perf_event(
-            {
-                "surface": "web",
-                "bridge": bridge_kind,
-                "agent": agent_id,
-                "session": sess.tab_id,
-                "target": sanitize_url_target(sess.last_url),
-                "ops": [
-                    str(s.get("op") or s.get("action") or "").lower()
-                    for s in active_steps
-                    if (s.get("op") or s.get("action"))
-                ],
-                "step_count": len(active_steps),
-                "els": int(res.get("count") or 0),
-                "mode_out": mode_out,
-                "out_chars": len(final_out),
-                "est_tokens": max(1, (len(final_out) + 3) // 4),
-                "escalations": all_escalations,
-                "error_count": len(errs_list),
-                "errors": [sanitize_error(e) for e in errs_list[:3]],
-                "timings_ms": {
-                    "total": round(elapsed_ms, 2),
-                    "tab_attach": round(tab_attach_ms, 2),
-                    "bridge_overhead": round(bridge_overhead_ms, 2),
-                    "in_page_exec": round(in_page_exec_ms, 2),
-                    "in_page_settle": round(in_page_settle_ms, 2),
-                    "in_page_snap": round(in_page_snap_ms, 2),
-                    "escalation": round(escalation_ms, 2),
-                    "ocr": round(ocr_ms, 2),
-                },
-            }
-        )
+        perf_payload: dict[str, Any] = {
+            "surface": "web",
+            "bridge": bridge_kind,
+            "agent": agent_id,
+            "session": sess.tab_id,
+            "target": sanitize_url_target(sess.last_url),
+            "ops": [
+                str(s.get("op") or s.get("action") or "").lower()
+                for s in active_steps
+                if (s.get("op") or s.get("action"))
+            ],
+            "step_count": len(active_steps),
+            "els": int(res.get("count") or 0),
+            "mode_out": mode_out,
+            "out_chars": len(final_out),
+            "est_tokens": max(1, (len(final_out) + 3) // 4),
+            "escalations": all_escalations,
+            "error_count": len(errs_list),
+            "errors": [sanitize_error(e) for e in errs_list[:3]],
+            "timings_ms": {
+                "total": round(elapsed_ms, 2),
+                "tab_attach": round(tab_attach_ms, 2),
+                "bridge_overhead": round(bridge_overhead_ms, 2),
+                "nav_wait": round(nav_wait_ms, 2),
+                "in_page_exec": round(in_page_exec_ms, 2),
+                "in_page_settle": round(in_page_settle_ms, 2),
+                "in_page_snap": round(in_page_snap_ms, 2),
+                "escalation": round(escalation_ms, 2),
+                "ocr": round(ocr_ms, 2),
+            },
+        }
+        if any_eval_truncated:
+            perf_payload["truncated_eval"] = True
+        record_perf_event(perf_payload)
         is_headless_tab = not sess.is_extension and not self._is_cdp_chrome
         preview_file: str | None = sess.last_preview_path
         if _preview_enabled() and sess in self._tabs.values():

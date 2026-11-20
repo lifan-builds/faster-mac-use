@@ -2905,6 +2905,349 @@ setInterval(() => {{}}, 1000);
             self.assertEqual(data["titleMethod"], "Portal Login")
             self.assertEqual(data["titleProp"], "Portal Login")
 
+    def test_33_parallel_mv3_upload_fallback_illegal_invocation_bot_fastfail_and_telemetry(self) -> None:
+        """Verify parallel MV3 non-blocking dispatch, DOMContentLoaded settlement, inline upload fallback, setNativeValue guards, bot fast-fail, shorthand steps, and session log clear/correlation."""
+        from fmu.cli import _estimate_request_wait_s
+        from fmu.telemetry import clear_perf_logs, flush_telemetry, load_perf_events
+
+        # 1. CLI wait-budget estimator covers parallel[] and code waitFor()
+        self.assertGreaterEqual(
+            _estimate_request_wait_s({"parallel": [{"steps": [{"op": "waitFor", "text": "Cathay", "timeoutMs": 25000}]}]}),
+            40.0,
+        )
+        self.assertGreaterEqual(
+            _estimate_request_wait_s({"code": 'await tab.waitFor("Emirates", 20000);'}),
+            20.0,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="fmu-audit33-") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            tmp_logs = tmp_path / "logs"
+            tmp_logs.mkdir(parents=True, exist_ok=True)
+            prev_log_dir = os.environ.get("FMU_LOG_DIR")
+            os.environ["FMU_LOG_DIR"] = str(tmp_logs)
+            try:
+                # 2. setNativeValue Illegal invocation guards (<form>, <label>, Shadow DOM, <select>, custom role=textbox) + shorthand steps + eval cap + bot fast-fail
+                form_page = tmp_path / "forms.html"
+                form_page.write_text(
+                    """<!doctype html><html><head><title>Flight Search Results</title></head><body>
+<main>
+  <h1>No matching nonstop flights</h1>
+  <form id="pypi-search" role="search" aria-label="Search PyPI">
+    <input type="submit" value="Go" />
+    <input id="real-q" type="search" name="q" value="" />
+  </form>
+  <label id="email-lbl" for="login-email">Account Email</label>
+  <input id="login-email" type="email" value="" />
+  <div id="shadow-field" role="textbox" aria-label="Shadow Promo"></div>
+  <select id="cabin-sel" aria-label="Cabin Class">
+    <option value="Y">Economy</option>
+    <option value="J">Business</option>
+  </select>
+  <div id="custom-box" role="textbox" aria-label="Custom Widget" tabindex="0"></div>
+  <button id="go-captcha" type="button" onclick="history.replaceState(null, '', '/captcha-v2/index.html')">Trigger Captcha</button>
+</main>
+<script>
+  const host = document.getElementById("shadow-field");
+  const sr = host.attachShadow({ mode: "open" });
+  const inp = document.createElement("input");
+  inp.type = "text";
+  sr.appendChild(inp);
+  window.__shadowInp = inp;
+  window.__customEvents = [];
+  document.getElementById("custom-box").addEventListener("input", (e) => {
+    window.__customEvents.push(e.data || "");
+  });
+</script>
+</body></html>""",
+                    encoding="utf-8",
+                )
+                form_url = form_page.resolve().as_uri()
+                fill_out = self.rt.execute(
+                    {
+                        "mode": "headless",
+                        "url": form_url,
+                        "steps": [
+                            {"op": "fill", "selector": "#pypi-search", "value": "faster-mac-use"},
+                            {"op": "fill", "selector": "#email-lbl", "value": "user@example.com"},
+                            {"op": "fill", "selector": "#shadow-field", "value": "SAVE20"},
+                            {"op": "fill", "selector": "#cabin-sel", "value": "Business"},
+                            {"op": "fill", "selector": "#custom-box", "value": "custom-ok"},
+                            {"eval": "JSON.stringify({q: document.getElementById('real-q').value, e: document.getElementById('login-email').value, s: window.__shadowInp.value, c: document.getElementById('cabin-sel').value, x: window.__customEvents})"},
+                        ],
+                    }
+                )
+                self.assertNotIn("Illegal invocation", fill_out)
+                self.assertNotIn("! errors:", fill_out)
+                self.assertIn('"q":"faster-mac-use"', fill_out)
+                self.assertIn('"e":"user@example.com"', fill_out)
+                self.assertIn('"s":"SAVE20"', fill_out)
+                self.assertIn('"c":"J"', fill_out)
+                self.assertIn('"custom-ok"', fill_out)
+
+                # Default 16000-char eval cap vs per-step maxChars override
+                cap_out = self.rt.execute(
+                    {
+                        "code": (
+                            'const tab = await cua.getTab();\n'
+                            'const a = await tab.eval("\'A\'.repeat(20000)").diff();\n'
+                            'const b = await tab.eval("\'B\'.repeat(20000)", 22000).diff();\n'
+                            'const v = await tab.evalValue("123 + 456");\n'
+                            'return JSON.stringify({ truncA: a.includes("[truncated: showing 16000 of 20000 chars"), truncB: b.includes("[truncated:"), notB: !b.includes("[truncated:"), v });'
+                        )
+                    }
+                )
+                cap_data = json.loads(cap_out.splitlines()[-1])
+                self.assertTrue(cap_data["truncA"])
+                self.assertFalse(cap_data["truncB"])
+                self.assertTrue(cap_data["notB"])
+                self.assertEqual(cap_data["v"], 579)
+
+                # Rich waitFor timeout context (title + visible heading)
+                t_ctx_out = self.rt.execute(
+                    {
+                        "mode": "headless",
+                        "steps": [{"waitFor": {"text": "Cathay Pacific", "timeoutMs": 90}}],
+                    }
+                )
+                self.assertIn('timed out after 90ms waiting for text="Cathay Pacific"', t_ctx_out)
+                self.assertIn('title="Flight Search Results"', t_ctx_out)
+                self.assertIn('heading="No matching nonstop flights"', t_ctx_out)
+
+                # Fast-fail bot/CAPTCHA interstitial detection (< 600ms instead of 8000ms)
+                http_captcha_out_t0 = time.perf_counter()
+                bot_out = self.rt.execute(
+                    {
+                        "mode": "headless",
+                        "url": f"{self.server.base_url}/pricing",
+                        "steps": [
+                            {"op": "eval", "code": "history.replaceState(null, '', '/captcha-v2/index.html')"},
+                            {"op": "waitFor", "text": "Emirates", "timeoutMs": 8000},
+                        ],
+                    }
+                )
+                bot_elapsed_s = time.perf_counter() - http_captcha_out_t0
+                self.assertLess(bot_elapsed_s, 1.5)
+                self.assertIn("bot/CAPTCHA interstitial detected", bot_out)
+
+                # Shorthand steps on macOS AX (Calculator)
+                ax_short_out = self.rt.execute(
+                    {
+                        "app": "Calculator",
+                        "steps": [{"key": "escape"}, {"wait": 15}],
+                    }
+                )
+                self.assertNotIn("missing 'op'", ax_short_out)
+
+                # 3. Real MV3 background.js harness: parallel concurrency, DOMContentLoaded fast-return, inline upload fallback, & strict-CSP host cache
+                self.rt.execute({"reset": True})
+                port = self.rt.browser.bridge_port
+                bg_js_src = (ROOT / "extension" / "background.js").read_text(encoding="utf-8").replace(
+                    "ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{port}/ext"
+                )
+                real_upload_file = tmp_path / "boarding_pass.txt"
+                real_upload_file.write_text("BOARDING_PASS_PAYLOAD_OK", encoding="utf-8")
+
+                mv3_harness = f"""
+const state = {{
+  evalCount: 0,
+  uploadedFiles: [],
+  tabs: new Map([
+    [701, {{ id: 701, windowId: 700, groupId: -1, title: "GF 1", url: "https://www.google.com/travel/flights?q=1", status: "complete", active: false }}],
+    [702, {{ id: 702, windowId: 700, groupId: -1, title: "GF 2", url: "https://www.google.com/travel/flights?q=2", status: "complete", active: false }}],
+    [703, {{ id: 703, windowId: 700, groupId: -1, title: "GF 3", url: "https://www.google.com/travel/flights?q=3", status: "complete", active: false }}],
+    [704, {{ id: 704, windowId: 700, groupId: -1, title: "Slow Ads Page", url: "https://slow.example.com/deals", status: "loading", pendingUrl: "", active: false }}],
+  ]),
+  nextId: 710,
+}};
+
+globalThis.chrome = {{
+  extension: {{
+    isAllowedFileSchemeAccess: async () => false,
+  }},
+  tabs: {{
+    query: async () => Array.from(state.tabs.values()),
+    get: async (tabId) => state.tabs.get(tabId) || {{ id: tabId, windowId: 700, status: "complete", url: "https://x.com/compose/post" }},
+    create: async (opts) => {{
+      const u = String(opts.url || "");
+      if (u.includes("slow.example.com")) return state.tabs.get(704);
+      const id = state.nextId++;
+      const t = {{ id, windowId: 700, groupId: -1, title: "Tab " + id, url: u, status: "complete", active: false }};
+      state.tabs.set(id, t);
+      return t;
+    }},
+    update: async (tabId, opts) => {{
+      const t = state.tabs.get(tabId) || {{ id: tabId, windowId: 700, status: "complete", url: opts.url }};
+      if (opts.url) t.url = opts.url;
+      state.tabs.set(tabId, t);
+      return t;
+    }},
+    group: async () => 88,
+    onRemoved: {{ addListener: () => {{}} }},
+    onUpdated: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{
+    query: async () => [],
+    update: async (gid, opts) => ({{ id: gid, ...opts }}),
+  }},
+  windows: {{
+    getAll: async () => [{{ id: 700, focused: false, type: "normal" }}],
+  }},
+  debugger: {{
+    attach: async () => {{}},
+    sendCommand: async (target, method, params) => {{
+      if (method === "Runtime.evaluate") {{
+        const expr = String(params.expression || "");
+        if (expr.includes("document.readyState")) {{
+          return {{ result: {{ value: true }} }};
+        }}
+        if (expr.includes("new DataTransfer()")) {{
+          const m = expr.match(/atob\\(String\\(item\\.dataB64\\|\\|""\\)\\)/) || true;
+          state.uploadedFiles.push(expr);
+          return {{ result: {{ value: {{ found: true, fileCount: 1 }} }} }};
+        }}
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          if (expr.includes("SLOW_PARALLEL_OP")) {{
+            await new Promise(r => setTimeout(r, 380));
+          }}
+          const isCsp = expr.includes("CSP_HOST_TEST");
+          if (isCsp) state.evalCount++;
+          return {{
+            result: {{
+              value: {{
+                url: target.tabId === 704 ? "https://slow.example.com/deals" : "https://x.com/compose/post",
+                title: "Test Tab",
+                crc: "abcd1234",
+                seq: 1,
+                count: 1,
+                useDiff: false,
+                timings: {{ execMs: 5, settleMs: 0, snapMs: 2, totalInPageMs: 7 }},
+                errors: [],
+                evalOutputs: [],
+                escalations: isCsp ? [{{ step: 1, reason: "eval_csp", code: "return 'CSP_OK_' + (1 + 1);" }}] : [],
+                lines: ['@u1 file "Attach receipt"'],
+              }}
+            }}
+          }};
+        }}
+        if (expr.startsWith("(async () =>")) {{
+          return {{ result: {{ value: {{ __fmuEvalBox: true, hasValue: true, text: "CSP_DIRECT_OK", raw: "CSP_DIRECT_OK" }} }} }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+    onEvent: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }},
+}};
+
+{bg_js_src}
+setInterval(() => {{}}, 1000);
+"""
+                node_proc = subprocess.Popen(
+                    ["node", "-e", mv3_harness],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    self.assertTrue(self.rt.browser.ensure_bridge().wait_connected(timeout=3.0))
+
+                    # (a) Parallel MV3 tabs run concurrently (~380ms, well under 3 * 380ms = 1140ms)
+                    t_par0 = time.perf_counter()
+                    par_out = self.rt.execute(
+                        {
+                            "parallel": [
+                                {"agent": "gf1", "mode": "chrome", "url": "https://www.google.com/travel/flights?q=1", "steps": [{"op": "click", "target": "SLOW_PARALLEL_OP", "optional": True}]},
+                                {"agent": "gf2", "mode": "chrome", "url": "https://www.google.com/travel/flights?q=2", "steps": [{"op": "click", "target": "SLOW_PARALLEL_OP", "optional": True}]},
+                                {"agent": "gf3", "mode": "chrome", "url": "https://www.google.com/travel/flights?q=3", "steps": [{"op": "click", "target": "SLOW_PARALLEL_OP", "optional": True}]},
+                            ]
+                        }
+                    )
+                    par_elapsed = time.perf_counter() - t_par0
+                    self.assertIn("=== [gf1] ===", par_out)
+                    self.assertIn("=== [gf3] ===", par_out)
+                    self.assertLess(par_elapsed, 0.95, f"Expected parallel MV3 execution <0.95s, took {par_elapsed:.2f}s")
+
+                    # (b) DOMContentLoaded fast-return on status="loading" tab (<1.2s instead of 10s)
+                    t_dcl0 = time.perf_counter()
+                    dcl_out = self.rt.execute({"mode": "chrome", "url": "https://slow.example.com/deals", "session": "t_dcl"})
+                    dcl_elapsed = time.perf_counter() - t_dcl0
+                    self.assertIn("https://slow.example.com/deals", self.rt.browser._tab_last_urls.get("t_dcl", ""))
+                    self.assertLess(dcl_elapsed, 1.2, f"Expected DOMContentLoaded return <1.2s, took {dcl_elapsed:.2f}s ({dcl_out})")
+
+                    # (c) Zero-config inline DataTransfer upload when isAllowedFileSchemeAccess() === false
+                    up_ok = self.rt.execute(
+                        {
+                            "mode": "chrome",
+                            "url": "https://x.com/compose/post",
+                            "session": "t_up",
+                            "steps": [{"op": "upload", "uid": "@u1", "files": [str(real_upload_file)]}],
+                        }
+                    )
+                    self.assertNotIn('Allow access to file URLs', up_ok)
+                    self.assertNotIn("! errors:", up_ok)
+
+                    # (d) Strict-CSP host cache: 1st eval escalates (eval_csp), 2nd eval pre-routes via CDP (eval_csp_cached)
+                    csp1 = self.rt.execute(
+                        {
+                            "mode": "chrome",
+                            "session": "t_up",
+                            "steps": [{"op": "eval", "code": "const CSP_HOST_TEST = 1; return CSP_HOST_TEST;"}],
+                        }
+                    )
+                    self.assertIn("> CSP_DIRECT_OK", csp1)
+                    csp2 = self.rt.execute(
+                        {
+                            "mode": "chrome",
+                            "session": "t_up",
+                            "steps": [{"op": "eval", "code": "const CSP_SECOND = 2; return CSP_SECOND;"}],
+                        }
+                    )
+                    self.assertIn("> CSP_DIRECT_OK", csp2)
+                    val_cached = self.rt.browser.evaluate_value("return 'VAL_OK';", session="t_up", mode="chrome")
+                    self.assertEqual(val_cached, "CSP_DIRECT_OK")
+                finally:
+                    node_proc.terminate()
+                    try:
+                        node_proc.wait(timeout=2.0)
+                    except Exception:
+                        node_proc.kill()
+                    if node_proc.stdout:
+                        node_proc.stdout.close()
+                    if node_proc.stderr:
+                        node_proc.stderr.close()
+
+                # 4. Verify telemetry improvements (entrypoints, batch_id, nav_wait, truncated_eval, bot_challenge, eval_csp_cached) + clear_perf_logs
+                flush_telemetry()
+                events = load_perf_events(days=7, log_dir=tmp_logs)
+                self.assertTrue(any(e.get("entrypoint") == "repl" for e in events))
+                par_events = [e for e in events if e.get("entrypoint") == "parallel"]
+                self.assertGreaterEqual(len(par_events), 3)
+                self.assertEqual(len({e.get("batch_id") for e in par_events}), 1)
+                self.assertTrue(any(e.get("truncated_eval") is True for e in events))
+                self.assertTrue(any("bot_challenge" in (e.get("escalations") or []) for e in events))
+                self.assertTrue(any("eval_csp_cached" in (e.get("escalations") or []) for e in events))
+                self.assertTrue(any("nav_wait" in (e.get("timings_ms") or {}) for e in events if e.get("surface") == "web" and "in_page_snap" in (e.get("timings_ms") or {})))
+
+                rep_json = json.loads(self.rt.execute({"perfReport": {"days": 7, "format": "json"}}))
+                self.assertIn("parallel", rep_json["entrypoints"])
+                self.assertIn("repl", rep_json["entrypoints"])
+                self.assertGreaterEqual(rep_json["tokens"]["eval_truncations"], 1)
+
+                cleared_msg = self.rt.execute({"perfReport": {"clear": True}})
+                self.assertIn("# fmu-perf cleared=", cleared_msg)
+                self.assertEqual(len(list(tmp_logs.glob("perf-*.jsonl"))), 0)
+                self.assertEqual(clear_perf_logs(log_dir=tmp_logs), 0)
+            finally:
+                if prev_log_dir is None:
+                    os.environ.pop("FMU_LOG_DIR", None)
+                else:
+                    os.environ["FMU_LOG_DIR"] = prev_log_dir
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

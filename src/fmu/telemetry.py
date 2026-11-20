@@ -40,6 +40,20 @@ _log_queue: queue.SimpleQueue[tuple[Path | None, str | threading.Event]] = queue
 _writer_started = False
 _writer_lock = threading.Lock()
 _pruned_dirs: set[str] = set()
+_telemetry_ctx = threading.local()
+
+
+def set_telemetry_context(*, entrypoint: str | None = None, batch_id: str | None = None) -> tuple[str | None, str | None]:
+    """Attach caller entrypoint ('repl', 'parallel', 'steps') and batch_id to thread-local telemetry."""
+    prev_ep = getattr(_telemetry_ctx, "entrypoint", None)
+    prev_bid = getattr(_telemetry_ctx, "batch_id", None)
+    _telemetry_ctx.entrypoint = entrypoint
+    _telemetry_ctx.batch_id = batch_id
+    return prev_ep, prev_bid
+
+
+def reset_telemetry_context(prev: tuple[str | None, str | None]) -> None:
+    _telemetry_ctx.entrypoint, _telemetry_ctx.batch_id = prev
 
 
 def telemetry_enabled() -> bool:
@@ -205,8 +219,16 @@ def record_perf_event(event: dict[str, Any], *, sync: bool = False) -> None:
         now = datetime.now(timezone.utc)
         log_dir = get_log_dir()
         _prune_old_logs(log_dir)
+        ctx_ep = getattr(_telemetry_ctx, "entrypoint", None)
+        ctx_bid = getattr(_telemetry_ctx, "batch_id", None)
+        ctx_fields: dict[str, Any] = {}
+        if ctx_ep and "entrypoint" not in event and event.get("surface") in ("web", "app"):
+            ctx_fields["entrypoint"] = ctx_ep
+        if ctx_bid and "batch_id" not in event and event.get("surface") in ("web", "app"):
+            ctx_fields["batch_id"] = ctx_bid
         payload: dict[str, Any] = {
             "ts": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            **ctx_fields,
             **event,
         }
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -227,6 +249,23 @@ def flush_telemetry(timeout: float = 0.5) -> None:
     done = threading.Event()
     _log_queue.put_nowait((None, done))
     done.wait(timeout=max(0.05, timeout))
+
+
+def clear_perf_logs(log_dir: Path | None = None) -> int:
+    """Flush queued telemetry and remove all perf-*.jsonl session log files in log_dir."""
+    flush_telemetry()
+    base = log_dir or get_log_dir()
+    _pruned_dirs.discard(str(base))
+    if not base.is_dir():
+        return 0
+    removed = 0
+    for p in list(base.glob("perf-*.jsonl")):
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _percentile(sorted_vals: list[float], pct: float) -> float:
@@ -284,8 +323,9 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
             "log_dir": str(base),
             "total_calls": 0,
             "surfaces": {},
+            "entrypoints": {},
             "phases_avg_ms": {},
-            "tokens": {"avg": 0, "p95": 0, "max": 0, "diff_or_unchanged_ratio": 0.0},
+            "tokens": {"avg": 0, "p95": 0, "max": 0, "diff_or_unchanged_ratio": 0.0, "eval_truncations": 0},
             "cold_starts": 0,
             "error_calls": 0,
             "escalations": {},
@@ -295,6 +335,7 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
         }
 
     by_surface: dict[str, list[float]] = defaultdict(list)
+    entrypoint_counts: Counter[str] = Counter()
     phase_sums: dict[str, float] = defaultdict(float)
     phase_counts: dict[str, int] = defaultdict(int)
     target_latencies: dict[str, list[float]] = defaultdict(list)
@@ -305,6 +346,7 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
     err_counts: Counter[str] = Counter()
     cold_starts = 0
     error_calls = 0
+    eval_truncations = 0
 
     for ev in events:
         surf = str(ev.get("surface") or "unknown")
@@ -313,6 +355,12 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
         timings = ev.get("timings_ms") if isinstance(ev.get("timings_ms"), dict) else {}
         tot = float(timings.get("total", ev.get("total_ms", 0.0)) or 0.0)
         by_surface[surf_key].append(tot)
+
+        ep = str(ev.get("entrypoint") or ("steps" if surf in ("web", "app") else ""))
+        if ep:
+            entrypoint_counts[ep] += 1
+        if ev.get("truncated_eval"):
+            eval_truncations += 1
 
         for pk, pv in timings.items():
             if pk == "total":
@@ -409,7 +457,15 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
         )
     if esc_counts.get("eval_csp", 0) > 0:
         recommendations.append(
-            f"{esc_counts['eval_csp']} strict-CSP eval_csp escalations occurred — consider pre-routing known strict-CSP domains (e.g. x.com) directly to CDP Runtime.evaluate to save 1 in-page round-trip."
+            f"{esc_counts['eval_csp']} strict-CSP eval_csp escalations occurred (cached bypasses={esc_counts.get('eval_csp_cached', 0)})."
+        )
+    if esc_counts.get("bot_challenge", 0) > 0:
+        recommendations.append(
+            f"{esc_counts['bot_challenge']} bot/CAPTCHA interstitials aborted early — prefer mode='chrome' MV3 tabs over headless on anti-bot sites."
+        )
+    if eval_truncations > 0:
+        recommendations.append(
+            f"{eval_truncations} oversized eval outputs were capped at FMU_MAX_EVAL_CHARS — prefer tab.text(selector) or targeted JS projections over full-DOM dumps."
         )
     if error_calls > 0:
         recommendations.append(
@@ -425,6 +481,7 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
         "cold_starts": cold_starts,
         "error_calls": error_calls,
         "surfaces": surfaces_summary,
+        "entrypoints": dict(entrypoint_counts),
         "phases_avg_ms": phases_avg,
         "modes": dict(mode_counts),
         "tokens": {
@@ -432,6 +489,7 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
             "p95": int(_percentile(sorted_toks, 95)) if sorted_toks else 0,
             "max": int(sorted_toks[-1]) if sorted_toks else 0,
             "diff_or_unchanged_ratio": diff_ratio,
+            "eval_truncations": eval_truncations,
         },
         "escalations": dict(esc_counts),
         "slowest_targets": slowest_targets[:8],
@@ -453,9 +511,12 @@ def format_perf_report(summary: dict[str, Any], fmt: str = "markdown") -> str:
         return "\n".join(lines)
 
     tok = summary["tokens"]
+    trunc_note = f" eval_truncations={tok['eval_truncations']}" if tok.get("eval_truncations") else ""
+    ep_note = f" entrypoints={json.dumps(summary['entrypoints'])}" if summary.get("entrypoints") else ""
     lines.append(
         f"# tokens: avg={tok['avg']} p95={tok['p95']} max={tok['max']} "
-        f"compact_diff_ratio={round(tok['diff_or_unchanged_ratio'] * 100, 1)}% modes={json.dumps(summary.get('modes', {}))}"
+        f"compact_diff_ratio={round(tok['diff_or_unchanged_ratio'] * 100, 1)}% "
+        f"modes={json.dumps(summary.get('modes', {}))}{trunc_note}{ep_note}"
     )
     if summary.get("surfaces"):
         lines.append("## Latency by Surface (ms)")

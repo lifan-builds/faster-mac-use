@@ -351,7 +351,7 @@ class MacNativeEngine:
                     time.sleep(0.015)
         return False
 
-    def execute(self, req: dict[str, Any]) -> str:
+    def execute(self, req: dict[str, Any], *, _retried_tcc: bool = False) -> str:
         t0 = time.perf_counter()
         is_control = any(
             req.get(k) is not None and req.get(k) is not False
@@ -374,9 +374,14 @@ class MacNativeEngine:
         if "steps" in req and req["steps"] is not None:
             if not isinstance(req["steps"], list):
                 return "Error: 'steps' must be a JSON array of step objects"
+            from fmu.browser_engine import normalize_step_dict
+
+            norm_steps_list: list[dict[str, Any]] = []
             for idx, st in enumerate(req["steps"]):
                 if not isinstance(st, dict):
                     return f"Error: step {idx + 1} must be a JSON object"
+                norm_steps_list.append(normalize_step_dict(st))
+            req = {**req, "steps": norm_steps_list}
         was_cold = not Path(self.socket_path).exists()
         t_boot0 = time.perf_counter()
         restarted = bool(self.ensure_daemon())
@@ -418,6 +423,17 @@ class MacNativeEngine:
             out = b"".join(chunks).decode("utf-8", errors="replace").strip()
         finally:
             s.close()
+
+        if "AXIsProcessTrusted=false" in out and not was_cold and not _retried_tcc:
+            subprocess.run(
+                ["pkill", "-f", f"fmu-ax --daemon {self.socket_path}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            Path(self.socket_path).unlink(missing_ok=True)
+            self._last_bin_check_mono = 0.0
+            return self.execute(req, _retried_tcc=True)
 
         if not is_control:
             total_ms = (time.perf_counter() - t0) * 1000.0

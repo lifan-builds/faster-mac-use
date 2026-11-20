@@ -7,6 +7,7 @@ const sessionGroups = new Map();
 const sessionTabs = new Map();
 const attachedDebuggers = new Set();
 const initializedRuntimeTabs = new Map();
+const strictCspHosts = new Set();
 const pendingNetRequests = new Map();
 let cachedRuntimeJs = "";
 let cachedRuntimeVersion = "";
@@ -124,22 +125,47 @@ async function ensureAgentGroup(tabId, sessionName = "🤖 Agent", color = "blue
   return groupId;
 }
 
-async function waitForTabLoad(tabId, timeoutMs = 10000, expectedUrl = "") {
+async function waitForTabLoad(tabId, timeoutMs = 10000, expectedUrl = "", prevUrl = "") {
   if (!chrome.tabs || typeof chrome.tabs.get !== "function") return;
   const start = Date.now();
   const deadline = start + Math.max(500, timeoutMs);
   const wantRealUrl = Boolean(expectedUrl && expectedUrl !== "about:blank");
+  let lastDomProbeAt = 0;
   while (Date.now() < deadline) {
     try {
       const t = await chrome.tabs.get(tabId);
       if (!t) return;
       const curUrl = String(t.url || "");
       const pendingUrl = String(t.pendingUrl || "");
+      const elapsed = Date.now() - start;
       if (t.status === "complete" && !pendingUrl) {
-        if (!wantRealUrl || (curUrl && curUrl !== "about:blank") || (Date.now() - start > 450)) {
+        if (!wantRealUrl || (curUrl && curUrl !== "about:blank") || elapsed > 450) {
           return;
         }
       }
+        if (
+          !pendingUrl
+          && curUrl
+          && curUrl !== "about:blank"
+          && !curUrl.startsWith("chrome://")
+          && (!prevUrl || curUrl !== prevUrl || elapsed >= 400)
+          && elapsed >= 350
+          && Date.now() - lastDomProbeAt >= 150
+          && chrome.debugger
+          && typeof chrome.debugger.sendCommand === "function"
+        ) {
+          lastDomProbeAt = Date.now();
+          try {
+            await ensureDebuggerAndFocusEmulation(tabId);
+            const rs = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+              expression: "(location.href !== 'about:blank' && (document.readyState === 'interactive' || document.readyState === 'complete') && Boolean(document.body && document.body.children && document.body.children.length > 0))",
+              returnByValue: true
+            });
+            if (rs && rs.result && rs.result.value === true) {
+              return;
+            }
+          } catch (_) {}
+        }
     } catch (_) {
       return;
     }
@@ -478,7 +504,7 @@ async function waitForNavigationSettlement(tabId, prevUrl = "", timeoutMs = 1000
     }
     await new Promise(r => setTimeout(r, 20));
   }
-  await waitForTabLoad(tabId, timeoutMs);
+  await waitForTabLoad(tabId, timeoutMs, "", prevUrl);
   let finalTab = null;
   try {
     finalTab = await chrome.tabs.get(tabId);
@@ -664,8 +690,50 @@ async function evalStepCodeOnTab(tabId, rawCode) {
   return { __fmuEvalBox: true, hasValue: false, text: "", raw: null };
 }
 
-async function setInputFilesOnTab(tabId, selector, files) {
+async function injectInlineFilesOnTab(tabId, candidateSelectors, inlineFiles) {
+  const expr = `((sels, items) => {
+    let el = null;
+    for (const sel of sels) {
+      try {
+        el = document.querySelector(sel);
+        if (el) break;
+      } catch (_) {}
+    }
+    if (!el) return { found: false, fileCount: 0 };
+    const dt = new DataTransfer();
+    for (const item of items) {
+      const bin = atob(String(item.dataB64 || ""));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      dt.items.add(new File([bytes], String(item.name || "upload.bin"), {
+        type: String(item.type || "application/octet-stream"),
+        lastModified: Date.now()
+      }));
+    }
+    el.files = dt.files;
+    const count = el.files ? el.files.length : 0;
+    if (count > 0) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    return { found: true, fileCount: count };
+  })(${JSON.stringify(candidateSelectors)}, ${JSON.stringify(inlineFiles)})`;
+  return await evalInTab(tabId, expr, false);
+}
+
+async function setInputFilesOnTab(tabId, selector, files, inlineFiles = null) {
   const fileList = Array.isArray(files) ? files.map(String) : [String(files)];
+  const rawSel = selector || "input[type='file']";
+  const candidateSelectors = [];
+  if (rawSel.startsWith("[")) {
+    candidateSelectors.push(`input[type='file']${rawSel}`);
+  }
+  candidateSelectors.push(rawSel);
+  if (rawSel !== "input[type='file']") {
+    candidateSelectors.push("input[type='file']");
+  }
+  const hasInline = Array.isArray(inlineFiles) && inlineFiles.length === fileList.length && inlineFiles.length > 0;
+
   if (
     fileList.length > 0
     && chrome.extension
@@ -676,20 +744,20 @@ async function setInputFilesOnTab(tabId, selector, files) {
       allowed = await chrome.extension.isAllowedFileSchemeAccess();
     } catch (_) {}
     if (allowed === false) {
+      if (hasInline) {
+        const inlineRes = await injectInlineFilesOnTab(tabId, candidateSelectors, inlineFiles);
+        if (inlineRes && inlineRes.found && Number(inlineRes.fileCount || 0) > 0) {
+          return { ok: true, files: fileList, via: "inlineDataTransfer" };
+        }
+        if (inlineRes && !inlineRes.found) {
+          throw new Error(`No <input type="file"> found matching ${rawSel}`);
+        }
+      }
       throw new Error(UPLOAD_FILE_URL_ERR);
     }
   }
   const doc = await sendDebuggerCommand(tabId, "DOM.getDocument", { depth: 0 });
   const rootId = doc && doc.root ? doc.root.nodeId : 1;
-  const rawSel = selector || "input[type='file']";
-  const candidateSelectors = [];
-  if (rawSel.startsWith("[")) {
-    candidateSelectors.push(`input[type='file']${rawSel}`);
-  }
-  candidateSelectors.push(rawSel);
-  if (rawSel !== "input[type='file']") {
-    candidateSelectors.push("input[type='file']");
-  }
   let nodeId = 0;
   let matchedSel = "input[type='file']";
   for (const cand of candidateSelectors) {
@@ -730,6 +798,12 @@ async function setInputFilesOnTab(tabId, selector, files) {
     && checkRes !== true
     && (!checkRes || typeof checkRes !== "object" || Number(checkRes.fileCount || 0) === 0)
   ) {
+    if (hasInline) {
+      const inlineRes = await injectInlineFilesOnTab(tabId, [matchedSel, ...candidateSelectors], inlineFiles);
+      if (inlineRes && inlineRes.found && Number(inlineRes.fileCount || 0) > 0) {
+        return { ok: true, files: fileList, via: "inlineDataTransfer" };
+      }
+    }
     throw new Error(UPLOAD_FILE_URL_ERR);
   }
   return { ok: true, files: fileList };
@@ -1241,8 +1315,8 @@ async function handleRpc(msg) {
       };
     }
     if (method === "setInputFiles") {
-      const { tabId, selector = "input[type='file']", files = [] } = params;
-      const res = await setInputFilesOnTab(tabId, selector, files);
+      const { tabId, selector = "input[type='file']", files = [], inlineFiles = null } = params;
+      const res = await setInputFilesOnTab(tabId, selector, files, inlineFiles);
       return { id, result: res };
     }
     if (method === "evaluate") {
@@ -1275,13 +1349,20 @@ async function handleRpc(msg) {
       const effectiveRuntimeVer = String(runtimeVersion || cachedRuntimeVersion || "init");
       stopLiveScreencast(tabId);
 
+      let navWaitMs = 0;
+      let curTabUrl = "";
       if (chrome.tabs && typeof chrome.tabs.get === "function") {
         try {
           const curTab = await chrome.tabs.get(tabId);
-          if (curTab && (curTab.status === "loading" || curTab.pendingUrl)) {
-            initializedRuntimeTabs.delete(tabId);
-            await waitForTabLoad(tabId, 10000);
-            try { await ensureDebuggerAndFocusEmulation(tabId); } catch (_) {}
+          if (curTab) {
+            curTabUrl = String(curTab.url || curTab.pendingUrl || "");
+            if (curTab.status === "loading" || curTab.pendingUrl) {
+              initializedRuntimeTabs.delete(tabId);
+              const tNav0 = Date.now();
+              await waitForTabLoad(tabId, 6000);
+              navWaitMs += (Date.now() - tNav0);
+              try { await ensureDebuggerAndFocusEmulation(tabId); } catch (_) {}
+            }
           }
         } catch (_) {}
       }
@@ -1294,7 +1375,9 @@ async function handleRpc(msg) {
             initializedRuntimeTabs.set(tabId, effectiveRuntimeVer);
           } catch (rtErr) {
             if (!isNavigationError(rtErr)) throw rtErr;
-            const navSt = await waitForNavigationSettlement(tabId, "", 10000);
+            const tNav0 = Date.now();
+            const navSt = await waitForNavigationSettlement(tabId, "", 8000);
+            navWaitMs += (Date.now() - tNav0);
             if (!navSt.alive) throw rtErr;
             await evalInTab(tabId, effectiveRuntimeJs, false);
             initializedRuntimeTabs.set(tabId, effectiveRuntimeVer);
@@ -1327,41 +1410,96 @@ async function handleRpc(msg) {
       );
 
       const origSteps = Array.isArray(reqPayload.steps) ? reqPayload.steps : [];
-      let batchRes;
-      try {
-        batchRes = await injectAndRunBatch(reqPayload);
-      } catch (batchErr) {
-        if (!isNavigationError(batchErr)) throw batchErr;
-        initializedRuntimeTabs.delete(tabId);
-        const navSt = await waitForNavigationSettlement(tabId, "", 10000);
-        if (!navSt.alive) throw batchErr;
-        const navIdx = origSteps.findIndex(stp => {
+      const tabHost = getHostname(curTabUrl);
+      const isPureEvalOnKnownCspHost = (
+        tabHost
+        && strictCspHosts.has(tabHost)
+        && origSteps.length > 0
+        && origSteps.every(stp => {
           const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
-          return op === "click" || op === "press" || op === "key" || op === "eval" || op === "evaluate" || op === "webmcp" || op === "calltool";
-        });
-        const remSteps = navIdx >= 0
-          ? origSteps.slice(navIdx + 1).filter(stp => {
-              const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
-              return isPostNavSafeOp(op);
-            })
-          : [];
-        if (reqPayload.skipSnapshot && remSteps.length === 0) {
+          return op === "eval" || op === "evaluate";
+        })
+      );
+
+      let batchRes;
+      if (isPureEvalOnKnownCspHost) {
+        const preEvals = [];
+        const preRaws = [];
+        const preErrors = [];
+        for (let idx = 0; idx < origSteps.length; idx++) {
+          const stp = origSteps[idx] || {};
+          const code = String(stp.code ?? stp.value ?? stp.text ?? "");
+          try {
+            const evalBox = await evalStepCodeOnTab(tabId, code);
+            if (evalBox && evalBox.hasValue) preEvals.push(evalBox.text);
+            if (reqPayload && reqPayload.returnRawEval) {
+              preRaws.push(evalBox && evalBox.hasValue ? evalBox.raw : null);
+            }
+          } catch (evalErr) {
+            preErrors.push(`step ${idx + 1} (eval): ${(evalErr && evalErr.message) || evalErr}`);
+          }
+        }
+        if (reqPayload && reqPayload.skipSnapshot) {
           batchRes = {
-            didNavigate: true,
-            url: navSt.url || "",
-            title: navSt.title || "",
-            errors: [],
-            evalOutputs: [],
-            rawEvalValues: [],
-            escalations: [],
+            url: curTabUrl,
+            title: "",
+            errors: preErrors,
+            evalOutputs: preEvals,
+            rawEvalValues: preRaws,
+            escalations: [{ reason: "eval_csp_cached", handled: true }],
             canvases: [],
+            timings: { execMs: 0, settleMs: 0, snapMs: 0, totalInPageMs: 0 },
             lines: []
           };
         } else {
-          const followReq = { ...reqPayload, steps: remSteps };
-          if (!reqPayload.skipSnapshot) followReq.diff = false;
-          batchRes = await injectAndRunBatch(followReq, true);
-          if (batchRes && typeof batchRes === "object") batchRes.didNavigate = true;
+          batchRes = await injectAndRunBatch({ ...reqPayload, steps: [], hadPreSteps: true });
+          if (batchRes && typeof batchRes === "object") {
+            batchRes.errors = preErrors.concat(Array.isArray(batchRes.errors) ? batchRes.errors : []);
+            batchRes.evalOutputs = preEvals.concat(Array.isArray(batchRes.evalOutputs) ? batchRes.evalOutputs : []);
+            batchRes.rawEvalValues = preRaws.concat(Array.isArray(batchRes.rawEvalValues) ? batchRes.rawEvalValues : []);
+            batchRes.escalations = [{ reason: "eval_csp_cached", handled: true }].concat(
+              Array.isArray(batchRes.escalations) ? batchRes.escalations : []
+            );
+          }
+        }
+      } else {
+        try {
+          batchRes = await injectAndRunBatch(reqPayload);
+        } catch (batchErr) {
+          if (!isNavigationError(batchErr)) throw batchErr;
+          initializedRuntimeTabs.delete(tabId);
+          const tNav0 = Date.now();
+          const navSt = await waitForNavigationSettlement(tabId, curTabUrl, 8000);
+          navWaitMs += (Date.now() - tNav0);
+          if (!navSt.alive) throw batchErr;
+          const navIdx = origSteps.findIndex(stp => {
+            const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
+            return op === "click" || op === "press" || op === "key" || op === "eval" || op === "evaluate" || op === "webmcp" || op === "calltool";
+          });
+          const remSteps = navIdx >= 0
+            ? origSteps.slice(navIdx + 1).filter(stp => {
+                const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
+                return isPostNavSafeOp(op);
+              })
+            : [];
+          if (reqPayload.skipSnapshot && remSteps.length === 0) {
+            batchRes = {
+              didNavigate: true,
+              url: navSt.url || "",
+              title: navSt.title || "",
+              errors: [],
+              evalOutputs: [],
+              rawEvalValues: [],
+              escalations: [],
+              canvases: [],
+              lines: []
+            };
+          } else {
+            const followReq = { ...reqPayload, steps: remSteps };
+            if (!reqPayload.skipSnapshot) followReq.diff = false;
+            batchRes = await injectAndRunBatch(followReq, true);
+            if (batchRes && typeof batchRes === "object") batchRes.didNavigate = true;
+          }
         }
       }
 
@@ -1372,7 +1510,9 @@ async function handleRpc(msg) {
         const nextIdx = typeof batchRes.nextStepIndex === "number" ? batchRes.nextStepIndex : origSteps.length;
         const remSteps = nextIdx < origSteps.length ? origSteps.slice(nextIdx) : [];
         initializedRuntimeTabs.delete(tabId);
-        const navSt = await waitForNavigationSettlement(tabId, String(batchRes.url || ""), 10000);
+        const tNav0 = Date.now();
+        const navSt = await waitForNavigationSettlement(tabId, String(batchRes.url || ""), 8000);
+        navWaitMs += (Date.now() - tNav0);
         if (reqPayload.skipSnapshot && remSteps.length === 0) {
           batchRes = {
             didNavigate: true,
@@ -1410,6 +1550,8 @@ async function handleRpc(msg) {
           if (esc.reason === "eval_csp" && !esc.handled) {
             esc.handled = true;
             didMutate = true;
+            const escHost = getHostname((batchRes && batchRes.url) || curTabUrl);
+            if (escHost) strictCspHosts.add(escHost);
             try {
               const evalBox = await evalStepCodeOnTab(tabId, esc.code);
               if (evalBox && evalBox.hasValue) {
@@ -1429,7 +1571,7 @@ async function handleRpc(msg) {
               esc.handled = true;
               didMutate = true;
               try {
-                await setInputFilesOnTab(tabId, sel, files);
+                await setInputFilesOnTab(tabId, sel, files, stepObj.inlineFiles || null);
               } catch (upErr) {
                 batchRes.errors.push(String((upErr && upErr.message) || upErr));
               }
@@ -1457,6 +1599,9 @@ async function handleRpc(msg) {
             }
           } catch (_) {}
         }
+      }
+      if (batchRes && typeof batchRes === "object" && navWaitMs > 0) {
+        batchRes.navWaitMs = Math.round(navWaitMs * 100) / 100;
       }
       if (batchRes && typeof batchRes === "object" && (!reqPayload || reqPayload.skipPreview !== true)) {
         scheduleAsyncPreviewPush(tabId);

@@ -9,20 +9,23 @@ Run the built-in analyzer across the desired window (default 7 days):
 ```bash
 /Users/lfan/Project/faster-mac-use/bin/fmu --perf 7
 /Users/lfan/Project/faster-mac-use/bin/fmu --perf 7 --json
+/Users/lfan/Project/faster-mac-use/bin/fmu --perf --clear
 ```
 
 Or inside `cua` / `agy-cua`:
 
 ```json
 {"perfReport": {"days": 7, "format": "markdown"}}
+{"perfReport": {"clear": true}}
 ```
 
 ## 2. What Each Metric Measures
 
-- **Surfaces (`web:mv3`, `web:playwright`, `app:ax`, `daemon:unix_sock`)**: `p50` / `p95` / `p99` / `max` end-to-end latency per batch.
+- **Surfaces (`web:mv3`, `web:playwright`, `app:ax`, `daemon:unix_sock`) & Entrypoints (`repl`, `parallel`, `steps`)**: `p50` / `p95` / `p99` / `max` end-to-end latency per batch, correlated by `batch_id` across `code` REPL and `parallel` swarms.
 - **Sub-Phase Breakdown (`timings_ms`)**:
   - `tab_attach`: Tab lookup, `createBrowserTab`, navigation (`domcontentloaded`), and `ensure_runtime`.
-  - `bridge_overhead`: Out-of-page IPC serialization (`in_page_wall_ms - totalInPageMs`) across the MV3 WebSocket + `chrome.debugger` or Playwright pipe.
+  - `nav_wait`: Post-action / in-flight document load settlement (`DOMContentLoaded`), tracked separately so slow site loads never inflate `bridge_overhead`.
+  - `bridge_overhead`: Out-of-page IPC serialization (`in_page_wall_ms - totalInPageMs - navWaitMs`) across the MV3 WebSocket + `chrome.debugger` or Playwright pipe.
   - `in_page_exec`: DOM action execution (`click`, `fill`, `select`, `eval`, `webmcp`).
   - `in_page_settle`: Post-mutation `waitQuietDom(quietMs, maxWaitMs)` stabilization window.
   - `in_page_snap`: `collectSnapshot` DOM/WeakRef walk + CRC-32 `computeDiff`.

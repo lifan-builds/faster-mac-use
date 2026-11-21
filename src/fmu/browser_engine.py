@@ -1,4 +1,4 @@
-"""Browser Interaction Engine: Unfocused '🤖 Agent' tabs, Outbound MV3 WebSocket Bridge, Multi-Cursor Isolation, Focus Emulation, WeakRef UIDs, Native + Virtual WebMCP Macros, <canvas> Vision OCR Fusion, and CRC-32 Delta Reader."""
+"""Browser Interaction Engine: Unfocused 'Agent' tabs, Outbound MV3 WebSocket Bridge, Multi-Cursor Isolation, Focus Emulation, WeakRef UIDs, Native + Virtual WebMCP Macros, <canvas> Vision OCR Fusion, and CRC-32 Delta Reader."""
 
 from __future__ import annotations
 import base64
@@ -16,6 +16,8 @@ import time
 from urllib.parse import urlparse
 from typing import Any, Callable
 
+from fmu.prefs import load_prefs
+from fmu.sessions import SessionRegistry
 from fmu.mac_engine import (
     USER_STOPPED_ERROR,
     interruptible_sleep,
@@ -117,7 +119,10 @@ _SCREENSHOT_SEQ = 0
 
 
 def _preview_enabled() -> bool:
-    return os.environ.get("FMU_PREVIEW") != "0" and os.environ.get("FMU_MENUBAR") != "0"
+    if os.environ.get("FMU_PREVIEW") == "0" or os.environ.get("FMU_MENUBAR") == "0":
+        return False
+    prefs = load_prefs()
+    return prefs.get("liveView", True) is not False and prefs.get("livePreview", True) is not False
 
 
 def _write_web_preview_b64(b64_data: str | None) -> str | None:
@@ -199,33 +204,29 @@ def normalize_step_dict(step: dict[str, Any]) -> dict[str, Any]:
 def _build_inline_files_payload(
     file_list: list[str],
     max_total_bytes: int = MAX_INLINE_UPLOAD_BYTES,
-) -> list[dict[str, str]]:
-    """Read local files into base64 File payloads when all exist and fit within max_total_bytes."""
-    if not file_list:
-        return []
-    total_bytes = 0
-    items: list[dict[str, str]] = []
-    for raw_f in file_list:
-        p = Path(str(raw_f)).expanduser()
-        try:
-            if not p.is_file():
-                return []
-            sz = p.stat().st_size
-            total_bytes += sz
-            if total_bytes > max_total_bytes:
-                return []
-            data = p.read_bytes()
-        except OSError:
-            return []
-        mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-        items.append(
+) -> tuple[list[dict[str, str]], str]:
+    """Read local files into base64 File payloads; return (items, skip_reason) where skip_reason explains an empty result."""
+    paths = [Path(str(f)).expanduser() for f in file_list]
+    try:
+        missing = next((p for p in paths if not p.is_file()), None)
+        if missing is not None:
+            return [], f"file not found: {missing}"
+        total_bytes = sum(p.stat().st_size for p in paths)
+        if total_bytes > max_total_bytes:
+            return [], (
+                f"{total_bytes / 1048576:.1f} MB across {len(paths)} file(s) exceeds the "
+                f"{max_total_bytes / 1048576:.0f} MB inline cap; upload in smaller batches"
+            )
+        return [
             {
                 "name": p.name,
-                "type": mime,
-                "dataB64": base64.b64encode(data).decode("ascii"),
+                "type": mimetypes.guess_type(p.name)[0] or "application/octet-stream",
+                "dataB64": base64.b64encode(p.read_bytes()).decode("ascii"),
             }
-        )
-    return items
+            for p in paths
+        ], ""
+    except OSError as exc:
+        return [], f"cannot read upload file: {exc}"
 
 
 _JS_NON_EXPR_STMT_RE = re.compile(
@@ -404,11 +405,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.4.4"
+_FMU_RUNTIME_VERSION = "0.4.5"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.4.4";
+  const FMU_RUNTIME_VERSION = "0.4.5";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -2382,7 +2383,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const forceFull = req.diff === false || req.fullTable === true || req.fullPage === true || viewChanged;
     const hadBaseline = st.lastLinesByUid.size > 0 && !viewChanged;
 
-    if (steps.length === 0 && req.diff === true && !forceFull && hadBaseline && store.mutationSeq === st.lastSnapSeq) {
+    if (steps.length === 0 && !req.hadPreSteps && req.diff === true && !forceFull && hadBaseline && store.mutationSeq === st.lastSnapSeq) {
       const fastMs = +(performance.now() - tBatchStart).toFixed(2);
       return {
         unchanged: true,
@@ -2396,7 +2397,7 @@ IN_PAGE_RUNTIME_JS = r"""
       };
     }
 
-    if (!hadBaseline && !query && steps.length > 0 && !req.skipSnapshot) {
+    if (!hadBaseline && !forceFull && !query && steps.length > 0 && !req.skipSnapshot) {
       const base = collectSnapshot("", 180, foldTables, fullPage);
       st.lastLinesByUid = base.currentMap;
       st.lastCrc = base.newCrc;
@@ -2410,6 +2411,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const evalOutputs = [];
     const rawEvalValues = [];
     const escalations = [];
+    const stepOffset = Number(req.stepOffset || 0);
     const tExecStart = performance.now();
 
     const makeNavigatedEarlyReturn = (nextIdx) => ({
@@ -2431,6 +2433,77 @@ IN_PAGE_RUNTIME_JS = r"""
       },
       lines: []
     });
+
+    const makeCdpClickReturn = (nextIdx, x, y) => ({
+      cdpClick: { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 },
+      nextStepIndex: nextIdx,
+      url: location.href,
+      title: document.title,
+      errors,
+      evalOutputs,
+      rawEvalValues,
+      escalations,
+      cursor: st.cursor,
+      canvases: [],
+      timings: {
+        execMs: +(performance.now() - tExecStart).toFixed(2),
+        settleMs: 0,
+        snapMs: 0,
+        totalInPageMs: +(performance.now() - tBatchStart).toFixed(2)
+      },
+      lines: []
+    });
+
+    function deepElementFromPoint(x, y) {
+      let hit = document.elementFromPoint(x, y);
+      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === "function") {
+        const inner = hit.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
+      return hit;
+    }
+
+    function isTrustedClickHit(el, hit) {
+      if (!hit) return false;
+      if (hit === el || (el.contains && el.contains(hit))) return true;
+      if (tagOf(hit) === "label" && (hit.control === el || (el.id && hit.htmlFor === el.id))) return true;
+      if (tagOf(el) === "label" && el.control && (hit === el.control || (el.control.contains && el.control.contains(hit)))) return true;
+      return false;
+    }
+
+    function resolveTrustedClickPoint(el) {
+      if (!el || el.ownerDocument !== document || el.disabled) return null;
+      const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+      const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+      if (vw <= 0 || vh <= 0) return null;
+      const rects = [];
+      const eff = getEffectiveRect(el);
+      if (eff.width >= 1 && eff.height >= 1) rects.push(eff);
+      if (el.getClientRects) {
+        for (const cr of el.getClientRects()) {
+          if (cr.width >= 1 && cr.height >= 1) rects.push(cr);
+        }
+      }
+      const ratios = [[0.5, 0.5], [0.5, 0.25], [0.5, 0.75], [0.25, 0.5], [0.75, 0.5]];
+      for (const r of rects) {
+        const clL = Math.max(0, r.left);
+        const clT = Math.max(0, r.top);
+        const clR = Math.min(vw - 1, r.right);
+        const clB = Math.min(vh - 1, r.bottom);
+        if (clR <= clL || clB <= clT) continue;
+        for (const [rx, ry] of ratios) {
+          const px = clL + (clR - clL) * rx;
+          const py = clT + (clB - clT) * ry;
+          if (isTrustedClickHit(el, deepElementFromPoint(px, py))) {
+            return { x: px, y: py };
+          }
+        }
+      }
+      return null;
+    }
+
+    if (store.navigating) return makeNavigatedEarlyReturn(0);
 
     const SHORTHAND_VERBS = [
       ["click", "target"], ["tap", "target"], ["fill", "value"], ["set", "value"],
@@ -2469,9 +2542,10 @@ IN_PAGE_RUNTIME_JS = r"""
       let op = String(s.op || s.action || "").trim().toLowerCase();
       const targetRef = s.uid || s.ref || s.target || s.selector || s.name;
       const stepValue = s.value !== undefined ? s.value : s.text;
+        const stepNum = stepOffset + i + 1;
       if (!op) {
         if (!s.optional) {
-          errors.push(`step ${i + 1}: missing 'op' (or 'action') field; valid ops: click, fill, set, type, select, upload, move, press, key, waitFor, wait, text, eval, callTool`);
+          errors.push(`step ${stepNum}: missing 'op' (or 'action') field; valid ops: click, fill, set, type, select, upload, move, press, key, waitFor, wait, text, eval, callTool`);
         }
         continue;
       }
@@ -2483,7 +2557,7 @@ IN_PAGE_RUNTIME_JS = r"""
       }
       if (!VALID_WEB_OPS.has(op)) {
         if (!s.optional) {
-          errors.push(`step ${i + 1}: unsupported op '${op}'; valid ops: click, fill, set, type, select, upload, move, press, key, waitFor, wait, text, eval, callTool`);
+          errors.push(`step ${stepNum}: unsupported op '${op}'; valid ops: click, fill, set, type, select, upload, move, press, key, waitFor, wait, text, eval, callTool`);
         }
         continue;
       }
@@ -2497,14 +2571,14 @@ IN_PAGE_RUNTIME_JS = r"""
           const wRes = await waitForCondition(s);
           if (wRes.navigating || store.navigating) return makeNavigatedEarlyReturn(i + 1);
           if (wRes.botChallenge) {
-            escalations.push({ step: i + 1, reason: "bot_challenge", kind: wRes.botChallenge });
+            escalations.push({ step: stepNum, reason: "bot_challenge", kind: wRes.botChallenge });
             if (!s.optional) {
-              errors.push(`step ${i + 1} (waitFor): aborted early after ${wRes.elapsedMs}ms — bot/CAPTCHA interstitial detected (${wRes.botChallenge} at ${location.host}${location.pathname}); use mode="chrome" MV3 tab instead of headless while waiting for ${wRes.desc}`);
+              errors.push(`step ${stepNum} (waitFor): aborted early after ${wRes.elapsedMs}ms — bot/CAPTCHA interstitial detected (${wRes.botChallenge} at ${location.host}${location.pathname}); use mode="chrome" MV3 tab instead of headless while waiting for ${wRes.desc}`);
             }
             continue;
           }
           if (!wRes.ok && !s.optional) {
-            errors.push(`step ${i + 1} (waitFor): timed out after ${wRes.timeoutMs}ms waiting for ${wRes.desc}${wRes.contextHint || ""}`);
+            errors.push(`step ${stepNum} (waitFor): timed out after ${wRes.timeoutMs}ms waiting for ${wRes.desc}${wRes.contextHint || ""}`);
           }
           continue;
         }
@@ -2530,7 +2604,7 @@ IN_PAGE_RUNTIME_JS = r"""
         if (op === "eval" || op === "evaluate") {
           const code = String(s.code || stepValue || "");
           if (store.strictCsp) {
-            escalations.push({ step: i + 1, reason: "eval_csp", code, cached: true, maxChars: s.maxChars });
+            escalations.push({ step: stepNum, reason: "eval_csp", code, cached: true, maxChars: s.maxChars });
             continue;
           }
           try {
@@ -2545,7 +2619,7 @@ IN_PAGE_RUNTIME_JS = r"""
               || msg.includes("unsafe-eval")
             ) {
               store.strictCsp = true;
-              escalations.push({ step: i + 1, reason: "eval_csp", code, maxChars: s.maxChars });
+              escalations.push({ step: stepNum, reason: "eval_csp", code, maxChars: s.maxChars });
             } else {
               throw evalErr;
             }
@@ -2580,6 +2654,12 @@ IN_PAGE_RUNTIME_JS = r"""
           const hitEl = document.elementFromPoint(s.x, s.y);
           updateAgentCursor(st, hitEl, op, s.x, s.y);
           if (op === "click") {
+            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (req.cdpClick && s.x >= 0 && s.y >= 0 && s.x < vw && s.y < vh) {
+              store.mutationSeq++;
+              return makeCdpClickReturn(i + 1, s.x, s.y);
+            }
             dispatchCanvasClick({ x: s.x, y: s.y, label: "@xy", uid: "@xy", canvasUid: "" });
             if (!store.navigating) await new Promise(r => setTimeout(r, 0));
             if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
@@ -2589,7 +2669,7 @@ IN_PAGE_RUNTIME_JS = r"""
 
         if (!targetRef) {
           if (!s.optional) {
-            errors.push(`step ${i + 1} (${op}): missing target (provide 'uid', 'name', 'target', 'selector', or 'x'/'y')`);
+            errors.push(`step ${stepNum} (${op}): missing target (provide 'uid', 'name', 'target', 'selector', or 'x'/'y')`);
           }
           continue;
         }
@@ -2609,6 +2689,12 @@ IN_PAGE_RUNTIME_JS = r"""
             if (op === "move") {
               continue;
             } else if (op === "click") {
+              const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+              const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+              if (req.cdpClick && ocrItem.x >= 0 && ocrItem.y >= 0 && ocrItem.x < vw && ocrItem.y < vh) {
+                store.mutationSeq++;
+                return makeCdpClickReturn(i + 1, ocrItem.x, ocrItem.y);
+              }
               dispatchCanvasClick(ocrItem);
               if (!store.navigating) await new Promise(r => setTimeout(r, 0));
               if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
@@ -2624,7 +2710,7 @@ IN_PAGE_RUNTIME_JS = r"""
               continue;
             }
           }
-          if (!s.optional) errors.push(`step ${i + 1} (${op}): target not found (${targetRef})`);
+          if (!s.optional) errors.push(`step ${stepNum} (${op}): target not found (${targetRef})`);
           continue;
         }
 
@@ -2679,8 +2765,14 @@ IN_PAGE_RUNTIME_JS = r"""
               }
               fileEl.setAttribute("data-fmu-upload-uid", fUid);
             }
-            escalations.push({ step: i + 1, reason: "file_input", uid: fileEl ? fUid : "" });
+            escalations.push({ step: stepNum, reason: "file_input", uid: fileEl ? fUid : "" });
             continue;
+          }
+          if (req.cdpClick) {
+            const pt = resolveTrustedClickPoint(el);
+            if (pt) {
+              return makeCdpClickReturn(i + 1, pt.x, pt.y);
+            }
           }
           el.focus({ preventScroll: true });
           el.click();
@@ -2707,7 +2799,7 @@ IN_PAGE_RUNTIME_JS = r"""
           el.dispatchEvent(new Event("change", { bubbles: true }));
         }
       } catch (err) {
-        errors.push(`step ${i + 1} (${op}): ${err.message || err}`);
+        errors.push(`step ${stepNum} (${op}): ${err.message || err}`);
       }
     }
 
@@ -3252,7 +3344,7 @@ class _ExtensionPageAdapter:
 
     def set_input_files(self, selector: str, files: str | list[str]) -> dict[str, Any]:
         file_list = [str(files)] if isinstance(files, (str, Path)) else [str(f) for f in files]
-        inline_files = _build_inline_files_payload(file_list)
+        inline_files, inline_skipped = _build_inline_files_payload(file_list)
         rpc_params: dict[str, Any] = {
             "tabId": self.chrome_tab_id,
             "selector": selector,
@@ -3260,6 +3352,8 @@ class _ExtensionPageAdapter:
         }
         if inline_files:
             rpc_params["inlineFiles"] = inline_files
+        if inline_skipped:
+            rpc_params["inlineSkipped"] = inline_skipped
         res = self._bridge.call_rpc(
             "setInputFiles",
             rpc_params,
@@ -3294,9 +3388,11 @@ class _ExtensionPageAdapter:
                     raw_files = st_norm.get("files") or (st_norm.get("value") if sop == "upload" else None)
                     if raw_files and "inlineFiles" not in st_norm and not batch_arg.get("skipSnapshot"):
                         flist = [str(raw_files)] if isinstance(raw_files, (str, Path)) else [str(f) for f in raw_files]
-                        inline_f = _build_inline_files_payload(flist)
+                        inline_f, inline_skipped = _build_inline_files_payload(flist)
                         if inline_f:
                             st_norm = {**st_norm, "inlineFiles": inline_f}
+                        elif inline_skipped:
+                            st_norm = {**st_norm, "inlineSkipped": inline_skipped}
                     norm_steps.append(st_norm)
                 else:
                     norm_steps.append(st)
@@ -3386,7 +3482,7 @@ class BrowserTabSession:
         tab_id: str,
         page: Any,
         cdp_session: Any,
-        group_name: str = "🤖 Agent",
+        group_name: str = "Agent",
         group_color: str = "blue",
         last_url: str = "about:blank",
         last_title: str = "",
@@ -3750,6 +3846,7 @@ class BrowserEngine:
         self._next_tab_num: int = 1
         self.cursors: dict[str, dict[str, Any]] = {}
         self._agent_colors: dict[str, str] = {}
+        self.clients = SessionRegistry()
         self._strict_csp_hosts: set[str] = set()
         self._state_lock = threading.RLock()
         self._ext_bridge_inst: ExtensionWebSocketBridge | None = None
@@ -4227,7 +4324,27 @@ class BrowserEngine:
     def _browser(self, val: Any) -> None:
         self._raw_browser = val
 
+    def group_title(self, agent_id: str) -> str:
+        client, sub = self.clients.lookup(agent_id)
+        if client is None:
+            return "Agent" if agent_id == "default" else f"Agent {agent_id}"
+        return f"{client.label} · {sub}" if sub else client.label
+
+    def owner_for(self, scoped_id: str | None) -> str:
+        client, _ = self.clients.lookup(scoped_id)
+        return client.owner if client is not None else ""
+
+    def in_scope(self, tab_id: str, scope: str | None) -> bool:
+        """True when `tab_id` belongs to the caller's session scope (unscoped callers see every tab)."""
+        if not scope:
+            return True
+        tab_scope = tab_id.split(":", 1)[0] if ":" in tab_id else ""
+        return tab_scope == scope or tab_scope.startswith(f"{scope}.")
+
     def _get_agent_color(self, agent_id: str) -> str:
+        client, _ = self.clients.lookup(agent_id)
+        if client is not None:
+            return client.color
         if agent_id not in self._agent_colors:
             self._agent_colors[agent_id] = _GROUP_COLORS[len(self._agent_colors) % len(_GROUP_COLORS)]
         return self._agent_colors[agent_id]
@@ -4384,7 +4501,7 @@ class BrowserEngine:
         self,
         url: str = "about:blank",
         mode: str = "chrome",
-        session_name: str = "🤖 Agent",
+        session_name: str = "Agent",
         tab_id: str | None = None,
         group_color: str = "blue",
         window: str | None = None,
@@ -4476,7 +4593,7 @@ class BrowserEngine:
         self,
         url: str = "about:blank",
         mode: str = "chrome",
-        session_name: str = "🤖 Agent",
+        session_name: str = "Agent",
         tab_id: str | None = None,
         group_color: str = "blue",
         window: str | None = None,
@@ -4556,6 +4673,7 @@ class BrowserEngine:
                     "sessionId": tid,
                     "sessionName": session_name,
                     "color": group_color,
+                    "owner": self.owner_for(tid),
                     "skipPreview": not _preview_enabled(),
                 }
                 if window:
@@ -4670,6 +4788,7 @@ class BrowserEngine:
         window_id: int | None = None,
         session_name: str | None = None,
         group_color: str = "blue",
+        scope: str | None = None,
     ) -> BrowserTabSession | None:
         fn = lambda: self._attach_existing_tab_inner(
             tab_id=tab_id,
@@ -4679,6 +4798,7 @@ class BrowserEngine:
             window_id=window_id,
             session_name=session_name,
             group_color=group_color,
+            scope=scope,
         )
         if self._can_run_direct_mv3(tab_id=tab_id):
             return fn()
@@ -4694,6 +4814,7 @@ class BrowserEngine:
         window_id: int | None = None,
         session_name: str | None = None,
         group_color: str = "blue",
+        scope: str | None = None,
     ) -> BrowserTabSession | None:
         if chrome_tab_id is not None:
             for existing in list(self._tabs.values()):
@@ -4729,6 +4850,9 @@ class BrowserEngine:
             rpc_params["windowId"] = int(window_id)
         if session_name:
             rpc_params["sessionName"] = str(session_name)
+        owner = self.owner_for(scope or tab_id)
+        if owner:
+            rpc_params["owner"] = owner
 
         try:
             ext_res = self._ext_bridge.call_rpc("getTab", rpc_params, timeout=4.0)
@@ -4761,15 +4885,16 @@ class BrowserEngine:
                     self._tab_last_titles[existing.tab_id] = actual_title
                 return existing
 
+        prefix = f"{scope}:" if scope and self.clients.lookup(scope)[0] is not None else ""
         with self._state_lock:
             if tab_id:
                 tid = tab_id
             else:
-                while f"t{self._next_tab_num}" in self._tabs:
+                while f"{prefix}t{self._next_tab_num}" in self._tabs:
                     self._next_tab_num += 1
-                tid = f"t{self._next_tab_num}"
+                tid = f"{prefix}t{self._next_tab_num}"
             self._next_tab_num += 1
-        eff_group = str(ext_res.get("groupTitle") or session_name or "🤖 Agent")
+        eff_group = str(ext_res.get("groupTitle") or session_name or self.group_title(scope or "default"))
         sess_holder: list[BrowserTabSession] = []
 
         def _handle_ext_preview(prev_obj: dict[str, Any], u_hint: str) -> None:
@@ -4929,6 +5054,83 @@ class BrowserEngine:
                 pass
         return f"# web tab={tab_id} closed"
 
+    def close_agent_tabs(self, scope: str | None = None) -> str:
+        return self._run_sync(lambda: self._close_agent_tabs_inner(scope))
+
+    def _close_agent_tabs_inner(self, scope: str | None = None) -> str:
+        self._cancel_pending_preview()
+        closed_chrome_ids: set[int] = set()
+        closed_chrome = 0
+        if self._ext_bridge_inst is not None:
+            if not self._ext_bridge.is_connected():
+                self._ext_bridge.wait_connected(timeout=2.0)
+            if self._ext_bridge.is_connected():
+                params = {"owner": self.owner_for(scope)} if scope else {}
+                res = self._ext_bridge.call_rpc("closeAgentTabs", params, timeout=10.0)
+                closed_chrome_ids = {int(t) for t in res.get("tabIds") or []}
+                closed_chrome = int(res.get("closedCount") or 0)
+        closed_pages = 0
+        for tid, sess in list(self._tabs.items()):
+            if sess.is_extension:
+                if getattr(sess._raw_page, "chrome_tab_id", None) not in closed_chrome_ids:
+                    continue
+                sess._raw_page._closed = True
+            else:
+                if not self.in_scope(tid, scope):
+                    continue
+                try:
+                    sess._raw_page.close()
+                except Exception:
+                    pass
+                closed_pages += 1
+            self._tabs.pop(tid, None)
+            self._tab_last_urls.pop(tid, None)
+            self._tab_last_titles.pop(tid, None)
+        return f"# web agent tabs closed chrome={closed_chrome} playwright={closed_pages}"
+
+    def retire_client(self, client: Any) -> None:
+        """Session ended: close its blank agent tabs, collapse its tab groups, and forget its fmu tab handles."""
+        self._run_sync(lambda: self._retire_client_inner(client))
+
+    def _retire_client_inner(self, client: Any) -> None:
+        mine = {tid: sess for tid, sess in self._tabs.items() if self.in_scope(tid, client.short_id)}
+        titles = sorted({client.label, *(str(sess.group_name) for sess in mine.values() if sess.group_name)})
+        if self._ext_bridge_inst is not None and self._ext_bridge.is_connected():
+            try:
+                self._ext_bridge.call_rpc("retireOwner", {"owner": client.owner, "titles": titles}, timeout=6.0)
+            except Exception:
+                pass
+        for tid, sess in mine.items():
+            if not sess.is_extension:
+                try:
+                    sess._raw_page.close()
+                except Exception:
+                    pass
+            self._tabs.pop(tid, None)
+            self._tab_last_urls.pop(tid, None)
+            self._tab_last_titles.pop(tid, None)
+
+    def agent_sessions(self) -> list[dict[str, Any]]:
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        for client in self.clients.live():
+            tabs = [
+                sess
+                for tid, sess in list(self._tabs.items())
+                if self.in_scope(tid, client.short_id) and self._is_session_alive(sess)
+            ]
+            out.append(
+                {
+                    "id": client.short_id,
+                    "label": client.label,
+                    "color": client.color,
+                    "harness": client.ident.harness,
+                    "tabs": len(tabs),
+                    "idleSec": int(now - client.last_active),
+                }
+            )
+        return out
+
     def _eval_step_via_cdp(self, sess: BrowserTabSession, raw_code: str) -> tuple[bool, Any]:
         candidates = _build_js_eval_candidates(raw_code)
 
@@ -5084,6 +5286,17 @@ class BrowserEngine:
             sess.enable_background_focus_emulation()
             sess.ensure_runtime()
 
+    def _dispatch_cdp_mouse_click(self, sess: BrowserTabSession, x: float, y: float) -> None:
+        sess._raw_cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y, "button": "none"})
+        sess._raw_cdp.send(
+            "Input.dispatchMouseEvent",
+            {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1},
+        )
+        sess._raw_cdp.send(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1},
+        )
+
     def _eval_batch_handling_navigation(
         self,
         sess: BrowserTabSession,
@@ -5092,7 +5305,24 @@ class BrowserEngine:
         tab_id: str,
     ) -> dict[str, Any]:
         prev_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
-        steps = list(payload.get("steps") or [])
+        orig_steps = list(payload.get("steps") or [])
+        can_cdp_click = (not sess.is_extension) and (sess._raw_cdp is not None)
+        post_nav_safe_ops = {
+            "wait",
+            "sleep",
+            "delay",
+            "settle",
+            "waitfor",
+            "wait_for",
+            "waituntil",
+            "text",
+            "readtext",
+            "readmain",
+            "eval",
+            "evaluate",
+            "snapshot",
+            "diff",
+        }
 
         def _invoke(p: dict[str, Any]) -> dict[str, Any]:
             try:
@@ -5112,89 +5342,202 @@ class BrowserEngine:
                     return out if isinstance(out, dict) else {}
                 raise
 
-        try:
-            res = _invoke(payload)
-        except Exception as exc:
-            if not _is_navigation_error(exc) or sess._raw_page.is_closed():
-                raise
-            self._settle_playwright_navigation(sess, prev_url, tab_id)
-            if sess.is_extension:
+        if sess.is_extension:
+            try:
+                return _invoke(payload)
+            except Exception as exc:
+                if not _is_navigation_error(exc) or sess._raw_page.is_closed():
+                    raise
                 time.sleep(0.08)
-            rem_steps: list[dict[str, Any]] = []
-            nav_trigger_idx = next(
-                (
-                    idx
-                    for idx, stp in enumerate(steps)
-                    if str(stp.get("op") or stp.get("action") or "").lower()
-                    in ("click", "press", "key", "eval", "evaluate", "webmcp", "calltool")
-                ),
-                -1,
-            )
-            if nav_trigger_idx >= 0:
-                rem_steps = [
-                    stp
-                    for stp in steps[nav_trigger_idx + 1 :]
-                    if str(stp.get("op") or stp.get("action") or "").lower()
-                    in (
-                        "wait",
-                        "sleep",
-                        "delay",
-                        "settle",
-                        "waitfor",
-                        "wait_for",
-                        "waituntil",
-                        "text",
-                        "readtext",
-                        "readmain",
-                        "eval",
-                        "evaluate",
-                        "snapshot",
-                        "diff",
-                    )
-                ]
-            follow_payload = dict(payload)
-            follow_payload["steps"] = rem_steps
-            if not follow_payload.get("skipSnapshot"):
-                follow_payload["diff"] = False
-            follow_payload["virtualTools"] = self.get_macros_for_url(sess.last_url)
-            res_after_err = _invoke(follow_payload)
-            res_after_err["didNavigate"] = True
-            return res_after_err
+                nav_trigger_idx = next(
+                    (
+                        idx
+                        for idx, stp in enumerate(orig_steps)
+                        if str(stp.get("op") or stp.get("action") or "").lower()
+                        in ("click", "press", "key", "eval", "evaluate", "webmcp", "calltool")
+                    ),
+                    -1,
+                )
+                rem_steps = (
+                    [
+                        stp
+                        for stp in orig_steps[nav_trigger_idx + 1 :]
+                        if str(stp.get("op") or stp.get("action") or "").lower() in post_nav_safe_ops
+                    ]
+                    if nav_trigger_idx >= 0
+                    else []
+                )
+                follow_payload = dict(payload)
+                follow_payload["steps"] = rem_steps
+                if not follow_payload.get("skipSnapshot"):
+                    follow_payload["diff"] = False
+                follow_payload["virtualTools"] = self.get_macros_for_url(sess.last_url)
+                res_after_err = _invoke(follow_payload)
+                res_after_err["didNavigate"] = True
+                return res_after_err
 
-        if isinstance(res, dict) and res.get("navigated"):
-            prior_errors = list(res.get("errors") or [])
-            prior_evals = list(res.get("evalOutputs") or [])
-            prior_raw_vals = list(res.get("rawEvalValues") or [])
-            next_idx = int(res.get("nextStepIndex") or len(steps))
-            rem_steps = steps[next_idx:] if next_idx < len(steps) else []
-            self._settle_playwright_navigation(sess, str(res.get("url") or prev_url), tab_id)
-            if sess.is_extension:
-                time.sleep(0.08)
-            if payload.get("skipSnapshot") and not rem_steps:
-                return {
-                    "didNavigate": True,
-                    "url": str(getattr(sess._raw_page, "url", "") or sess.last_url or ""),
-                    "title": sess.last_title,
-                    "errors": prior_errors,
-                    "evalOutputs": prior_evals,
-                    "rawEvalValues": prior_raw_vals,
-                    "escalations": [],
-                    "canvases": [],
-                    "timings": res.get("timings") or {},
-                    "lines": [],
-                }
-            follow_payload = dict(payload)
-            follow_payload["steps"] = rem_steps
-            if not follow_payload.get("skipSnapshot"):
-                follow_payload["diff"] = False
-            follow_payload["virtualTools"] = self.get_macros_for_url(sess.last_url)
-            res2 = _invoke(follow_payload)
-            res2["didNavigate"] = True
-            res2["errors"] = prior_errors + list(res2.get("errors") or [])
-            res2["evalOutputs"] = prior_evals + list(res2.get("evalOutputs") or [])
-            res2["rawEvalValues"] = prior_raw_vals + list(res2.get("rawEvalValues") or [])
-            return res2
+        cur_steps = orig_steps
+        step_offset = int(payload.get("stepOffset") or 0)
+        had_pre_steps = bool(payload.get("hadPreSteps"))
+        cur_diff = payload.get("diff")
+        did_navigate = False
+        acc_errors: list[Any] = []
+        acc_evals: list[Any] = []
+        acc_raw_vals: list[Any] = []
+        acc_escalations: list[Any] = []
+        acc_exec_ms = 0.0
+        last_cursor: Any = None
+        max_slices = len(orig_steps) + 3
+        res: dict[str, Any] = {}
 
+        for _ in range(max_slices):
+            slice_payload = dict(payload)
+            slice_payload["steps"] = cur_steps
+            slice_payload["stepOffset"] = step_offset
+            slice_payload["hadPreSteps"] = had_pre_steps
+            if cur_diff is not None:
+                slice_payload["diff"] = cur_diff
+            slice_payload["cdpClick"] = can_cdp_click
+            slice_payload["virtualTools"] = self.get_macros_for_url(sess.last_url)
+            try:
+                res = _invoke(slice_payload)
+            except Exception as exc:
+                if not _is_navigation_error(exc) or sess._raw_page.is_closed():
+                    raise
+                self._settle_playwright_navigation(sess, prev_url, tab_id)
+                prev_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
+                did_navigate = True
+                nav_trigger_idx = next(
+                    (
+                        idx
+                        for idx, stp in enumerate(cur_steps)
+                        if str(stp.get("op") or stp.get("action") or "").lower()
+                        in ("click", "press", "key", "eval", "evaluate", "webmcp", "calltool")
+                    ),
+                    -1,
+                )
+                if nav_trigger_idx >= 0:
+                    step_offset += nav_trigger_idx + 1
+                    cur_steps = [
+                        stp
+                        for stp in cur_steps[nav_trigger_idx + 1 :]
+                        if str(stp.get("op") or stp.get("action") or "").lower() in post_nav_safe_ops
+                    ]
+                else:
+                    step_offset += len(cur_steps)
+                    cur_steps = []
+                had_pre_steps = True
+                if not payload.get("skipSnapshot"):
+                    cur_diff = False
+                if payload.get("skipSnapshot") and not cur_steps:
+                    return {
+                        "didNavigate": True,
+                        "url": prev_url,
+                        "title": sess.last_title,
+                        "errors": acc_errors,
+                        "evalOutputs": acc_evals,
+                        "rawEvalValues": acc_raw_vals,
+                        "escalations": acc_escalations,
+                        "cursor": last_cursor,
+                        "canvases": [],
+                        "timings": {"execMs": round(acc_exec_ms, 2)},
+                        "lines": [],
+                    }
+                continue
+
+            acc_errors.extend(res.get("errors") or [])
+            acc_evals.extend(res.get("evalOutputs") or [])
+            acc_raw_vals.extend(res.get("rawEvalValues") or [])
+            acc_escalations.extend(res.get("escalations") or [])
+            tm = res.get("timings") if isinstance(res.get("timings"), dict) else {}
+            acc_exec_ms += float(tm.get("execMs") or 0.0)
+            if res.get("cursor") is not None:
+                last_cursor = res.get("cursor")
+
+            cdp_click = res.get("cdpClick") if isinstance(res, dict) else None
+            if isinstance(cdp_click, dict) and can_cdp_click:
+                next_idx = int(res.get("nextStepIndex") if res.get("nextStepIndex") is not None else len(cur_steps))
+                click_url = str(res.get("url") or getattr(sess._raw_page, "url", "") or prev_url)
+                step_offset += next_idx
+                cur_steps = cur_steps[next_idx:] if next_idx < len(cur_steps) else []
+                had_pre_steps = True
+                try:
+                    self._dispatch_cdp_mouse_click(sess, float(cdp_click["x"]), float(cdp_click["y"]))
+                except Exception as click_exc:
+                    if not _is_navigation_error(click_exc):
+                        acc_errors.append(f"step {step_offset} (click): {click_exc}")
+                try:
+                    if not sess._raw_page.is_closed():
+                        sess._raw_page.wait_for_timeout(15)
+                except Exception:
+                    pass
+                if not sess._raw_page.is_closed():
+                    post_click_url = str(getattr(sess._raw_page, "url", "") or "")
+                    if click_url and post_click_url and post_click_url != click_url:
+                        sess.last_url = post_click_url
+                        self._tab_last_urls[tab_id] = post_click_url
+                        if not _same_origin_and_path(click_url, post_click_url):
+                            self._settle_playwright_navigation(sess, click_url, tab_id)
+                            prev_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
+                            did_navigate = True
+                            if not payload.get("skipSnapshot"):
+                                cur_diff = False
+                if payload.get("skipSnapshot") and not cur_steps:
+                    return {
+                        "didNavigate": did_navigate,
+                        "url": str(getattr(sess._raw_page, "url", "") or sess.last_url or ""),
+                        "title": sess.last_title,
+                        "errors": acc_errors,
+                        "evalOutputs": acc_evals,
+                        "rawEvalValues": acc_raw_vals,
+                        "escalations": acc_escalations,
+                        "cursor": last_cursor,
+                        "canvases": [],
+                        "timings": {"execMs": round(acc_exec_ms, 2)},
+                        "lines": [],
+                    }
+                continue
+
+            if isinstance(res, dict) and res.get("navigated"):
+                next_idx = int(res.get("nextStepIndex") if res.get("nextStepIndex") is not None else len(cur_steps))
+                nav_from = str(res.get("url") or prev_url)
+                step_offset += next_idx
+                cur_steps = cur_steps[next_idx:] if next_idx < len(cur_steps) else []
+                had_pre_steps = True
+                self._settle_playwright_navigation(sess, nav_from, tab_id)
+                prev_url = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
+                did_navigate = True
+                if not payload.get("skipSnapshot"):
+                    cur_diff = False
+                if payload.get("skipSnapshot") and not cur_steps:
+                    return {
+                        "didNavigate": True,
+                        "url": prev_url,
+                        "title": sess.last_title,
+                        "errors": acc_errors,
+                        "evalOutputs": acc_evals,
+                        "rawEvalValues": acc_raw_vals,
+                        "escalations": acc_escalations,
+                        "cursor": last_cursor,
+                        "canvases": [],
+                        "timings": {"execMs": round(acc_exec_ms, 2)},
+                        "lines": [],
+                    }
+                continue
+
+            break
+
+        if isinstance(res, dict):
+            if did_navigate:
+                res["didNavigate"] = True
+            res["errors"] = acc_errors
+            res["evalOutputs"] = acc_evals
+            res["rawEvalValues"] = acc_raw_vals
+            res["escalations"] = acc_escalations
+            if last_cursor is not None and not res.get("cursor"):
+                res["cursor"] = last_cursor
+            if isinstance(res.get("timings"), dict):
+                res["timings"]["execMs"] = round(acc_exec_ms, 2)
         return res
 
     def evaluate_value(
@@ -5204,7 +5547,7 @@ class BrowserEngine:
         agent: str = "default",
         session: str | None = None,
         mode: str = "chrome",
-        session_name: str = "🤖 Agent",
+        session_name: str = "Agent",
         window: str | None = None,
         window_id: int | None = None,
         chrome_tab_id: int | None = None,
@@ -5430,7 +5773,7 @@ class BrowserEngine:
         agent: str = "default",
         session: str | None = None,
         mode: str = "chrome",
-        session_name: str = "🤖 Agent",
+        session_name: str = "Agent",
         window: str | None = None,
         window_id: int | None = None,
         chrome_tab_id: int | None = None,
@@ -5699,7 +6042,7 @@ class BrowserEngine:
         agent_id = str(req.get("agent") or req.get("cursor") or "default").strip() or "default"
         default_tab = "t1" if agent_id == "default" else f"{agent_id}:t1"
         tab_id = str(req.get("session") or req.get("tab") or default_tab)
-        default_group = "🤖 Agent" if agent_id == "default" else f"🤖 {agent_id}"
+        default_group = self.group_title(agent_id)
         group_name = str(req.get("sessionName") or req.get("group") or default_group)
         group_color = self._get_agent_color(agent_id)
         mode = str(req.get("mode") or "chrome")
@@ -5746,7 +6089,7 @@ class BrowserEngine:
             surface="web",
             target=mb_target,
             op=mb_op,
-            agent=agent_id,
+            agent=self.group_title(agent_id),
             step_count=len(steps),
             preview_path=initial_prev,
             win_w=initial_vw,
@@ -5757,7 +6100,7 @@ class BrowserEngine:
             "surface": "web",
             "target": mb_target,
             "op": mb_op,
-            "agent": agent_id,
+            "agent": self.group_title(agent_id),
             "step_count": len(steps),
             "preview_path": initial_prev,
             "win_w": initial_vw,
@@ -5924,6 +6267,7 @@ class BrowserEngine:
         in_page_total_js_ms = 0.0
         escalation_ms = 0.0
         ocr_ms = 0.0
+        fixed_wait_ms = 0.0
         all_escalations: list[str] = []
 
         def _accum_in_page(r: Any, dt_ms: float) -> None:
@@ -6072,7 +6416,10 @@ class BrowserEngine:
                         else:
                             had_pre_on_current_page = True
                     wait_ms = int(b_step.get("ms") or 30)
-                    if not interruptible_sleep(wait_ms / 1000.0):
+                    t_wait0 = time.perf_counter()
+                    slept = interruptible_sleep(wait_ms / 1000.0)
+                    fixed_wait_ms += (time.perf_counter() - t_wait0) * 1000.0
+                    if not slept:
                         return USER_STOPPED_ERROR
                     if not sess.is_extension and not sess._raw_page.is_closed():
                         try:
@@ -6506,6 +6853,7 @@ class BrowserEngine:
                 "in_page_snap": round(in_page_snap_ms, 2),
                 "escalation": round(escalation_ms, 2),
                 "ocr": round(ocr_ms, 2),
+                "fixed_wait": round(fixed_wait_ms, 2),
             },
         }
         if any_eval_truncated:
@@ -6565,6 +6913,13 @@ class BrowserEngine:
     def _reset_inner(self, agent: str | None = None) -> None:
         self._cancel_pending_preview()
         if agent and agent not in ("default", "all"):
+            client, sub = self.clients.lookup(agent)
+            if client is not None and not sub:
+                self._close_agent_tabs_inner(agent)
+                for tid in [k for k in self._tabs if self.in_scope(k, agent)]:
+                    self._tabs.pop(tid, None)
+                    self._tab_last_urls.pop(tid, None)
+                    self._tab_last_titles.pop(tid, None)
             prefix = f"{agent}:"
             for tid in [k for k in self._tabs if k.startswith(prefix) or k == agent]:
                 self._close_tab_inner(tid)

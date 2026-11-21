@@ -379,6 +379,7 @@ struct StatusUpdateSpec: Codable {
 
 struct BatchRequest: Codable {
     let agent: String?
+    let agentLabel: String?
     let cursor: String?
     let app: String?
     let window: WindowSpec?
@@ -402,6 +403,9 @@ struct BatchRequest: Codable {
     let highlightWindow: Bool?
     let togglePreview: Bool?
     let toggleZoom: Bool?
+    let liveView: Bool?
+    let menuOutline: Bool?
+    let menuAction: String?
     let dumpUiSnapshots: String?
     let statusUpdate: StatusUpdateSpec?
     let imagePath: String?
@@ -2018,7 +2022,181 @@ func invokeMenuBar(_ pid: pid_t, path: [String]) -> Bool {
     return false
 }
 
-let userStoppedErrorMessage = "Error: [USER_STOPPED] User clicked Stop in the macOS menu bar. Do NOT retry or call fmu again; stop immediately and report to the user. (Click '🛑 fmu Stopped ▶ Resume' in the macOS menu bar or run 'fmu --resume' to re-enable.)"
+let userStoppedErrorMessage = "Error: [USER_STOPPED] User clicked Stop in the macOS menu bar. Do NOT retry or call fmu again; stop immediately and report to the user. (Click Resume on the fmu menu bar item or run 'fmu --resume' to re-enable.)"
+
+let fmuPrefsPath: String = ProcessInfo.processInfo.environment["FMU_PREFS"]
+    ?? (NSHomeDirectory() as NSString).appendingPathComponent(".fmu/prefs.json")
+
+func loadFmuPrefs() -> [String: Any] {
+    guard let data = FileManager.default.contents(atPath: fmuPrefsPath),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+    return obj
+}
+
+func saveFmuPrefs(_ updates: [String: Any]) {
+    var prefs = loadFmuPrefs()
+    for (k, v) in updates { prefs[k] = v }
+    try? FileManager.default.createDirectory(atPath: (fmuPrefsPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+    if let data = try? JSONSerialization.data(withJSONObject: prefs, options: [.prettyPrinted, .sortedKeys]) {
+        try? data.write(to: URL(fileURLWithPath: fmuPrefsPath), options: .atomic)
+    }
+}
+
+func sessionDisplayLabel(_ agent: String) -> String {
+    let clean = cleanDisplayText(agent)
+    return ["", "default", "Agent", "parallel"].contains(clean) ? "" : clean
+}
+
+func chromeGroupColor(_ name: String) -> NSColor {
+    let hex: UInt32
+    switch name {
+    case "grey": hex = 0x5F6368
+    case "blue": hex = 0x1A73E8
+    case "red": hex = 0xD93025
+    case "yellow": hex = 0xF9AB00
+    case "green": hex = 0x188038
+    case "pink": hex = 0xD01884
+    case "purple": hex = 0xA142F4
+    case "cyan": hex = 0x007B83
+    case "orange": hex = 0xFA903E
+    default: hex = 0x5F6368
+    }
+    return NSColor(
+        calibratedRed: CGFloat((hex >> 16) & 0xFF) / 255.0,
+        green: CGFloat((hex >> 8) & 0xFF) / 255.0,
+        blue: CGFloat(hex & 0xFF) / 255.0,
+        alpha: 1.0
+    )
+}
+
+enum FMUIcon {
+    case play, stop, target, monitor, expand, compact, dock, reset, close, closeTabs
+
+    func draw(in r: NSRect, color: NSColor) {
+        let w = r.width
+        let h = r.height
+        func pt(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: r.minX + x * w, y: r.minY + y * h) }
+        let path = NSBezierPath()
+        path.lineWidth = max(1.2, w * 0.11)
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        func arrowHead(tip: NSPoint, from tail: NSPoint) {
+            let dir = atan2(tip.y - tail.y, tip.x - tail.x)
+            let len = w * 0.26
+            for spread in [-0.62, 0.62] {
+                let a = dir + .pi + spread
+                path.move(to: NSPoint(x: tip.x + cos(a) * len, y: tip.y + sin(a) * len))
+                path.line(to: tip)
+            }
+        }
+        color.setStroke()
+        color.setFill()
+        switch self {
+        case .play:
+            path.move(to: pt(0.26, 0.16))
+            path.line(to: pt(0.86, 0.5))
+            path.line(to: pt(0.26, 0.84))
+            path.close()
+            path.fill()
+        case .stop:
+            NSBezierPath(roundedRect: NSRect(x: r.minX + w * 0.2, y: r.minY + h * 0.2, width: w * 0.6, height: h * 0.6), xRadius: w * 0.1, yRadius: h * 0.1).fill()
+        case .target:
+            path.appendOval(in: r.insetBy(dx: w * 0.2, dy: h * 0.2))
+            for (a, b) in [((0.5, 0.0), (0.5, 0.24)), ((0.5, 0.76), (0.5, 1.0)), ((0.0, 0.5), (0.24, 0.5)), ((0.76, 0.5), (1.0, 0.5))] {
+                path.move(to: pt(a.0, a.1))
+                path.line(to: pt(b.0, b.1))
+            }
+            path.stroke()
+            NSBezierPath(ovalIn: NSRect(x: r.midX - w * 0.09, y: r.midY - h * 0.09, width: w * 0.18, height: h * 0.18)).fill()
+        case .monitor:
+            path.appendRoundedRect(NSRect(x: r.minX + w * 0.06, y: r.minY + h * 0.3, width: w * 0.88, height: h * 0.58), xRadius: w * 0.08, yRadius: h * 0.08)
+            path.move(to: pt(0.5, 0.3))
+            path.line(to: pt(0.5, 0.13))
+            path.move(to: pt(0.3, 0.12))
+            path.line(to: pt(0.7, 0.12))
+            path.stroke()
+        case .expand, .compact:
+            let pairs: [(NSPoint, NSPoint)] = self == .expand
+                ? [(pt(0.58, 0.58), pt(0.88, 0.88)), (pt(0.42, 0.42), pt(0.12, 0.12))]
+                : [(pt(0.88, 0.88), pt(0.6, 0.6)), (pt(0.12, 0.12), pt(0.4, 0.4))]
+            for (tail, tip) in pairs {
+                path.move(to: tail)
+                path.line(to: tip)
+                arrowHead(tip: tip, from: tail)
+            }
+            path.stroke()
+        case .dock:
+            path.appendRoundedRect(r.insetBy(dx: w * 0.08, dy: h * 0.16), xRadius: w * 0.08, yRadius: h * 0.08)
+            path.stroke()
+            NSBezierPath(roundedRect: NSRect(x: r.minX + w * 0.54, y: r.minY + h * 0.5, width: w * 0.26, height: h * 0.22), xRadius: w * 0.04, yRadius: h * 0.04).fill()
+        case .reset:
+            let c = NSPoint(x: r.midX, y: r.midY)
+            let radius = w * 0.32
+            path.appendArc(withCenter: c, radius: radius, startAngle: 135, endAngle: 405, clockwise: false)
+            path.stroke()
+            let endAngle = 45.0 * Double.pi / 180.0
+            let p = NSPoint(x: c.x + radius * cos(endAngle), y: c.y + radius * sin(endAngle))
+            let dir = NSPoint(x: cos(endAngle + Double.pi / 2), y: sin(endAngle + Double.pi / 2))
+            let nrm = NSPoint(x: cos(endAngle), y: sin(endAngle))
+            let len = w * 0.34
+            let head = NSBezierPath()
+            head.move(to: NSPoint(x: p.x + dir.x * len * 0.55, y: p.y + dir.y * len * 0.55))
+            head.line(to: NSPoint(x: p.x + nrm.x * len * 0.5 - dir.x * len * 0.25, y: p.y + nrm.y * len * 0.5 - dir.y * len * 0.25))
+            head.line(to: NSPoint(x: p.x - nrm.x * len * 0.5 - dir.x * len * 0.25, y: p.y - nrm.y * len * 0.5 - dir.y * len * 0.25))
+            head.close()
+            head.fill()
+        case .close:
+            path.move(to: pt(0.24, 0.24))
+            path.line(to: pt(0.76, 0.76))
+            path.move(to: pt(0.24, 0.76))
+            path.line(to: pt(0.76, 0.24))
+            path.stroke()
+        case .closeTabs:
+            path.move(to: pt(0.02, 0.16))
+            path.line(to: pt(0.98, 0.16))
+            path.move(to: pt(0.12, 0.16))
+            path.line(to: pt(0.2, 0.82))
+            path.line(to: pt(0.8, 0.82))
+            path.line(to: pt(0.88, 0.16))
+            path.move(to: pt(0.4, 0.36))
+            path.line(to: pt(0.6, 0.6))
+            path.move(to: pt(0.4, 0.6))
+            path.line(to: pt(0.6, 0.36))
+            path.stroke()
+        }
+    }
+
+    func menuImage(size: CGFloat = 14) -> NSImage {
+        let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            self.draw(in: rect.insetBy(dx: 0.5, dy: 0.5), color: .black)
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+
+    static func statusDotImage(_ color: NSColor, size: CGFloat = 14) -> NSImage {
+        let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: size * 0.28, dy: size * 0.28)).fill()
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+}
+
+func drawIconLabel(_ icon: FMUIcon?, _ label: NSAttributedString, centeredIn rect: NSRect, iconSize: CGFloat, color: NSColor) {
+    let sz = label.size()
+    let gap: CGFloat = (icon != nil && label.length > 0) ? 4 : 0
+    let iconW: CGFloat = icon == nil ? 0 : iconSize
+    var x = rect.midX - (iconW + gap + sz.width) / 2
+    if let icon = icon {
+        icon.draw(in: NSRect(x: x, y: rect.midY - iconSize / 2, width: iconSize, height: iconSize), color: color)
+        x += iconW + gap
+    }
+    label.draw(at: NSPoint(x: x, y: rect.midY - sz.height / 2))
+}
 
 final class FMUHudPanel: NSPanel {
     override var canBecomeKey: Bool { false }
@@ -2096,8 +2274,8 @@ final class FMUHighlightView: NSView {
         let cleanTarget = cleanDisplayText(targetLabel.isEmpty ? "Target Window" : targetLabel)
         let cleanOp = cleanDisplayText(opLabel)
         let badgeText = bounds.width < 290
-            ? "🎯 fmu: \(cleanTarget)\(cleanOp.isEmpty ? "" : " · \(cleanOp)")"
-            : "🎯 fmu Working Here: \(cleanTarget)\(cleanOp.isEmpty ? "" : " · \(cleanOp)")"
+            ? "fmu: \(cleanTarget)\(cleanOp.isEmpty ? "" : " · \(cleanOp)")"
+            : "fmu Working Here: \(cleanTarget)\(cleanOp.isEmpty ? "" : " · \(cleanOp)")"
         let pStyle = NSMutableParagraphStyle()
         pStyle.lineBreakMode = .byTruncatingTail
         pStyle.alignment = .center
@@ -2108,7 +2286,7 @@ final class FMUHighlightView: NSView {
         ]
         let badgeStr = NSAttributedString(string: badgeText, attributes: badgeAttrs)
         let badgeSz = badgeStr.size()
-        let badgeW = min(max(80, bounds.width - 20), ceil(badgeSz.width) + 22)
+        let badgeW = min(max(80, bounds.width - 20), ceil(badgeSz.width) + 38)
         let badgeH: CGFloat = 24
         let badgeRect = NSRect(x: max(10, (bounds.width - badgeW) / 2.0), y: 8, width: badgeW, height: badgeH)
         let badgeBg = NSBezierPath(roundedRect: badgeRect, xRadius: 7, yRadius: 7)
@@ -2117,10 +2295,11 @@ final class FMUHighlightView: NSView {
         badgeBg.lineWidth = 1.3
         NSColor(calibratedRed: 0.28, green: 0.98, blue: 0.50, alpha: 0.96).setStroke()
         badgeBg.stroke()
+        FMUIcon.target.draw(in: NSRect(x: badgeRect.minX + 10, y: badgeRect.midY - 6, width: 12, height: 12), color: .white)
         let textDrawRect = NSRect(
-            x: badgeRect.minX + 10,
+            x: badgeRect.minX + 26,
             y: badgeRect.minY + (badgeH - badgeSz.height) / 2.0,
-            width: badgeRect.width - 20,
+            width: badgeRect.width - 36,
             height: ceil(badgeSz.height) + 2
         )
         badgeStr.draw(in: textDrawRect)
@@ -2198,6 +2377,7 @@ final class FMUHudView: NSView {
     var coordRect: CGRect = CGRect(x: 0, y: 0, width: 1280, height: 800)
     var cursorPt: CGPoint?
     var cursorLabel: String = ""
+    var agentLabel: String = ""
     var isHovered: Bool = false
     var isStopHovered: Bool = false
     var isCloseHovered: Bool = false
@@ -2435,27 +2615,27 @@ final class FMUHudView: NSView {
                 NSColor(calibratedWhite: 1.0, alpha: 0.18).setFill()
                 xBg.fill()
             }
-            let xAttr: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 11, weight: .bold),
-                .foregroundColor: NSColor(calibratedWhite: isCloseHovered ? 1.0 : 0.72, alpha: 0.95)
-            ]
-            let xStr = NSAttributedString(string: "✕", attributes: xAttr)
-            let xSz = xStr.size()
-            xStr.draw(at: NSPoint(x: xRect.midX - xSz.width / 2, y: xRect.midY - xSz.height / 2))
+            FMUIcon.close.draw(
+                in: NSRect(x: xRect.midX - 5, y: xRect.midY - 5, width: 10, height: 10),
+                color: NSColor(calibratedWhite: isCloseHovered ? 1.0 : 0.72, alpha: 0.95)
+            )
             rightEdge = xRect.minX - 6
             leftOfButtons = rightEdge
         }
 
         if state == "stopped" || state == "working" {
             let btnText: String
+            let btnIcon: FMUIcon
             let btnColor: NSColor
             if state == "stopped" {
-                btnText = "▶ Click to Resume"
+                btnText = "Click to Resume"
+                btnIcon = .play
                 btnColor = (isHovered && !isCloseHovered)
                     ? NSColor(calibratedRed: 0.20, green: 0.78, blue: 0.35, alpha: 1.0)
                     : NSColor(calibratedRed: 0.16, green: 0.68, blue: 0.29, alpha: 1.0)
             } else {
-                btnText = "⏹ Stop"
+                btnText = "Stop"
+                btnIcon = .stop
                 btnColor = isStopHovered
                     ? NSColor(calibratedRed: 1.0, green: 0.28, blue: 0.24, alpha: 1.0)
                     : NSColor(calibratedRed: 0.92, green: 0.20, blue: 0.18, alpha: 1.0)
@@ -2468,7 +2648,7 @@ final class FMUHudView: NSView {
             ]
             let btnAttrStr = NSAttributedString(string: btnText, attributes: btnAttrs)
             let btnTextSz = btnAttrStr.size()
-            let btnW = ceil(btnTextSz.width) + 16
+            let btnW = ceil(btnTextSz.width) + 29
             let btnRect = NSRect(x: rightEdge - btnW, y: headerMidY - btnH / 2, width: btnW, height: btnH)
             stopBtnRect = btnRect
             let btnPath = NSBezierPath(roundedRect: btnRect, xRadius: 6.5, yRadius: 6.5)
@@ -2479,11 +2659,11 @@ final class FMUHudView: NSView {
                 NSColor(calibratedWhite: 1.0, alpha: 0.5).setStroke()
                 btnPath.stroke()
             }
-            btnAttrStr.draw(at: NSPoint(x: btnRect.midX - btnTextSz.width / 2, y: btnRect.midY - btnTextSz.height / 2))
+            drawIconLabel(btnIcon, btnAttrStr, centeredIn: btnRect, iconSize: 9, color: .white)
             leftOfButtons = btnRect.minX - 5
         }
 
-        // Secondary '🎯 Highlight' + '⤢ Zoom' + '▾/▴' Preview Toggle buttons when working
+        // Secondary Highlight + Zoom + Preview Toggle buttons when working
         if state == "working" {
             // 1. Compact preview expand/collapse toggle button (vector chevron)
             let togW: CGFloat = 24
@@ -2515,7 +2695,7 @@ final class FMUHudView: NSView {
             chev.stroke()
             leftOfButtons = togRect.minX - 5
 
-            // 2. HD Large Monitor Zoom toggle ('⤢' / '⤡') when preview is expanded
+            // 2. HD Large Monitor Zoom toggle when preview is expanded
             if showPreview {
                 let zmW: CGFloat = 24
                 let zmRect = NSRect(x: leftOfButtons - zmW, y: headerMidY - btnH / 2, width: zmW, height: btnH)
@@ -2532,26 +2712,22 @@ final class FMUHudView: NSView {
                 }
                 zmPath.stroke()
 
-                let zmSym = isZoomedPreview ? "⤡" : "⤢"
-                let zmAttrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: 12.0, weight: .bold),
-                    .foregroundColor: NSColor.white
-                ]
-                let zmStr = NSAttributedString(string: zmSym, attributes: zmAttrs)
-                let zmSz = zmStr.size()
-                zmStr.draw(at: NSPoint(x: zmRect.midX - zmSz.width / 2, y: zmRect.midY - zmSz.height / 2))
+                (isZoomedPreview ? FMUIcon.compact : FMUIcon.expand).draw(
+                    in: NSRect(x: zmRect.midX - 6, y: zmRect.midY - 6, width: 12, height: 12),
+                    color: .white
+                )
                 leftOfButtons = zmRect.minX - 5
             }
 
-            // 3. '🎯 Highlight' button
-            let hlText = highlightActive ? "🎯 Active" : "🎯 Highlight"
+            // 3. Highlight button
+            let hlText = highlightActive ? "Active" : "Highlight"
             let hlAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
                 .foregroundColor: NSColor.white
             ]
             let hlStr = NSAttributedString(string: hlText, attributes: hlAttrs)
             let hlSz = hlStr.size()
-            let hlW = ceil(hlSz.width) + 12
+            let hlW = ceil(hlSz.width) + 26
             let hlRect = NSRect(x: leftOfButtons - hlW, y: headerMidY - btnH / 2, width: hlW, height: btnH)
             highlightBtnRect = hlRect
             let hlPath = NSBezierPath(roundedRect: hlRect, xRadius: 6, yRadius: 6)
@@ -2561,7 +2737,7 @@ final class FMUHudView: NSView {
             hlPath.lineWidth = highlightActive ? 1.4 : 1.0
             NSColor(calibratedRed: 0.25, green: 0.95, blue: 0.48, alpha: highlightActive ? 0.98 : 0.75).setStroke()
             hlPath.stroke()
-            hlStr.draw(at: NSPoint(x: hlRect.midX - hlSz.width / 2, y: hlRect.midY - hlSz.height / 2))
+            drawIconLabel(.target, hlStr, centeredIn: hlRect, iconSize: 10, color: .white)
             leftOfButtons = hlRect.minX - 6
         }
 
@@ -2585,7 +2761,8 @@ final class FMUHudView: NSView {
             let surfLabel = (surface == "web" || surface == "browser") ? "Web" : "App"
             let tgt = cleanDisplayText(target.isEmpty ? (surfLabel == "Web" ? "Browser" : "macOS") : target)
             let opLabel = cleanDisplayText(op.isEmpty ? "work" : op)
-            subStr = "\(surfLabel): \(tgt) → \(opLabel)"
+            let who = sessionDisplayLabel(agentLabel)
+            subStr = who.isEmpty ? "\(surfLabel): \(tgt) → \(opLabel)" : "\(who) · \(surfLabel): \(tgt) → \(opLabel)"
         } else {
             titleStr = "fmu Agent Resumed"
             subStr = "Ready (Idle)"
@@ -2669,25 +2846,28 @@ final class FMUHudView: NSView {
                 winFramePath.stroke()
 
                 // Subtle top-left LIVE stream badge
-                let liveBadgeText = isLiveInFlight ? "● LIVE" : "● LIVE HOLD"
+                let liveBadgeText = isLiveInFlight ? "LIVE" : "LIVE HOLD"
+                let liveColor = isLiveInFlight
+                    ? NSColor(calibratedRed: 0.35, green: 1.0, blue: 0.55, alpha: 1.0)
+                    : NSColor(calibratedWhite: 0.88, alpha: 0.92)
                 let liveAttrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.monospacedSystemFont(ofSize: 8.5, weight: .bold),
-                    .foregroundColor: isLiveInFlight
-                        ? NSColor(calibratedRed: 0.35, green: 1.0, blue: 0.55, alpha: 1.0)
-                        : NSColor(calibratedWhite: 0.88, alpha: 0.92)
+                    .foregroundColor: liveColor
                 ]
                 let liveStr = NSAttributedString(string: liveBadgeText, attributes: liveAttrs)
                 let liveSz = liveStr.size()
                 let liveRect = NSRect(
                     x: winDrawRect.minX + 6,
                     y: winDrawRect.maxY - liveSz.height - 8,
-                    width: ceil(liveSz.width) + 10,
+                    width: ceil(liveSz.width) + 19,
                     height: ceil(liveSz.height) + 4
                 )
                 let liveBg = NSBezierPath(roundedRect: liveRect, xRadius: 4, yRadius: 4)
                 NSColor(calibratedRed: 0.04, green: 0.06, blue: 0.09, alpha: 0.78).setFill()
                 liveBg.fill()
-                liveStr.draw(at: NSPoint(x: liveRect.minX + 5, y: liveRect.minY + 2))
+                liveColor.setFill()
+                NSBezierPath(ovalIn: NSRect(x: liveRect.minX + 5, y: liveRect.midY - 2.5, width: 5, height: 5)).fill()
+                liveStr.draw(at: NSPoint(x: liveRect.minX + 14, y: liveRect.minY + 2))
 
                 // Draw Virtual Cursor & pulsing target reticle ONLY when an actual target coordinate exists
                 let coordW = max(1.0, coordRect.width)
@@ -2800,13 +2980,13 @@ final class FMUHudView: NSView {
             ]
             let leftTitle: String
             if surface == "web" || surface == "browser" {
-                leftTitle = isHeadlessWeb ? "👻 Headless Tab Stream" : "📺 Live Tab Stream"
+                leftTitle = isHeadlessWeb ? "Headless Tab Stream" : "Live Tab Stream"
             } else {
-                leftTitle = "📺 Live App Window"
+                leftTitle = "Live App Window"
             }
             let rightTitle = highlightActive
-                ? (isHeadlessWeb ? "✨ Active in Headless Stream" : "✨ Highlighted on screen!")
-                : (isZoomedPreview ? "🎯 Click to highlight · ⤡ Compact" : "🎯 Click to highlight · ⤢ Expand HD")
+                ? (isHeadlessWeb ? "Active in Headless Stream" : "Highlighted on Screen")
+                : (isZoomedPreview ? "Click to highlight · Compact" : "Click to highlight · Expand HD")
             let leftCap = NSAttributedString(string: leftTitle, attributes: capLeftAttrs)
             let rightCap = NSAttributedString(string: rightTitle, attributes: capRightAttrs)
             leftCap.draw(at: NSPoint(x: stage.minX + 8, y: stage.minY + 3))
@@ -2837,8 +3017,9 @@ final class MenuBarController: NSObject {
     private var _highlightUntil: Double = 0
     private var _hudDismissedWhileStopped: Bool = false
     private var _hudDismissedWhileHolding: Bool = false
-    private var _showLivePreview: Bool = (ProcessInfo.processInfo.environment["FMU_PREVIEW"] != "0")
-    private var _zoomedPreview: Bool = false
+    private var _liveViewEnabled: Bool = (loadFmuPrefs()["liveView"] as? Bool) ?? true
+    private var _showLivePreview: Bool = ProcessInfo.processInfo.environment["FMU_PREVIEW"] != "0" && ((loadFmuPrefs()["livePreview"] as? Bool) ?? true)
+    private var _zoomedPreview: Bool = (loadFmuPrefs()["zoomedPreview"] as? Bool) ?? false
     private var _customHudOrigin: NSPoint? = nil
     private var _surface: String = "idle"
     private var _target: String = ""
@@ -2959,7 +3140,7 @@ final class MenuBarController: NSObject {
     private func computeDisplayLocked(now: Double) -> (state: String, plainTitle: String, surface: String, target: String, op: String, agent: String, stopped: Bool, isLiveInFlight: Bool, justResumed: Bool, hudDismissed: Bool, showPreview: Bool, highlightActive: Bool) {
         let hlActive = (_highlightUntil > now)
         if _isStopped {
-            return ("stopped", "🛑 fmu Stopped  ▶ Resume", _surface, _target, _op, _agent, true, false, false, _hudDismissedWhileStopped, false, hlActive)
+            return ("stopped", "fmu Stopped · Resume", _surface, _target, _op, _agent, true, false, false, _hudDismissedWhileStopped || !_liveViewEnabled, false, hlActive)
         }
         if _activeCount > 0 && _lastActiveTime > 0 && (now - _lastActiveTime) > maxInFlightSeconds {
             _activeCount = 0
@@ -2969,13 +3150,13 @@ final class MenuBarController: NSObject {
         if isWorking {
             let shortTarget = truncateLabel(_target.isEmpty ? (_surface == "web" ? "Chrome" : "macOS") : _target, maxChars: 18)
             let shortOp = truncateLabel(_op.isEmpty ? "work" : _op, maxChars: 10)
-            let title = "🟢 fmu Working: \(shortTarget) · \(shortOp)  ⏹ Stop"
+            let title = "fmu Working: \(shortTarget) · \(shortOp) · Stop"
             let isLive = (_activeCount > 0)
-            let dismissed = (!isLive && _hudDismissedWhileHolding)
+            let dismissed = (!isLive && _hudDismissedWhileHolding) || !_liveViewEnabled
             return ("working", title, _surface, _target, _op, _agent, false, isLive, false, dismissed, _showLivePreview, hlActive)
         }
-        let justResumed = (_justResumedUntil > now)
-        return ("idle", "⚪ fmu Idle", "idle", _target, _op, _agent, false, false, justResumed, false, false, hlActive)
+        let justResumed = (_justResumedUntil > now) && _liveViewEnabled
+        return ("idle", "fmu Idle", "idle", _target, _op, _agent, false, false, justResumed, false, false, hlActive)
     }
 
     func dismissStoppedHud() {
@@ -2994,11 +3175,22 @@ final class MenuBarController: NSObject {
         refreshUIAsync(immediateIfMain: true)
     }
 
+    func setLiveView(_ enabled: Bool) {
+        statusLock.lock()
+        _liveViewEnabled = enabled
+        _previewGeneration &+= 1
+        statusLock.unlock()
+        saveFmuPrefs(["liveView": enabled])
+        refreshUIAsync(immediateIfMain: true)
+    }
+
     func toggleLivePreview() {
         statusLock.lock()
         _showLivePreview.toggle()
         _previewGeneration &+= 1
+        let shown = _showLivePreview
         statusLock.unlock()
+        saveFmuPrefs(["livePreview": shown])
         if _showLivePreview {
             maybeCaptureWindowThumbnailAsync(force: true)
         }
@@ -3010,7 +3202,9 @@ final class MenuBarController: NSObject {
         _showLivePreview = true
         _zoomedPreview.toggle()
         _previewGeneration &+= 1
+        let zoomedNow = _zoomedPreview
         statusLock.unlock()
+        saveFmuPrefs(["livePreview": true, "zoomedPreview": zoomedNow])
         maybeCaptureWindowThumbnailAsync(force: true)
         refreshUIAsync(immediateIfMain: true)
     }
@@ -3299,7 +3493,7 @@ final class MenuBarController: NSObject {
         if ProcessInfo.processInfo.environment["FMU_PREVIEW"] == "0" { return }
         let now = CFAbsoluteTimeGetCurrent()
         statusLock.lock()
-        if _isStopped || _surface == "web" || _surface == "browser" || _surface == "parallel" || _surface == "idle" {
+        if !_liveViewEnabled || !_showLivePreview || _isStopped || _surface == "web" || _surface == "browser" || _surface == "parallel" || _surface == "idle" {
             statusLock.unlock()
             return
         }
@@ -3634,10 +3828,11 @@ final class MenuBarController: NSObject {
         let hlVis = info.highlightActive
         let hasFrame = (_previewImage != nil)
         let zoomed = _zoomedPreview
+        let liveViewOn = _liveViewEnabled
         statusLock.unlock()
         let escTarget = info.target.replacingOccurrences(of: "\"", with: "'")
         let escTitle = info.plainTitle.replacingOccurrences(of: "\"", with: "'")
-        return "# fmu-menubar state=\"\(info.state)\" title=\"\(escTitle)\" stopped=\(info.stopped ? "true" : "false") surface=\"\(info.surface)\" target=\"\(escTarget)\" op=\"\(info.op)\" agent=\"\(info.agent)\" visible=\(visible ? "true" : "false") hud=\(hudVis ? "true" : "false") preview=\(prevVis ? "true" : "false") hasFrame=\(hasFrame ? "true" : "false") zoomed=\(zoomed ? "true" : "false") highlight=\(hlVis ? "true" : "false") axTrusted=\(AXIsProcessTrusted() ? "true" : "false")"
+        return "# fmu-menubar state=\"\(info.state)\" title=\"\(escTitle)\" stopped=\(info.stopped ? "true" : "false") surface=\"\(info.surface)\" target=\"\(escTarget)\" op=\"\(info.op)\" agent=\"\(info.agent)\" visible=\(visible ? "true" : "false") hud=\(hudVis ? "true" : "false") preview=\(prevVis ? "true" : "false") hasFrame=\(hasFrame ? "true" : "false") zoomed=\(zoomed ? "true" : "false") highlight=\(hlVis ? "true" : "false") liveView=\(liveViewOn ? "true" : "false") axTrusted=\(AXIsProcessTrusted() ? "true" : "false")"
     }
 
     private func refreshUIAsync(immediateIfMain: Bool = false) {
@@ -3694,6 +3889,7 @@ final class MenuBarController: NSObject {
     ) -> NSImage {
         let statusLabel: String
         let ctaLabel: String
+        let ctaIcon: FMUIcon
         let ctaBgColor: NSColor
         let capsuleFill: NSColor
         let capsuleBorder: NSColor
@@ -3702,20 +3898,23 @@ final class MenuBarController: NSObject {
 
         if state == "stopped" {
             statusLabel = "fmu Stopped"
-            ctaLabel = "▶ Resume"
+            ctaLabel = "Resume"
+            ctaIcon = .play
             ctaBgColor = NSColor(calibratedRed: 0.16, green: 0.68, blue: 0.29, alpha: 1.0)
             capsuleFill = NSColor(calibratedRed: 0.26, green: 0.08, blue: 0.08, alpha: 0.94)
             capsuleBorder = NSColor(calibratedRed: 0.98, green: 0.30, blue: 0.26, alpha: 0.90)
         } else if state == "working" {
             let cleanTgt = truncateLabel(shortTarget, maxChars: 12)
             statusLabel = cleanTgt.isEmpty ? "fmu Working" : "fmu · \(cleanTgt)"
-            ctaLabel = "⏹ Stop"
+            ctaLabel = "Stop"
+            ctaIcon = .stop
             ctaBgColor = NSColor(calibratedRed: 0.94, green: 0.20, blue: 0.18, alpha: 1.0)
             capsuleFill = NSColor(calibratedRed: 0.06, green: 0.20, blue: 0.11, alpha: 0.94)
             capsuleBorder = NSColor(calibratedRed: 0.22, green: 0.88, blue: 0.40, alpha: 0.92)
         } else {
             statusLabel = "fmu Idle"
             ctaLabel = ""
+            ctaIcon = .stop
             ctaBgColor = .clear
             capsuleFill = NSColor(calibratedRed: 0.11, green: 0.13, blue: 0.16, alpha: 0.90)
             capsuleBorder = NSColor(calibratedWhite: 0.45, alpha: 0.65)
@@ -3740,7 +3939,7 @@ final class MenuBarController: NSObject {
 
         let leftIconSpace: CGFloat = 20
         let ctaPadX: CGFloat = 10
-        let ctaW = hasCta ? (ceil(ctaSz.width) + ctaPadX) : 0
+        let ctaW = hasCta ? (ceil(ctaSz.width) + ctaPadX + 11) : 0
         let ctaH: CGFloat = 15
         let totalW = hasCta
             ? (leftIconSpace + ceil(statusSz.width) + 7 + ctaW + 5)
@@ -3800,7 +3999,7 @@ final class MenuBarController: NSObject {
                 ctaBgColor.setFill()
                 ctaPath.fill()
 
-                ctaAttrStr.draw(at: NSPoint(x: ctaRect.midX - ctaSz.width / 2.0, y: ctaRect.midY - ctaSz.height / 2.0))
+                drawIconLabel(ctaIcon, ctaAttrStr, centeredIn: ctaRect, iconSize: 7, color: .white)
             }
             return true
         }
@@ -3906,6 +4105,7 @@ final class MenuBarController: NSObject {
         view.coordRect = coordR
         view.cursorPt = curPt
         view.cursorLabel = curLbl
+        view.agentLabel = info.agent
         view.needsDisplay = true
 
         let screen = statusItem?.button?.window?.screen ?? NSScreen.main ?? NSScreen.screens.first
@@ -4027,7 +4227,7 @@ final class MenuBarController: NSObject {
         let now = CFAbsoluteTimeGetCurrent()
         statusLock.lock()
         let info = computeDisplayLocked(now: now)
-        let prevOn = _showLivePreview
+        let liveViewOn = _liveViewEnabled
         let zoomed = _zoomedPreview
         let hasCustomPos = (_customHudOrigin != nil)
         statusLock.unlock()
@@ -4038,14 +4238,20 @@ final class MenuBarController: NSObject {
         menu.addItem(headerItem)
 
         let stateDesc: String
+        let stateColor: NSColor
         if info.stopped {
-            stateDesc = "Status: 🛑 Stopped by User (Agent calls blocked)"
+            stateDesc = "Stopped by User (Agent calls blocked)"
+            stateColor = NSColor(calibratedRed: 1.0, green: 0.23, blue: 0.19, alpha: 1.0)
         } else if info.state == "working" {
-            stateDesc = "Status: 🟢 Working — \(info.surface) (\(info.target.isEmpty ? "active" : info.target) · \(info.op.isEmpty ? "work" : info.op))"
+            let who = sessionDisplayLabel(info.agent)
+            stateDesc = "Working — \(who.isEmpty ? "" : "\(who) · ")\(info.surface) (\(info.target.isEmpty ? "active" : info.target) · \(info.op.isEmpty ? "work" : info.op))"
+            stateColor = NSColor(calibratedRed: 0.19, green: 0.82, blue: 0.35, alpha: 1.0)
         } else {
-            stateDesc = "Status: ⚪ Idle (Agent is not working right now)"
+            stateDesc = "Idle (Agent is not working right now)"
+            stateColor = NSColor(calibratedWhite: 0.55, alpha: 1.0)
         }
         let statusMenuItem = NSMenuItem(title: stateDesc, action: nil, keyEquivalent: "")
+        statusMenuItem.image = FMUIcon.statusDotImage(stateColor)
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
 
@@ -4055,48 +4261,88 @@ final class MenuBarController: NSObject {
             menu.addItem(lastItem)
         }
 
-        menu.addItem(NSMenuItem.separator())
+        func addAction(_ title: String, _ icon: FMUIcon, _ action: Selector) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.image = icon.menuImage()
+            item.target = self
+            menu.addItem(item)
+        }
 
+        menu.addItem(NSMenuItem.separator())
         if info.stopped {
-            let resumeItem = NSMenuItem(title: "▶ Resume Agent Automation", action: #selector(menuResumeClicked), keyEquivalent: "")
-            resumeItem.target = self
-            menu.addItem(resumeItem)
+            addAction("Resume Agent Automation", .play, #selector(menuResumeClicked))
         } else if info.state == "working" {
-            let stopItem = NSMenuItem(title: "⏹ Stop Agent Immediately", action: #selector(menuStopClicked), keyEquivalent: "")
-            stopItem.target = self
-            menu.addItem(stopItem)
+            addAction("Stop Agent Immediately", .stop, #selector(menuStopClicked))
         }
-
-        let hlItem = NSMenuItem(title: "🎯 Highlight Target Window on Screen", action: #selector(menuHighlightClicked), keyEquivalent: "")
-        hlItem.target = self
-        menu.addItem(hlItem)
-
-        let prevTitle = prevOn ? "📺 Hide Live Screen Monitor" : "📺 Show Live Screen Monitor"
-        let prevItem = NSMenuItem(title: prevTitle, action: #selector(menuTogglePreviewClicked), keyEquivalent: "")
-        prevItem.target = self
-        menu.addItem(prevItem)
-
-        let zoomTitle = zoomed ? "🗗 Compact Live Screen Monitor" : "🔍 Large HD Live Screen Monitor"
-        let zoomItem = NSMenuItem(title: zoomTitle, action: #selector(menuToggleZoomClicked), keyEquivalent: "")
-        zoomItem.target = self
-        menu.addItem(zoomItem)
-
-        if hasCustomPos {
-            let posItem = NSMenuItem(title: "⌖ Dock Live Monitor to Top-Right", action: #selector(menuResetPositionClicked), keyEquivalent: "")
-            posItem.target = self
-            menu.addItem(posItem)
+        addAction("Highlight Target Window on Screen", .target, #selector(menuHighlightClicked))
+        let liveItem = NSMenuItem(title: "Show Live View Monitor", action: #selector(menuToggleLiveViewClicked), keyEquivalent: "")
+        liveItem.image = FMUIcon.monitor.menuImage()
+        liveItem.state = liveViewOn ? .on : .off
+        liveItem.target = self
+        menu.addItem(liveItem)
+        if liveViewOn {
+            addAction(zoomed ? "Compact Live Screen Monitor" : "Large HD Live Screen Monitor", zoomed ? .compact : .expand, #selector(menuToggleZoomClicked))
         }
-
-        let resetItem = NSMenuItem(title: "↺ Reset Agent State", action: #selector(menuResetClicked), keyEquivalent: "")
-        resetItem.target = self
-        menu.addItem(resetItem)
+        if liveViewOn && hasCustomPos {
+            addAction("Dock Live Monitor to Top-Right", .dock, #selector(menuResetPositionClicked))
+        }
+        addAction("Reset Agent State", .reset, #selector(menuResetClicked))
 
         menu.addItem(NSMenuItem.separator())
+        let sessions = fetchAgentSessions()
+        if !sessions.isEmpty {
+            let sessHeader = NSMenuItem(title: "Agent Sessions", action: nil, keyEquivalent: "")
+            sessHeader.isEnabled = false
+            menu.addItem(sessHeader)
+            for ses in sessions {
+                let tabs = ses["tabs"] as? Int ?? 0
+                let idle = ses["idleSec"] as? Int ?? 0
+                let item = NSMenuItem(title: "\(ses["label"] as? String ?? "Agent") — \(tabs) tab\(tabs == 1 ? "" : "s")", action: nil, keyEquivalent: "")
+                item.image = FMUIcon.statusDotImage(chromeGroupColor(ses["color"] as? String ?? "grey"))
+                let sub = NSMenu()
+                let idleItem = NSMenuItem(title: idle < 60 ? "Active \(idle)s ago" : "Active \(idle / 60)m ago", action: nil, keyEquivalent: "")
+                idleItem.isEnabled = false
+                sub.addItem(idleItem)
+                let closeItem = NSMenuItem(title: "Close This Session's Agent Tabs", action: #selector(menuCloseSessionTabsClicked(_:)), keyEquivalent: "")
+                closeItem.image = FMUIcon.closeTabs.menuImage()
+                closeItem.target = self
+                closeItem.representedObject = ses["id"] as? String
+                sub.addItem(closeItem)
+                item.submenu = sub
+                menu.addItem(item)
+            }
+        }
+        addAction("Close All Agent-Opened Chrome Tabs", .closeTabs, #selector(menuCloseAgentTabsClicked))
 
-        let quitItem = NSMenuItem(title: "✕ Quit fmu Menu Bar & Daemon", action: #selector(menuQuitClicked), keyEquivalent: "")
-        quitItem.target = self
-        menu.addItem(quitItem)
+        menu.addItem(NSMenuItem.separator())
+        addAction("Quit fmu Menu Bar & Daemon", .close, #selector(menuQuitClicked))
         return menu
+    }
+
+    func menuOutline() -> String {
+        func walk(_ menu: NSMenu, depth: Int) -> [String] {
+            menu.items.flatMap { item -> [String] in
+                if item.isSeparatorItem { return [String(repeating: "  ", count: depth) + "---"] }
+                let mark = item.state == .on ? "[x] " : ""
+                let flags = (item.image != nil ? " +icon" : "") + (item.isEnabled && item.action != nil ? "" : " (disabled)")
+                let line = String(repeating: "  ", count: depth) + mark + item.title + flags
+                return [line] + (item.submenu.map { walk($0, depth: depth + 1) } ?? [])
+            }
+        }
+        return walk(buildContextMenu(), depth: 0).joined(separator: "\n")
+    }
+
+    func performMenuAction(path: String) -> String {
+        let parts = path.components(separatedBy: " > ")
+        var menu: NSMenu? = buildContextMenu()
+        var found: NSMenuItem?
+        for part in parts {
+            found = menu?.items.first { $0.title == part || $0.title.hasPrefix(part + " — ") }
+            menu = found?.submenu
+        }
+        guard let item = found, let action = item.action else { return "Error: no actionable menu item at '\(path)'" }
+        NSApp.sendAction(action, to: item.target, from: item)
+        return "# fmu-menu performed \"\(item.title)\""
     }
 
     private func showContextMenu() {
@@ -4119,8 +4365,11 @@ final class MenuBarController: NSObject {
         triggerHighlightWindow()
     }
 
-    @objc private func menuTogglePreviewClicked() {
-        toggleLivePreview()
+    @objc private func menuToggleLiveViewClicked() {
+        statusLock.lock()
+        let enabled = !_liveViewEnabled
+        statusLock.unlock()
+        setLiveView(enabled)
     }
 
     @objc private func menuToggleZoomClicked() {
@@ -4139,6 +4388,29 @@ final class MenuBarController: NSObject {
             EngineState.shared.reset()
             EngineState.shared.lock.unlock()
             _ = trySendToDaemon(socketPath: rtSock, payload: "{\"reset\":true,\"resume\":true}")
+        }
+    }
+
+    private func fetchAgentSessions() -> [[String: Any]] {
+        guard let raw = trySendToDaemon(socketPath: runtimeSocketPath, payload: "{\"agentSessions\":{\"format\":\"json\"}}", timeoutSec: 0.35),
+              let data = raw.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+              let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return list
+    }
+
+    @objc private func menuCloseSessionTabsClicked(_ sender: NSMenuItem) {
+        guard let owner = sender.representedObject as? String else { return }
+        let rtSock = self.runtimeSocketPath
+        let payload = String(data: try! JSONSerialization.data(withJSONObject: ["closeAgentTabs": true, "owner": owner]), encoding: .utf8)!
+        DispatchQueue.global(qos: .userInteractive).async {
+            _ = trySendToDaemon(socketPath: rtSock, payload: payload)
+        }
+    }
+
+    @objc private func menuCloseAgentTabsClicked() {
+        let rtSock = self.runtimeSocketPath
+        DispatchQueue.global(qos: .userInteractive).async {
+            _ = trySendToDaemon(socketPath: rtSock, payload: "{\"closeAgentTabs\":true}")
         }
     }
 
@@ -4322,6 +4594,19 @@ func handleControlRequest(_ req: BatchRequest) -> String? {
         return MenuBarController.shared.statusLine()
     }
 
+    if req.menuOutline == true {
+        return DispatchQueue.main.sync { MenuBarController.shared.menuOutline() }
+    }
+
+    if let path = req.menuAction {
+        return DispatchQueue.main.sync { MenuBarController.shared.performMenuAction(path: path) }
+    }
+
+    if let enabled = req.liveView {
+        MenuBarController.shared.setLiveView(enabled)
+        return MenuBarController.shared.statusLine()
+    }
+
     if req.togglePreview == true {
         MenuBarController.shared.toggleLivePreview()
         return MenuBarController.shared.statusLine()
@@ -4416,7 +4701,7 @@ func executeRequest(_ req: BatchRequest) -> String {
         target: app.name,
         op: firstOp,
         stepCount: max(1, totalSteps),
-        agent: agentId
+        agent: req.agentLabel ?? agentId
     )
     defer {
         MenuBarController.shared.endWork(surface: "app", target: app.name, op: lastExecutedOp, stepCount: max(1, totalSteps))
@@ -5226,10 +5511,15 @@ func decodeBatchRequestOrError(_ rawData: Data) -> DecodedBatchRequest {
 
 let defaultSocketPath = "/tmp/fmu-ax.sock"
 
-func trySendToDaemon(socketPath: String, payload: String) -> String? {
+func trySendToDaemon(socketPath: String, payload: String, timeoutSec: Double? = nil) -> String? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
+    if let t = timeoutSec {
+        var tv = timeval(tv_sec: Int(t), tv_usec: Int32((t - Double(Int(t))) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
 
     var addr = sockaddr_un()
     addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)

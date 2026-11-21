@@ -23,7 +23,7 @@ DEFAULT_STOP_FILE = "/tmp/fmu-stop.json"
 USER_STOPPED_ERROR = (
     "Error: [USER_STOPPED] User clicked Stop in the macOS menu bar. "
     "Do NOT retry or call fmu again; stop immediately and report to the user. "
-    "(Click '🛑 fmu Stopped ▶ Resume' in the macOS menu bar or run 'fmu --resume' to re-enable.)"
+    "(Click Resume on the fmu menu bar item or run 'fmu --resume' to re-enable.)"
 )
 
 
@@ -148,7 +148,7 @@ def highlight_target_window(socket_path: str = DEFAULT_SOCK) -> str:
     try:
         return MacNativeEngine(socket_path=socket_path).execute({"highlightWindow": True})
     except Exception:
-        return '# fmu-menubar state="idle" title="⚪ fmu Idle" stopped=false highlight=false'
+        return '# fmu-menubar state="idle" title="fmu Idle" stopped=false highlight=false'
 
 
 def engage_user_stop(
@@ -166,7 +166,7 @@ def engage_user_stop(
     try:
         return MacNativeEngine(socket_path=socket_path).execute({"stop": True})
     except Exception:
-        return '# fmu-menubar state="stopped" title="🛑 fmu Stopped  ▶ Resume" stopped=true'
+        return '# fmu-menubar state="stopped" title="fmu Stopped · Resume" stopped=true'
 
 
 def clear_user_stop(socket_path: str = DEFAULT_SOCK) -> str:
@@ -177,7 +177,7 @@ def clear_user_stop(socket_path: str = DEFAULT_SOCK) -> str:
     try:
         return MacNativeEngine(socket_path=socket_path).execute({"resume": True})
     except Exception:
-        return '# fmu-menubar state="idle" title="🤖 fmu" stopped=false'
+        return '# fmu-menubar state="idle" title="fmu Idle" stopped=false'
 
 
 def get_menubar_status(socket_path: str = DEFAULT_SOCK) -> str:
@@ -186,7 +186,7 @@ def get_menubar_status(socket_path: str = DEFAULT_SOCK) -> str:
     except Exception:
         stopped = is_user_stopped()
         state = "stopped" if stopped else "idle"
-        title = "🛑 fmu Stopped  ▶ Resume" if stopped else "🤖 fmu"
+        title = "fmu Stopped · Resume" if stopped else "fmu Idle"
         return f'# fmu-menubar state="{state}" title="{title}" stopped={str(stopped).lower()}'
 
 
@@ -359,7 +359,7 @@ class MacNativeEngine:
 
     def execute(self, req: dict[str, Any], *, _retried_tcc: bool = False) -> str:
         t0 = time.perf_counter()
-        is_control = any(
+        is_control = "liveView" in req or "menuAction" in req or any(
             req.get(k) is not None and req.get(k) is not False
             for k in (
                 "reset",
@@ -370,6 +370,7 @@ class MacNativeEngine:
                 "highlightWindow",
                 "togglePreview",
                 "toggleZoom",
+                "menuOutline",
                 "dumpUiSnapshots",
                 "statusUpdate",
                 "getCursors",

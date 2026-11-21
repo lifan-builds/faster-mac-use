@@ -1,6 +1,12 @@
-# Faster Mac Use (`fmu`) Performance & Field Audit Report (`v0.4.4`)
+# Faster Mac Use (`fmu`) Performance & Field Audit Report (`v0.4.5`)
 
-**Latest Field Audit (`2026-11-20` — `3,963` calls cleared after shipping fixes)**:
+**Latest Field Audit (`2026-11-21` — `854` calls over 2 days: MV3 p50 `64.7ms`, p95 `3,509ms`, `26` error calls, `compact_diff_ratio` `65.6%`)**:
+- **`reuseExisting` duplicate sessions**: Polling with `cua.createBrowserTab({url, reuseExisting: true})` minted a new `tN` session per call for the same Chrome tab (Amazon Photos poll: `t13`..`t27` in 60s), each starting with a full snapshot. `createBrowserTab` now rebinds the live session that already wraps the tab (by `chromeTabId` or URL match).
+- **Oversized uploads mislabeled as a permission problem**: A `34.3MB` bundle exceeded the `25MB` inline `DataTransfer` cap, so the extension reported only `enable "Allow access to file URLs"` and the agent retried 5x. Errors now append the real cause (`... exceeds the 25 MB inline cap; upload in smaller batches`, `file not found: ...`).
+- **Fixed sleeps hidden in telemetry**: `wait(ms)` time landed in no phase (5s calls showed `{}`). New `fixed_wait` phase plus a `--perf` hint when caller sleeps exceed 10% of total latency.
+- **Open (not reproduced)**: one `7,033ms` canvas OCR pass on `old.reddit.com/r/Seattle/about/rules` and one `10,614ms` `tab_attach` on `old.reddit.com/user/.../comments/`.
+
+**Previous Field Audit (`2026-11-20` — `3,963` calls cleared after shipping fixes)**:
 - **True Parallel MV3 Dispatch + Daemon Timeout Cascade Fix**: Bypassed Playwright's single-threaded `_run_sync` worker queue for MV3 extension sessions (`3x 380ms` parallel MV3 tabs drop from `~1,140ms` serialized to `<500ms` concurrent; 4-tab `25s` Google Flights swarm drops from `54.4s` serialized to `~25s`), extended `cli.py` wait-budget estimation across `parallel[]` and `code` `waitFor()`, and stopped catching `TimeoutError` inside `except OSError:` so live warm daemons on `:19222` are never shadowed by fallback-port runtimes.
 - **MV3 `DOMContentLoaded` Load Settlement & `nav_wait` Phase Separation**: `waitForTabLoad` / `waitForNavigationSettlement` in `extension/background.js` now resolve once `document.readyState` is `interactive`/`complete` with a populated `<body>` instead of stalling up to `10,000ms` on third-party subresources (`status === "complete"`), and separate `nav_wait` from `bridge_overhead` (`rpc_timeout` raised to `max(18s, step_wait_s + 12s)`).
 - **Zero-Config MV3 File Uploads (`inlineFiles` `DataTransfer`)**: Local files (`<= 25MB`) now upload automatically via in-page `File` + `DataTransfer` injection even when Chrome's `"Allow access to file URLs"` toggle is disabled.

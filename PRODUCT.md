@@ -21,7 +21,7 @@ delegated: Canonical static showcase page lives at `https://clifan.com/faster-ma
 
 ## Positioning
 
-The only open-source computer-use engine that unifies unfocused Chrome `"🤖 Agent"` tab groups (with CDP Focus Emulation, `WeakMap` `@u1..@uN` UIDs, pre-registered table folding, and W3C WebMCP auto-execution) and a persistent native Swift macOS Accessibility + Apple Silicon `Vision.framework` OCR daemon (`/tmp/fmu-ax.sock`, `@a1..@aN` UIDs) inside a multi-cursor stateful `cua_repl` runtime—verified at `0.0 px` physical cursor displacement and `10×` to `114×` lower cumulative token usage.
+The only open-source computer-use engine that unifies unfocused Chrome `"Agent"` tab groups (with CDP Focus Emulation, `WeakMap` `@u1..@uN` UIDs, pre-registered table folding, and W3C WebMCP auto-execution) and a persistent native Swift macOS Accessibility + Apple Silicon `Vision.framework` OCR daemon (`/tmp/fmu-ax.sock`, `@a1..@aN` UIDs) inside a multi-cursor stateful `cua_repl` runtime—verified at `0.0 px` physical cursor displacement and `10×` to `114×` lower cumulative token usage.
 
 ## Operating Context
 
@@ -32,7 +32,7 @@ Evaluated alongside terminal sessions, MCP configuration files (`mcp_config.json
 - **Confirmed capabilities:** Single-tool 268-token MCP/CLI schema; stateful `cua_repl` execution (`cua.createBrowserTab`, `cua.getTab`, `cua.getApp`, `cua.getCursors`); 1-trip declarative `steps` batches; concurrent multi-cursor swarms (`{"parallel": [...]}`); persistent `@u1`/`@a1` UIDs with `+/~/-` diffs and CRC-32 short-circuiting; pre-registered table row folding (`foldTables`); stale-observation masking (`ContextWindowTracker`); 50Hz `BackgroundIntrusionGuard`; zero-dialog CDP file uploads; Apple Silicon `Vision.framework` Window OCR (`app.ocr()`).
 - **Material constraints (must be stated alongside claims):**
   1. Native `fmu-ax` accessibility + Vision OCR daemon requires macOS (Apple Silicon / macOS 14+ recommended) and Accessibility permission.
-  2. Creating color-coded `"🤖 Agent"` tab groups inside a user's visible Chrome window uses the included MV3 extension (`extension/background.js`); without the extension loaded, `fmu` runs in a background Chromium worker with CDP Focus Emulation.
+  2. Creating color-coded `"Agent"` tab groups inside a user's visible Chrome window uses the included MV3 extension (`extension/background.js`); without the extension loaded, `fmu` runs in a background Chromium worker with CDP Focus Emulation.
   3. `app.ocr()` (`CGWindowListCreateImage`) requires the target macOS window to be unminimized (it may be completely occluded behind other windows).
 
 ## Brand Commitments

@@ -2,6 +2,7 @@
 """Comprehensive unit and integration test suite for Faster Mac Use (fmu)."""
 
 from __future__ import annotations
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 os.environ.setdefault("FMU_RUNTIME_SOCK", "/tmp/fmu-test-suite.sock")
 
@@ -17,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "benchmarks"))
 
+from fmu.browser_engine import _build_inline_files_payload  # noqa: E402
 from fmu.cua_runtime import FasterMacUseRuntime  # noqa: E402
 from fmu.guard import BackgroundIntrusionGuard  # noqa: E402
 from test_app_server import BenchWebServer  # noqa: E402
@@ -66,7 +69,7 @@ class TestFasterMacUse(unittest.TestCase):
         url = f"{self.server.base_url}/orders"
         with BackgroundIntrusionGuard() as guard:
             snap = self.rt.execute({"surface": "web", "url": url, "session": "t1"})
-            self.assertIn("# web tab=t1 group=\"🤖 Agent\"", snap)
+            self.assertIn("# web tab=t1 group=\"Agent\"", snap)
             self.assertIn("webmcp=[\"approveOrder\"]", snap)
             self.assertIn("@u1 ", snap)
 
@@ -109,7 +112,7 @@ class TestFasterMacUse(unittest.TestCase):
         pricing_url = f"{self.server.base_url}/pricing"
         out1 = self.rt.execute({
             "code": (
-                f'let p = await cua.createBrowserTab({{url: "{pricing_url}", group: "🤖 Agent", active: false}});\n'
+                f'let p = await cua.createBrowserTab({{url: "{pricing_url}", group: "Agent", active: false}});\n'
                 'await p.click("Generate Quote Token");'
             )
         })
@@ -135,7 +138,7 @@ class TestFasterMacUse(unittest.TestCase):
     def test_04_repl_print_and_readme_syntax_aliases(self) -> None:
         url = f"{self.server.base_url}/pricing"
         out = self.rt.execute({
-            "code": f'tab = await cua.createBrowserTab({{url: "{url}", group: "🤖 Agent", active: false}})\nprint(await tab.snapshot())'
+            "code": f'tab = await cua.createBrowserTab({{url: "{url}", group: "Agent", active: false}})\nprint(await tab.snapshot())'
         })
         self.assertIn("Generate Quote Token", out)
         state = self.rt.execute({"code": "return await cua.getState();"})
@@ -558,7 +561,7 @@ class TestFasterMacUse(unittest.TestCase):
 
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
-        self.assertIn("faster-mac-use 0.4.4", ver_proc.stdout)
+        self.assertIn("faster-mac-use 0.4.5", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
         self.assertEqual(bad_proc.returncode, 2)
@@ -784,7 +787,7 @@ class TestFasterMacUse(unittest.TestCase):
                     res = {
                         "tabId": 777,
                         "groupId": 42,
-                        "sessionName": params.get("sessionName", "🤖 Agent"),
+                        "sessionName": params.get("sessionName", "Agent"),
                         "url": params.get("url", "about:blank"),
                     }
                 elif method == "evaluate":
@@ -1028,7 +1031,7 @@ const state = {{
     {{ id: 201, windowId: 200, groupId: -1, title: "Home / X", url: "https://x.com/home", status: "complete", active: true }},
   ],
   groups: [
-    {{ id: 10, windowId: 100, title: "🤖 Agent", color: "blue", collapsed: false }},
+    {{ id: 10, windowId: 100, title: "Agent", color: "blue", collapsed: false }},
   ],
   windows: [
     {{ id: 100, focused: true, type: "normal" }},
@@ -1037,6 +1040,7 @@ const state = {{
 }};
 
 globalThis.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
   tabs: {{
     query: async (q) => {{
       return state.tabs.filter(t => {{
@@ -1307,6 +1311,7 @@ const state = {{
 }};
 
 globalThis.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
   extension: {{
     isAllowedFileSchemeAccess: async () => state.allowFileUrls,
   }},
@@ -1418,6 +1423,7 @@ setInterval(() => {{}}, 1000);
             self.assertIn('+ @u9 status "MV3_CSP_OK"', mv3_out)
             expected_err = 'upload failed: enable "Allow access to file URLs" for the fmu extension in chrome://extensions'
             self.assertEqual(mv3_out.count(expected_err), 2)
+            self.assertIn("or fix the inline fallback: file not found: /tmp/blocked.jpg", mv3_out)
         finally:
             node_proc.terminate()
             try:
@@ -1455,11 +1461,15 @@ setInterval(() => {{}}, 1000);
                         ],
                     }
                 )
+                self.rt.execute({"surface": "web", "session": "t1", "steps": [{"op": "wait", "ms": 900}]})
                 self.rt.execute({"app": "Calculator", "steps": [{"op": "key", "name": "escape"}]})
                 flush_telemetry()
 
                 events = load_perf_events(days=7, log_dir=Path(tmp_logs))
-                self.assertGreaterEqual(len(events), 3)
+                self.assertGreaterEqual(len(events), 4)
+                wait_events = [e for e in events if e.get("ops") == ["wait"]]
+                self.assertEqual(len(wait_events), 1)
+                self.assertGreaterEqual(wait_events[0]["timings_ms"]["fixed_wait"], 850)
 
                 raw_dump = "\n".join(p.read_text(encoding="utf-8") for p in Path(tmp_logs).glob("perf-*.jsonl"))
                 self.assertNotIn("TOP_SECRET_123", raw_dump)
@@ -1479,6 +1489,7 @@ setInterval(() => {{}}, 1000);
                 self.assertIn("## Latency by Surface (ms)", md_report)
                 self.assertIn("web:playwright:", md_report)
                 self.assertIn("app:ax:", md_report)
+                self.assertIn("was caller-requested fixed wait/sleep", md_report)
 
                 json_report_raw = self.rt.execute({"perfReport": {"days": 7, "format": "json"}})
                 json_report = json.loads(json_report_raw)
@@ -1498,11 +1509,57 @@ setInterval(() => {{}}, 1000);
                 else:
                     os.environ["FMU_LOG_DIR"] = prev_dir
 
+    @contextlib.contextmanager
+    def _live_view_prefs_restored(self):
+        from fmu.prefs import load_prefs
+
+        before = dict(load_prefs())
+        self.rt.execute({"liveView": True})
+        try:
+            yield
+        finally:
+            self.rt.execute({"liveView": before.get("liveView", True) is not False})
+            if load_prefs().get("livePreview", True) != before.get("livePreview", True):
+                self.rt.execute({"togglePreview": True})
+
+    def test_live_view_off_persists_and_hides_monitor_during_work(self) -> None:
+        from fmu.browser_engine import _preview_enabled
+        from fmu.prefs import load_prefs
+
+        with self._live_view_prefs_restored():
+            off = self.rt.execute({"liveView": False})
+            self.assertIn("liveView=false", off)
+            self.assertIs(load_prefs()["liveView"], False)
+            self.assertFalse(_preview_enabled(), "Live View off must also stop preview frame capture")
+            self.rt.execute({"app": "Calculator", "steps": [{"op": "key", "name": "escape"}]})
+            working = self.rt.execute({"statusBar": True})
+            self.assertIn('state="working"', working)
+            self.assertIn("hud=false", working)
+            self.assertIn("liveView=false", working)
+            on = self.rt.execute({"liveView": True})
+            self.assertIn("hud=true", on)
+            self.assertIs(load_prefs()["liveView"], True)
+
+    def test_menu_bar_menu_has_live_view_toggle_and_drawn_icons(self) -> None:
+        import re
+
+        with self._live_view_prefs_restored():
+            outline = self.rt.execute({"menuOutline": True})
+            self.assertIn("[x] Show Live View Monitor +icon", outline)
+            self.assertIn("Close All Agent-Opened Chrome Tabs +icon", outline)
+            self.assertIn("Quit fmu Menu Bar & Daemon +icon", outline)
+            self.assertIsNone(re.search("[\U0001F000-\U0001FAFF\u2300-\u23FF\u25A0-\u25FF\u2600-\u27BF]", outline), outline)
+            self.assertIn('performed "Show Live View Monitor"', self.rt.execute({"menuAction": "Show Live View Monitor"}))
+            self.assertIn("liveView=false", self.rt.execute({"statusBar": True}))
+            unchecked = self.rt.execute({"menuOutline": True})
+            self.assertNotIn("[x] Show Live View Monitor", unchecked)
+            self.assertNotIn("Large HD Live Screen Monitor", unchecked)
+
     def test_26_macos_menubar_working_status_and_one_click_stop(self) -> None:
         import threading
 
         url = f"{self.server.base_url}/pricing"
-        with BackgroundIntrusionGuard() as guard:
+        with self._live_view_prefs_restored(), BackgroundIntrusionGuard() as guard:
             # 1. Trigger a native macOS AX command + web command and verify menu bar working status & live PiP preview
             self.rt.execute({"app": "Calculator", "steps": [{"op": "key", "name": "escape"}]})
             st_app = self.rt.execute({"statusBar": True})
@@ -1515,7 +1572,7 @@ setInterval(() => {{}}, 1000);
             self.assertIn("stopped=false", st_app)
             self.assertIn('state="working"', st_app)
             self.assertIn('target="Calculator"', st_app)
-            self.assertIn("⏹ Stop", st_app)
+            self.assertIn("· Stop", st_app)
 
             # 1b. Trigger Click-to-Highlight Target Window on Screen and verify highlight=true
             hl_out = self.rt.execute({"code": "return await cua.highlightWindow();"})
@@ -1541,7 +1598,7 @@ setInterval(() => {{}}, 1000);
             self.assertIn('state="working"', st_web)
             self.assertIn('surface="web"', st_web)
             self.assertIn("preview=true", st_web)
-            self.assertIn("⏹ Stop", st_web)
+            self.assertIn("· Stop", st_web)
 
             # 2. Simulate 1-click on the top-right macOS menu bar item -> stops agent immediately
             click_stop = self.rt.mac.execute({"clickStatusBar": True})
@@ -1550,7 +1607,7 @@ setInterval(() => {{}}, 1000);
             st_stopped = self.rt.execute({"statusBar": True})
             self.assertIn("stopped=true", st_stopped)
             self.assertIn('state="stopped"', st_stopped)
-            self.assertIn("🛑 fmu Stopped  ▶ Resume", st_stopped)
+            self.assertIn("fmu Stopped · Resume", st_stopped)
 
             # 3. Verify subsequent web, app, and REPL calls are blocked by the stop latch
             blocked_web = self.rt.execute(
@@ -1568,8 +1625,8 @@ setInterval(() => {{}}, 1000);
             click_resume = self.rt.mac.execute({"clickStatusBar": True})
             self.assertIn("stopped=false", click_resume)
             self.assertIn('state="idle"', click_resume)
-            self.assertIn("⚪ fmu Idle", click_resume)
-            self.assertNotIn("⏹ Stop", click_resume)
+            self.assertIn("fmu Idle", click_resume)
+            self.assertNotIn("· Stop", click_resume)
             st_resumed = self.rt.execute({"statusBar": True})
             self.assertIn("stopped=false", st_resumed)
             self.assertIn('state="idle"', st_resumed)
@@ -1914,12 +1971,12 @@ setInterval(() => {{}}, 1000);
         snap_out = self.rt.execute(
             {
                 "code": (
-                    f'const tab = await cua.createBrowserTab("headless", "{checkout_url}", sessionName="🤖 Checkout", windowId=42);\n'
+                    f'const tab = await cua.createBrowserTab("headless", "{checkout_url}", sessionName="Checkout", windowId=42);\n'
                     "return await tab.snapshot();"
                 )
             }
         )
-        self.assertIn('group="🤖 Checkout"', snap_out)
+        self.assertIn('group="Checkout"', snap_out)
         for fid, ftitle in (
             ("first-data-payment-field-name", "Cardholder Name"),
             ("first-data-payment-field-card", "Card Number"),
@@ -1954,7 +2011,7 @@ setInterval(() => {{}}, 1000);
         fd_snap = self.rt.execute(
             {
                 "code": (
-                    'const tab = await cua.getTab(sessionName="🤖 Checkout");\n'
+                    'const tab = await cua.getTab(sessionName="Checkout");\n'
                     "await tab.click('Recent search card').eval(\"(() => { document.getElementById('first-data-payment-field-card').setAttribute('src', 'https://lib.paymentjs.firstdata.com/v2/card'); return 'SWAPPED'; })()\").snapshot();"
                 )
             }
@@ -1968,7 +2025,7 @@ setInterval(() => {{}}, 1000);
         repl_val_out = self.rt.execute(
             {
                 "code": (
-                    'const tab = await cua.getTab(sessionName="🤖 Checkout");\n'
+                    'const tab = await cua.getTab(sessionName="Checkout");\n'
                     "const fields = await tab.eval(\"Array.from(document.querySelectorAll('input')).map(el => el.id)\");\n"
                     "const iframes = await tab.eval(\"(() => { const n = document.querySelectorAll('iframe.pci-frame').length; return n; })()\");\n"
                     'return { url: await tab.eval("location.href"), fields, fieldCount: fields.length, strLen: "abcd".length, iframes };'
@@ -2086,6 +2143,7 @@ const navState = {{
   groupId: 77,
 }};
 globalThis.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
   tabs: {{
     query: async () => [{{ id: 501, windowId: 77, groupId: navState.groupId, url: navState.url, title: navState.title, status: navState.status }}],
     get: async (id) => ({{ id, windowId: 77, groupId: navState.groupId, url: navState.url, pendingUrl: navState.pendingUrl, title: navState.title, status: navState.status }}),
@@ -2093,10 +2151,11 @@ globalThis.chrome = {{
     update: async (id, opts) => {{ if (opts.url) navState.url = opts.url; return {{ id, windowId: 77, url: navState.url, status: "complete" }}; }},
     group: async () => 77,
     remove: async () => ({{}}),
+    onRemoved: {{ addListener: () => {{}} }},
   }},
   tabGroups: {{
-    get: async (gid) => ({{ id: gid, windowId: 77, title: "🤖 Checkout" }}),
-    query: async () => [{{ id: 77, windowId: 77, title: "🤖 Checkout" }}],
+    get: async (gid) => ({{ id: gid, windowId: 77, title: "Checkout" }}),
+    query: async () => [{{ id: 77, windowId: 77, title: "Checkout" }}],
     update: async (gid) => ({{ id: gid, windowId: 77 }}),
   }},
   windows: {{
@@ -2174,7 +2233,7 @@ setInterval(() => {{}}, 1000);
             mv3_nav_out = self.rt.execute(
                 {
                     "code": (
-                        'const sTab = await cua.createBrowserTab("chrome", "https://shop.example.com/checkout", sessionName="🤖 Checkout", windowId=77, reuseExisting=true);\n'
+                        'const sTab = await cua.createBrowserTab("chrome", "https://shop.example.com/checkout", sessionName="Checkout", windowId=77, reuseExisting=true);\n'
                         'return await sTab.click("@u1").wait(40).eval("location.href").snapshot();'
                     )
                 }
@@ -2428,10 +2487,13 @@ const state = {{
   ],
   updateCalls: [],
   createdUrls: [],
+  removedIds: [],
+  onRemoved: [],
   runtimeInitEvals: 0,
   batchEvals: 0,
 }};
 global.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
   tabs: {{
     query: async (q) => state.tabs.filter(t => (q.windowId === undefined || t.windowId === q.windowId) && (q.groupId === undefined || t.groupId === q.groupId)),
     get: async (id) => {{
@@ -2452,12 +2514,18 @@ global.chrome = {{
       return f || {{ id, windowId: 88, url: opts.url || "", status: "complete" }};
     }},
     group: async () => 12,
-    remove: async () => ({{}}),
+    remove: async (id) => {{
+      if (!state.tabs.some(t => t.id === id)) throw new Error("No tab with id: " + id);
+      state.removedIds.push(id);
+      state.tabs = state.tabs.filter(t => t.id !== id);
+      for (const fn of state.onRemoved) fn(id);
+    }},
     onUpdated: {{ addListener: () => {{}} }},
+    onRemoved: {{ addListener: (fn) => state.onRemoved.push(fn) }},
   }},
   tabGroups: {{
-    get: async (gid) => ({{ id: gid, windowId: 88, title: "🤖 Agent" }}),
-    query: async () => [{{ id: 12, windowId: 88, title: "🤖 Agent" }}],
+    get: async (gid) => ({{ id: gid, windowId: 88, title: "Agent" }}),
+    query: async () => [{{ id: 12, windowId: 88, title: "Agent" }}],
     update: async (gid) => ({{ id: gid, windowId: 88 }}),
   }},
   windows: {{
@@ -2526,11 +2594,11 @@ setInterval(() => {{}}, 1000);
         try:
             self.assertTrue(bridge.wait_connected(timeout=3.0))
             bridge_st = self.rt.execute({"bridgeStatus": True})
-            self.assertIn('version="0.4.4"', bridge_st)
+            self.assertIn('version="0.4.5"', bridge_st)
 
             tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
             self.assertIn('@tab id=501', tabs_list)
-            self.assertIn('group="🤖 Agent"', tabs_list)
+            self.assertIn('group="Agent"', tabs_list)
             self.assertIn("https://www.hertz.com/us/en/book/vehicles", tabs_list)
             self.assertNotIn("expedia.ca", tabs_list)
 
@@ -2554,6 +2622,42 @@ setInterval(() => {{}}, 1000);
                 f"Expected zero chrome.tabs.update URL clobbers on reuseExisting, got {harness_state['updateCalls']}",
             )
             self.assertEqual(harness_state["createdUrls"], ["https://avis.ca"])
+            hertz_sessions = [
+                tid
+                for tid, s in self.rt.browser._tabs.items()
+                if s.is_extension and getattr(s._raw_page, "chrome_tab_id", None) == 501
+            ]
+            self.assertEqual(len(hertz_sessions), 1, f"reuseExisting must rebind the live session, got {hertz_sessions}")
+
+            from fmu.sessions import CallerIdentity, proc_info
+
+            start = proc_info(os.getpid()).start
+            devin = CallerIdentity("Devin", os.getpid(), start, "yyc-rental")
+            codex = CallerIdentity("Codex", os.getpid(), start, "yyc-rental")
+            adopted = self.rt.execute_for_client(
+                {"code": 'const a2 = await cua.createBrowserTab({mode: "chrome", url: "avis.ca", reuseExisting: true}); return a2.tab_id;'},
+                devin,
+            )
+            self.assertRegex(adopted, r"^devin\d+:t\d+$")
+            self.assertEqual(
+                self.rt.execute_for_client({"closeAgentTabs": True}, codex),
+                "# web agent tabs closed chrome=0 playwright=0",
+                "a session must never close another session's tabs",
+            )
+            self.assertEqual(
+                self.rt.execute_for_client({"closeAgentTabs": True}, devin),
+                "# web agent tabs closed chrome=1 playwright=0",
+            )
+            pw_open = sum(1 for s in self.rt.browser._tabs.values() if not s.is_extension)
+            close_out = self.rt.execute({"closeAgentTabs": True})
+            self.assertEqual(close_out, f"# web agent tabs closed chrome=0 playwright={pw_open}")
+            live_ctids = sorted(
+                getattr(s._raw_page, "chrome_tab_id", None) for s in self.rt.browser._tabs.values() if s.is_extension
+            )
+            self.assertEqual(live_ctids, [501], "only the agent-created tab 503 may close; attached user tab 501 stays")
+            after_state = json.loads(self.rt.execute({"code": 'return await cua.getTab("hertz.com").eval("__state__");'}))
+            self.assertEqual(after_state["removedIds"], [503])
+            self.assertEqual(sorted(t["id"] for t in after_state["tabs"]), [501, 502])
             # Tab 501 ran multiple executeBatch calls, yet runtimeInitEvals on tab 501 + tab 503 should be 2 total (1 per tab, not per batch!)
             self.assertEqual(harness_state["runtimeInitEvals"], 2)
             self.assertGreaterEqual(harness_state["batchEvals"], 4)
@@ -2567,6 +2671,110 @@ setInterval(() => {{}}, 1000);
                 node_proc.stdout.close()
             if node_proc.stderr:
                 node_proc.stderr.close()
+
+    def test_agent_sessions_isolate_tabs_label_groups_and_retire(self) -> None:
+        from fmu.sessions import CallerIdentity, proc_info
+
+        start = proc_info(os.getpid()).start
+        devin = CallerIdentity("Devin", os.getpid(), start, "alexa-photos")
+        codex = CallerIdentity("Codex", os.getpid(), start, "quotaswitch")
+        gone = CallerIdentity("Claude", 999_999, 1, "scratch")
+        pricing = f"{self.server.base_url}/pricing"
+        orders = f"{self.server.base_url}/orders"
+        rt = FasterMacUseRuntime()
+        try:
+            d_out = rt.execute_for_client({"url": pricing, "mode": "headless"}, devin)
+            c_out = rt.execute_for_client({"url": orders, "mode": "headless", "session": "t1"}, codex)
+            self.assertIn('tab=devin1:t1 group="Devin · alexa-photos"', d_out)
+            self.assertIn('tab=codex1:t1 group="Codex · quotaswitch"', c_out)
+            self.assertNotEqual(rt.browser._get_agent_color("devin1"), rt.browser._get_agent_color("codex1"))
+
+            stolen = rt.execute_for_client(
+                {"code": f'const t = await cua.getTab({{url: "{orders}", mode: "headless"}}); return t.tab_id;'}, devin
+            )
+            self.assertTrue(stolen.startswith("devin1:"), f"Devin must not adopt Codex's tab, got {stolen}")
+            own = rt.execute_for_client(
+                {"code": f'const t = await cua.getTab({{url: "{orders}", mode: "headless"}}); return t.tab_id;'}, codex
+            )
+            self.assertEqual(own, "codex1:t1")
+
+            par = rt.execute_for_client(
+                {"parallel": [{"url": pricing, "mode": "headless"}, {"url": orders, "mode": "headless", "agent": "audit"}]},
+                devin,
+            )
+            self.assertIn("=== [devin1.agent-1] ===", par)
+            self.assertIn('tab=devin1.audit:t1 group="Devin · alexa-photos · audit"', par)
+
+            sessions = {s["id"]: s for s in json.loads(rt.execute_for_client({"agentSessions": {"format": "json"}}, None))}
+            self.assertEqual(sessions["devin1"]["label"], "Devin · alexa-photos")
+            self.assertEqual(sessions["devin1"]["tabs"], 4)
+            self.assertEqual(sessions["codex1"]["tabs"], 1)
+
+            self.assertEqual(rt.execute_for_client({"reset": True}, devin), "# fmu runtime reset agent=devin1")
+            self.assertEqual(sorted(rt.browser._tabs), ["codex1:t1"])
+            self.assertEqual(
+                rt.execute_for_client({"closeAgentTabs": True}, codex), "# web agent tabs closed chrome=0 playwright=1"
+            )
+
+            rt.execute_for_client({"url": pricing, "mode": "headless"}, gone)
+            self.assertIn("claude1:t1", rt.browser._tabs)
+            rt.browser.clients._last_prune = 0.0
+            rt.execute_for_client({"agentSessions": True}, codex)
+            deadline = time.time() + 3.0
+            while "claude1:t1" in rt.browser._tabs and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertNotIn("claude1:t1", rt.browser._tabs)
+            self.assertNotIn("claude1", {c.short_id for c in rt.browser.clients.live()})
+            self.assertFalse(any(k.startswith("claude1") for k in rt._agents))
+        finally:
+            rt.shutdown()
+
+    def test_resolve_caller_walks_to_harness_and_names_project_from_workspace_cwd(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fmu-harness-") as tmp:
+            tmp_path = Path(tmp).resolve()
+            fake_codex = tmp_path / "codex"
+            wrapper_src = tmp_path / "codex.c"
+            wrapper_src.write_text(
+                "#include <unistd.h>\n#include <sys/wait.h>\n"
+                "int main(int argc, char **argv) { pid_t p = fork(); if (p == 0) { execv(\"/bin/sh\", argv); _exit(127); }"
+                " int st = 0; waitpid(p, &st, 0); return WEXITSTATUS(st); }\n",
+                encoding="utf-8",
+            )
+            subprocess.check_call(["cc", "-o", str(fake_codex), str(wrapper_src)])
+            repo = tmp_path / "alexa-photos"
+            (repo / ".git").mkdir(parents=True)
+            (repo / "sub").mkdir()
+            probe = (
+                f"import sys; sys.path.insert(0, {str(ROOT / 'src')!r}); import os; "
+                "from fmu.sessions import resolve_caller; c = resolve_caller(os.getpid()); "
+                "print(c.harness, c.project)"
+            )
+            from_shell = subprocess.check_output(
+                [str(fake_codex), "-c", f'cd {repo / "sub"} && {sys.executable} -c "{probe}"'], cwd=tmp_path, text=True
+            )
+            self.assertEqual(from_shell.split(), ["Codex", "alexa-photos"])
+            from_server = subprocess.check_output(
+                [str(fake_codex), "-c", f'{sys.executable} -c "{probe}"'], cwd=tmp_path, text=True
+            )
+            self.assertEqual(from_server.split(), ["Codex", "None"])
+
+    def test_native_ui_has_no_emoji_or_pictograph_glyphs(self) -> None:
+        import re
+
+        pictograph_re = re.compile(
+            "[\U0001F000-\U0001FAFF\u2194-\u21FF\u2300-\u23FF\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF\uFE0F]"
+        )
+        offenders = []
+        for path in sorted((ROOT / "src" / "fmu").rglob("*.swift")):
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if pictograph_re.search(line):
+                    offenders.append(f"{path.relative_to(ROOT)}:{lineno}: {line.strip()[:120]}")
+        self.assertEqual(
+            offenders,
+            [],
+            "fmu-drawn native UI must not use emoji or pictograph glyphs (DESIGN.md > Iconography); "
+            "draw icons with FMUIcon in src/fmu/native/fmu_ax.swift instead:\n" + "\n".join(offenders),
+        )
 
     def test_repl_raw_arrow_eval_callbacks_and_quoted_arrow_eval(self) -> None:
         from fmu.cua_runtime import FasterMacUseRuntime
@@ -3062,6 +3270,7 @@ const state = {{
 }};
 
 globalThis.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
   extension: {{
     isAllowedFileSchemeAccess: async () => false,
   }},
@@ -3191,6 +3400,18 @@ setInterval(() => {{}}, 1000);
                     self.assertNotIn('Allow access to file URLs', up_ok)
                     self.assertNotIn("! errors:", up_ok)
 
+                    big_upload_file = tmp_path / "too_big.bin"
+                    big_upload_file.write_bytes(b"0" * 2048)
+                    with mock.patch.object(_build_inline_files_payload, "__defaults__", (1024,)):
+                        up_big = self.rt.execute(
+                            {
+                                "mode": "chrome",
+                                "session": "t_up",
+                                "steps": [{"op": "upload", "uid": "@u1", "files": [str(big_upload_file)]}],
+                            }
+                        )
+                    self.assertIn("inline cap; upload in smaller batches", up_big)
+
                     # (d) Strict-CSP host cache: 1st eval escalates (eval_csp), 2nd eval pre-routes via CDP (eval_csp_cached)
                     csp1 = self.rt.execute(
                         {
@@ -3247,6 +3468,174 @@ setInterval(() => {{}}, 1000);
                     os.environ.pop("FMU_LOG_DIR", None)
                 else:
                     os.environ["FMU_LOG_DIR"] = prev_log_dir
+
+    def test_34_trusted_cdp_click_istrusted_gated_submit_and_mv3_stepping(self) -> None:
+        self.rt.execute({"reset": True})
+        html = (
+            "<!doctype html><html><body style='margin:24px;font-family:sans-serif'>"
+            "<div id='status'>UNANSWERED</div>"
+            "<button id='opt' type='button'>All of the above</button>"
+            "<button id='sub' type='button' disabled style='margin-left:12px'>Submit Answer</button>"
+            "<div id='host' style='margin-top:16px'></div>"
+            "<script>"
+            "const log = []; window.__clickLog = log;"
+            "const opt = document.getElementById('opt');"
+            "const sub = document.getElementById('sub');"
+            "opt.addEventListener('click', (e) => { if (e.isTrusted) { log.push('opt:trusted'); sub.disabled = false; } else { log.push('opt:untrusted'); } });"
+            "for (const ev of ['pointerdown', 'mousedown', 'mouseup']) {"
+            "  sub.addEventListener(ev, (e) => { if (e.isTrusted) log.push('sub:' + ev); });"
+            "}"
+            "sub.addEventListener('click', (e) => {"
+            "  if (!e.isTrusted) { log.push('sub:blocked'); return; }"
+            "  log.push('sub:trusted');"
+            "  document.getElementById('status').textContent = 'QUIZ_CREDITED_+1';"
+            "});"
+            "const sr = document.getElementById('host').attachShadow({ mode: 'open' });"
+            "const sbtn = document.createElement('button'); sbtn.textContent = 'Shadow Confirm';"
+            "sbtn.addEventListener('click', (e) => { if (e.isTrusted) { log.push('shadow:trusted'); document.getElementById('status').textContent += '_SHADOW_OK'; } });"
+            "sr.appendChild(sbtn);"
+            "</script></body></html>"
+        )
+        import urllib.parse
+        data_url = "data:text/html," + urllib.parse.quote(html)
+        out = self.rt.execute(
+            {
+                "code": (
+                    f'let tab = await cua.createBrowserTab("headless", "{data_url}"); '
+                    'await tab.click("All of the above").click("Submit Answer").click("Shadow Confirm");'
+                )
+            }
+        )
+        self.assertIn("QUIZ_CREDITED_+1_SHADOW_OK", out)
+        ev_log = self.rt.browser.evaluate_value("return window.__clickLog;", mode="headless")
+        self.assertIn("opt:trusted", ev_log)
+        self.assertIn("sub:pointerdown", ev_log)
+        self.assertIn("sub:mousedown", ev_log)
+        self.assertIn("sub:mouseup", ev_log)
+        self.assertIn("sub:trusted", ev_log)
+        self.assertIn("shadow:trusted", ev_log)
+        self.assertNotIn("sub:blocked", ev_log)
+
+        self.rt.execute({"reset": True})
+        port = self.rt.browser.bridge_port
+        bg_js_src = (ROOT / "extension" / "background.js").read_text(encoding="utf-8").replace(
+            "ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{port}/ext"
+        )
+        mv3_click_harness = f"""
+const mouseEvents = [];
+const tabObj = {{ id: 801, windowId: 800, groupId: -1, title: "Daily Quiz", url: "https://www.1point3acres.com/next/daily-question", status: "complete", active: false }};
+globalThis.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
+  extension: {{ isAllowedFileSchemeAccess: async () => false }},
+  tabs: {{
+    query: async () => [tabObj],
+    get: async () => tabObj,
+    create: async () => tabObj,
+    update: async (_id, opts) => {{ if (opts.url) tabObj.url = opts.url; return tabObj; }},
+    group: async () => 90,
+    onRemoved: {{ addListener: () => {{}} }},
+    onUpdated: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{ query: async () => [], update: async (gid, opts) => ({{ id: gid, ...opts }}) }},
+  windows: {{ getAll: async () => [{{ id: 800, focused: false, type: "normal" }}] }},
+  debugger: {{
+    attach: async () => {{}},
+    sendCommand: async (_target, method, params) => {{
+      if (method === "Input.dispatchMouseEvent") {{
+        mouseEvents.push({{ type: params.type, x: params.x, y: params.y, button: params.button }});
+        return {{}};
+      }}
+      if (method === "Runtime.evaluate") {{
+        const expr = String(params.expression || "");
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const payload = JSON.parse(expr.slice("window.__fmu.executeBatch(".length, -1));
+          const steps = payload.steps || [];
+          if (payload.cdpClick && steps.length > 0 && (steps[0].op === "click")) {{
+            const isFirst = steps[0].uid === "@u49";
+            return {{
+              result: {{
+                value: {{
+                  cdpClick: {{ x: 1644, y: isFirst ? 660 : 715 }},
+                  nextStepIndex: 1,
+                  url: tabObj.url,
+                  title: tabObj.title,
+                  errors: [],
+                  evalOutputs: [],
+                  rawEvalValues: [],
+                  escalations: [],
+                  cursor: {{ agent: "default", x: 1644, y: isFirst ? 660 : 715, uid: steps[0].uid, label: steps[0].uid, op: "click" }},
+                  canvases: [],
+                  timings: {{ execMs: 1, settleMs: 0, snapMs: 0, totalInPageMs: 1 }},
+                  lines: []
+                }}
+              }}
+            }};
+          }}
+          return {{
+            result: {{
+              value: {{
+                url: tabObj.url,
+                title: tabObj.title,
+                crc: "feedface",
+                seq: 3,
+                count: 2,
+                useDiff: true,
+                errors: [],
+                evalOutputs: [JSON.stringify(mouseEvents)],
+                rawEvalValues: [mouseEvents],
+                escalations: [],
+                timings: {{ execMs: 1, settleMs: 4, snapMs: 2, totalInPageMs: 7 }},
+                lines: ['+ @u99 text "回答正确，奖励 1 大米"']
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+    onEvent: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }},
+}};
+{bg_js_src}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(
+            ["node", "-e", mv3_click_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(self.rt.browser.ensure_bridge().wait_connected(timeout=3.0))
+            mv3_out = self.rt.execute(
+                {
+                    "chromeTabId": 801,
+                    "steps": [
+                        {"op": "click", "uid": "@u49"},
+                        {"op": "click", "uid": "@u51"},
+                    ],
+                }
+            )
+            self.assertIn("回答正确，奖励 1 大米", mv3_out)
+            self.assertIn('"type":"mousePressed"', mv3_out)
+            self.assertIn('"y":660', mv3_out)
+            self.assertIn('"y":715', mv3_out)
+            self.assertEqual(mv3_out.count('"mousePressed"'), 2)
+            self.assertEqual(mv3_out.count('"mouseReleased"'), 2)
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
 
 
 if __name__ == "__main__":

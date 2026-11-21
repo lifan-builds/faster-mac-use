@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "Faster Mac Use — 🤖 Agent Bridge",
-  "version": "0.4.4",
-  "description": "Unfocused Chrome '🤖 Agent' Tab Groups, Focus Emulation, WeakRef UID pre-registration, and CRC-32 delta reader.",
+  "name": "Faster Mac Use — Agent Bridge",
+  "version": "0.4.5",
+  "description": "Unfocused Chrome 'Agent' Tab Groups, Focus Emulation, WeakRef UID pre-registration, and CRC-32 delta reader.",
   "permissions": [
     "tabs",
     "tabGroups",
     "scripting",
     "debugger",
-    "alarms"
+    "alarms",
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"

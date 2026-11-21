@@ -1,5 +1,5 @@
-"""Faster Mac Use (fmu): Background-first Browser ('🤖 Agent' Tab Group) & macOS Accessibility engine."""
+"""Faster Mac Use (fmu): Background-first Browser ('Agent' Tab Group) & macOS Accessibility engine."""
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 

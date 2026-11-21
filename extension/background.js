@@ -16,6 +16,55 @@ let screencastIdleTimer = null;
 let lastScreencastPushAt = 0;
 let pendingPreviewTimer = null;
 
+const AGENT_TAB_CLAIMS_KEY = "fmuAgentTabClaims";
+const agentTabClaims = new Map();
+let agentTabClaimsLoaded = null;
+
+function loadAgentTabClaims() {
+  if (!agentTabClaimsLoaded) {
+    agentTabClaimsLoaded = chrome.storage.session.get(AGENT_TAB_CLAIMS_KEY).then(saved => {
+      for (const [tabId, claim] of Object.entries(saved[AGENT_TAB_CLAIMS_KEY] || {})) {
+        agentTabClaims.set(Number(tabId), claim);
+      }
+    });
+  }
+  return agentTabClaimsLoaded;
+}
+
+function saveAgentTabClaims() {
+  return chrome.storage.session.set({ [AGENT_TAB_CLAIMS_KEY]: Object.fromEntries(agentTabClaims) });
+}
+
+async function claimTab(tabId, owner, opened) {
+  await loadAgentTabClaims();
+  const prev = agentTabClaims.get(tabId);
+  agentTabClaims.set(tabId, {
+    owner: owner || (prev ? prev.owner : ""),
+    opened: Boolean(opened || (prev && prev.opened))
+  });
+  await saveAgentTabClaims();
+}
+
+async function bindSessionTab(sessionId, tabId, owner) {
+  sessionTabs.set(sessionId, tabId);
+  await claimTab(tabId, owner, false);
+}
+
+async function foreignTabIds(owner) {
+  if (!owner) return new Set();
+  await loadAgentTabClaims();
+  return new Set([...agentTabClaims].filter(([, c]) => c.owner && c.owner !== owner).map(([tabId]) => tabId));
+}
+
+async function releaseTabClaims(tabIds) {
+  await loadAgentTabClaims();
+  let changed = false;
+  for (const tabId of tabIds) changed = agentTabClaims.delete(tabId) || changed;
+  if (changed) await saveAgentTabClaims();
+}
+
+chrome.tabs.onRemoved.addListener(tabId => releaseTabClaims([tabId]));
+
 function scheduleReconnect(delayMs = 500) {
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
@@ -58,7 +107,7 @@ function normalizeNavUrl(rawUrl) {
   return hasUrlScheme(s) ? s : `https://${s}`;
 }
 
-async function findGroupWindowId(sessionName = "🤖 Agent", targetWindowId = undefined) {
+async function findGroupWindowId(sessionName = "Agent", targetWindowId = undefined) {
   const cacheKey = targetWindowId !== undefined ? `${sessionName}@${targetWindowId}` : sessionName;
   const cachedGid = sessionGroups.get(cacheKey);
   if (cachedGid !== undefined && chrome.tabGroups && typeof chrome.tabGroups.get === "function") {
@@ -91,7 +140,7 @@ async function findGroupWindowId(sessionName = "🤖 Agent", targetWindowId = un
   return { groupId: undefined, windowId: undefined };
 }
 
-async function ensureAgentGroup(tabId, sessionName = "🤖 Agent", color = "blue", targetWindowId = undefined) {
+async function ensureAgentGroup(tabId, sessionName = "Agent", color = "blue", targetWindowId = undefined) {
   const { groupId: existingGid } = await findGroupWindowId(sessionName, targetWindowId);
   let groupId = existingGid;
   if (groupId !== undefined) {
@@ -463,6 +512,10 @@ function scheduleAsyncPreviewPush(tabId, delayMs = 30) {
 
 const UPLOAD_FILE_URL_ERR = 'upload failed: enable "Allow access to file URLs" for the fmu extension in chrome://extensions';
 
+function uploadFileUrlError(inlineSkipped) {
+  return new Error(inlineSkipped ? `${UPLOAD_FILE_URL_ERR}, or fix the inline fallback: ${inlineSkipped}` : UPLOAD_FILE_URL_ERR);
+}
+
 const NON_EXPR_STMT_RE = /^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b/;
 
 function isNavigationError(err) {
@@ -721,7 +774,7 @@ async function injectInlineFilesOnTab(tabId, candidateSelectors, inlineFiles) {
   return await evalInTab(tabId, expr, false);
 }
 
-async function setInputFilesOnTab(tabId, selector, files, inlineFiles = null) {
+async function setInputFilesOnTab(tabId, selector, files, inlineFiles = null, inlineSkipped = "") {
   const fileList = Array.isArray(files) ? files.map(String) : [String(files)];
   const rawSel = selector || "input[type='file']";
   const candidateSelectors = [];
@@ -753,7 +806,7 @@ async function setInputFilesOnTab(tabId, selector, files, inlineFiles = null) {
           throw new Error(`No <input type="file"> found matching ${rawSel}`);
         }
       }
-      throw new Error(UPLOAD_FILE_URL_ERR);
+      throw uploadFileUrlError(inlineSkipped);
     }
   }
   const doc = await sendDebuggerCommand(tabId, "DOM.getDocument", { depth: 0 });
@@ -804,7 +857,7 @@ async function setInputFilesOnTab(tabId, selector, files, inlineFiles = null) {
         return { ok: true, files: fileList, via: "inlineDataTransfer" };
       }
     }
-    throw new Error(UPLOAD_FILE_URL_ERR);
+    throw uploadFileUrlError(inlineSkipped);
   }
   return { ok: true, files: fileList };
 }
@@ -827,7 +880,7 @@ async function handleRpc(msg) {
       clearPendingPreview();
       const {
         url = "about:blank",
-        sessionName = "🤖 Agent",
+        sessionName = "Agent",
         sessionId = "default",
         color = "blue",
         window: windowFilter,
@@ -836,12 +889,14 @@ async function handleRpc(msg) {
         reuseExisting = false,
         reattach = false,
         navigateIfReused = false,
-        timeoutMs = 10000
+        timeoutMs = 10000,
+        owner = ""
       } = params;
 
-      const allTabs = (chrome.tabs && typeof chrome.tabs.query === "function")
+      const foreign = await foreignTabIds(owner);
+      const allTabs = ((chrome.tabs && typeof chrome.tabs.query === "function")
         ? (await chrome.tabs.query({})) || []
-        : [];
+        : []).filter(t => !foreign.has(t.id));
       const wf = String(windowFilter || "").trim().toLowerCase();
       let filterMatchedWindowId = undefined;
 
@@ -857,7 +912,7 @@ async function handleRpc(msg) {
         const groupId = params.assignGroup === false
           ? directTab.groupId
           : await ensureAgentGroup(directTab.id, sessionName, color, directTab.windowId);
-        sessionTabs.set(sessionId, directTab.id);
+        await bindSessionTab(sessionId, directTab.id, owner);
         if (params.focusEmulation !== false) {
           try { await ensureDebuggerAndFocusEmulation(directTab.id); } catch (_) {}
         }
@@ -904,7 +959,7 @@ async function handleRpc(msg) {
         }
         if (reattachedTab && reattachedTab.id !== undefined) {
           const groupId = await ensureAgentGroup(reattachedTab.id, sessionName, color, reattachedTab.windowId);
-          sessionTabs.set(sessionId, reattachedTab.id);
+          await bindSessionTab(sessionId, reattachedTab.id, owner);
           if (params.focusEmulation !== false) {
             try { await ensureDebuggerAndFocusEmulation(reattachedTab.id); } catch (_) {}
           }
@@ -948,7 +1003,7 @@ async function handleRpc(msg) {
             const match = exactUrlMatch || wfTabs[0];
             if (match && match.id !== undefined) {
               const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-              sessionTabs.set(sessionId, match.id);
+              await bindSessionTab(sessionId, match.id, owner);
               const curMatchUrl = String(match.url || match.pendingUrl || "");
               const alreadyMatchesUrl = !urlStr
                 || urlStr === "about:blank"
@@ -1008,7 +1063,7 @@ async function handleRpc(msg) {
         });
         if (match && match.id !== undefined) {
           const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-          sessionTabs.set(sessionId, match.id);
+          await bindSessionTab(sessionId, match.id, owner);
           if (params.focusEmulation !== false) {
             try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
           }
@@ -1041,7 +1096,7 @@ async function handleRpc(msg) {
             : (groupTabs.length > 0 ? groupTabs[groupTabs.length - 1] : null);
           if (match && match.id !== undefined) {
             const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-            sessionTabs.set(sessionId, match.id);
+            await bindSessionTab(sessionId, match.id, owner);
             if (params.focusEmulation !== false) {
               try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
             }
@@ -1112,9 +1167,10 @@ async function handleRpc(msg) {
           throw err;
         }
       }
+      await claimTab(tab.id, owner, true);
       const effectiveWinId = tab.windowId !== undefined ? tab.windowId : targetWindowId;
       const groupId = await ensureAgentGroup(tab.id, sessionName, color, effectiveWinId);
-      sessionTabs.set(sessionId, tab.id);
+      await bindSessionTab(sessionId, tab.id, owner);
       if (params.focusEmulation !== false && params.skipPreview !== true) {
         startLiveScreencast(tab.id);
       }
@@ -1241,11 +1297,13 @@ async function handleRpc(msg) {
         sessionName,
         tabId,
         chromeTabId,
-        allowMissing = false
+        allowMissing = false,
+        owner = ""
       } = params;
-      const allTabs = (chrome.tabs && typeof chrome.tabs.query === "function")
+      const foreign = await foreignTabIds(owner);
+      const allTabs = ((chrome.tabs && typeof chrome.tabs.query === "function")
         ? (await chrome.tabs.query({})) || []
-        : [];
+        : []).filter(t => !foreign.has(t.id));
       const explicitId = chromeTabId !== undefined ? Number(chromeTabId) : (tabId !== undefined ? Number(tabId) : undefined);
       let match = null;
       if (explicitId !== undefined && !Number.isNaN(explicitId)) {
@@ -1294,7 +1352,7 @@ async function handleRpc(msg) {
         if (allowMissing) return { id, result: { found: false } };
         throw new Error(`No matching Chrome tab found for '${urlPattern || queryFilter || windowFilter || sessionName || sessionId}'`);
       }
-      sessionTabs.set(sessionId, match.id);
+      await bindSessionTab(sessionId, match.id, owner);
       if (params.assignGroup === true && sessionName) {
         try { await ensureAgentGroup(match.id, sessionName, params.color || "blue", match.windowId); } catch (_) {}
       }
@@ -1315,8 +1373,8 @@ async function handleRpc(msg) {
       };
     }
     if (method === "setInputFiles") {
-      const { tabId, selector = "input[type='file']", files = [], inlineFiles = null } = params;
-      const res = await setInputFilesOnTab(tabId, selector, files, inlineFiles);
+      const { tabId, selector = "input[type='file']", files = [], inlineFiles = null, inlineSkipped = "" } = params;
+      const res = await setInputFilesOnTab(tabId, selector, files, inlineFiles, inlineSkipped);
       return { id, result: res };
     }
     if (method === "evaluate") {
@@ -1463,80 +1521,199 @@ async function handleRpc(msg) {
           }
         }
       } else {
-        try {
-          batchRes = await injectAndRunBatch(reqPayload);
-        } catch (batchErr) {
-          if (!isNavigationError(batchErr)) throw batchErr;
-          initializedRuntimeTabs.delete(tabId);
-          const tNav0 = Date.now();
-          const navSt = await waitForNavigationSettlement(tabId, curTabUrl, 8000);
-          navWaitMs += (Date.now() - tNav0);
-          if (!navSt.alive) throw batchErr;
-          const navIdx = origSteps.findIndex(stp => {
-            const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
-            return op === "click" || op === "press" || op === "key" || op === "eval" || op === "evaluate" || op === "webmcp" || op === "calltool";
-          });
-          const remSteps = navIdx >= 0
-            ? origSteps.slice(navIdx + 1).filter(stp => {
+        const canCdpClick = Boolean(chrome.debugger && typeof chrome.debugger.sendCommand === "function");
+        let curSteps = origSteps;
+        let stepOffset = Number(reqPayload.stepOffset || 0);
+        let hadPreSteps = Boolean(reqPayload.hadPreSteps);
+        let curDiff = reqPayload.diff;
+        let forceReinit = false;
+        let didNavigate = false;
+        const accErrors = [];
+        const accEvals = [];
+        const accRawVals = [];
+        const accEscalations = [];
+        let accExecMs = 0;
+        let lastCursor = null;
+        const maxSlices = origSteps.length + 3;
+
+        for (let sliceIdx = 0; sliceIdx < maxSlices; sliceIdx++) {
+          const sliceReq = {
+            ...reqPayload,
+            steps: curSteps,
+            stepOffset,
+            hadPreSteps,
+            cdpClick: canCdpClick
+          };
+          if (curDiff !== undefined) sliceReq.diff = curDiff;
+
+          try {
+            batchRes = await injectAndRunBatch(sliceReq, forceReinit);
+            forceReinit = false;
+          } catch (batchErr) {
+            if (!isNavigationError(batchErr)) throw batchErr;
+            initializedRuntimeTabs.delete(tabId);
+            const tNav0 = Date.now();
+            const navSt = await waitForNavigationSettlement(tabId, curTabUrl, 8000);
+            navWaitMs += (Date.now() - tNav0);
+            if (!navSt.alive) throw batchErr;
+            curTabUrl = navSt.url || curTabUrl;
+            didNavigate = true;
+            forceReinit = true;
+            const navIdx = curSteps.findIndex(stp => {
+              const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
+              return op === "click" || op === "press" || op === "key" || op === "eval" || op === "evaluate" || op === "webmcp" || op === "calltool";
+            });
+            if (navIdx >= 0) {
+              stepOffset += navIdx + 1;
+              curSteps = curSteps.slice(navIdx + 1).filter(stp => {
                 const op = String((stp && (stp.op || stp.action)) || "").trim().toLowerCase();
                 return isPostNavSafeOp(op);
-              })
-            : [];
-          if (reqPayload.skipSnapshot && remSteps.length === 0) {
-            batchRes = {
-              didNavigate: true,
-              url: navSt.url || "",
-              title: navSt.title || "",
-              errors: [],
-              evalOutputs: [],
-              rawEvalValues: [],
-              escalations: [],
-              canvases: [],
-              lines: []
-            };
-          } else {
-            const followReq = { ...reqPayload, steps: remSteps };
-            if (!reqPayload.skipSnapshot) followReq.diff = false;
-            batchRes = await injectAndRunBatch(followReq, true);
-            if (batchRes && typeof batchRes === "object") batchRes.didNavigate = true;
+              });
+            } else {
+              stepOffset += curSteps.length;
+              curSteps = [];
+            }
+            hadPreSteps = true;
+            if (!reqPayload.skipSnapshot) curDiff = false;
+            if (reqPayload.skipSnapshot && curSteps.length === 0) {
+              batchRes = {
+                didNavigate: true,
+                url: navSt.url || "",
+                title: navSt.title || "",
+                errors: accErrors,
+                evalOutputs: accEvals,
+                rawEvalValues: accRawVals,
+                escalations: accEscalations,
+                cursor: lastCursor,
+                canvases: [],
+                timings: { execMs: Math.round(accExecMs * 100) / 100 },
+                lines: []
+              };
+              break;
+            }
+            continue;
           }
-        }
-      }
 
-      if (batchRes && batchRes.navigated) {
-        const priorErrors = Array.isArray(batchRes.errors) ? batchRes.errors : [];
-        const priorEvals = Array.isArray(batchRes.evalOutputs) ? batchRes.evalOutputs : [];
-        const priorRawVals = Array.isArray(batchRes.rawEvalValues) ? batchRes.rawEvalValues : [];
-        const nextIdx = typeof batchRes.nextStepIndex === "number" ? batchRes.nextStepIndex : origSteps.length;
-        const remSteps = nextIdx < origSteps.length ? origSteps.slice(nextIdx) : [];
-        initializedRuntimeTabs.delete(tabId);
-        const tNav0 = Date.now();
-        const navSt = await waitForNavigationSettlement(tabId, String(batchRes.url || ""), 8000);
-        navWaitMs += (Date.now() - tNav0);
-        if (reqPayload.skipSnapshot && remSteps.length === 0) {
-          batchRes = {
-            didNavigate: true,
-            url: navSt.url || batchRes.url || "",
-            title: navSt.title || batchRes.title || "",
-            errors: priorErrors,
-            evalOutputs: priorEvals,
-            rawEvalValues: priorRawVals,
-            escalations: [],
-            canvases: [],
-            timings: batchRes.timings || {},
-            lines: []
-          };
-        } else {
-          const followReq = { ...reqPayload, steps: remSteps };
-          if (!reqPayload.skipSnapshot) followReq.diff = false;
-          const postNavRes = await injectAndRunBatch(followReq, true);
-          if (postNavRes && typeof postNavRes === "object") {
-            postNavRes.didNavigate = true;
-            postNavRes.errors = priorErrors.concat(Array.isArray(postNavRes.errors) ? postNavRes.errors : []);
-            postNavRes.evalOutputs = priorEvals.concat(Array.isArray(postNavRes.evalOutputs) ? postNavRes.evalOutputs : []);
-            postNavRes.rawEvalValues = priorRawVals.concat(Array.isArray(postNavRes.rawEvalValues) ? postNavRes.rawEvalValues : []);
-            batchRes = postNavRes;
+          if (batchRes && typeof batchRes === "object") {
+            if (Array.isArray(batchRes.errors)) accErrors.push(...batchRes.errors);
+            if (Array.isArray(batchRes.evalOutputs)) accEvals.push(...batchRes.evalOutputs);
+            if (Array.isArray(batchRes.rawEvalValues)) accRawVals.push(...batchRes.rawEvalValues);
+            if (Array.isArray(batchRes.escalations)) accEscalations.push(...batchRes.escalations);
+            if (batchRes.timings && typeof batchRes.timings.execMs === "number") {
+              accExecMs += batchRes.timings.execMs;
+            }
+            if (batchRes.cursor) lastCursor = batchRes.cursor;
           }
+
+          if (batchRes && batchRes.cdpClick && canCdpClick) {
+            const pt = batchRes.cdpClick;
+            const clickUrl = String(batchRes.url || curTabUrl || "");
+            const nextIdx = typeof batchRes.nextStepIndex === "number" ? batchRes.nextStepIndex : curSteps.length;
+            stepOffset += nextIdx;
+            curSteps = nextIdx < curSteps.length ? curSteps.slice(nextIdx) : [];
+            hadPreSteps = true;
+            try {
+              await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: pt.x, y: pt.y, button: "none" });
+              await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: pt.x, y: pt.y, button: "left", buttons: 1, clickCount: 1 });
+              await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: pt.x, y: pt.y, button: "left", buttons: 0, clickCount: 1 });
+            } catch (clickErr) {
+              if (!isNavigationError(clickErr)) {
+                accErrors.push(`step ${stepOffset} (click): ${(clickErr && clickErr.message) || clickErr}`);
+              }
+            }
+            await new Promise(r => setTimeout(r, 15));
+            if (chrome.tabs && typeof chrome.tabs.get === "function") {
+              try {
+                const postTab = await chrome.tabs.get(tabId);
+                if (postTab) {
+                  const postUrl = String(postTab.url || postTab.pendingUrl || "");
+                  let samePath = false;
+                  if (clickUrl && postUrl) {
+                    try {
+                      const u1 = new URL(clickUrl);
+                      const u2 = new URL(postUrl);
+                      samePath = (u1.origin === u2.origin && u1.pathname === u2.pathname);
+                    } catch (_) {}
+                  }
+                  if (postTab.status === "loading" || postTab.pendingUrl || (clickUrl && postUrl && postUrl !== clickUrl && !samePath)) {
+                    initializedRuntimeTabs.delete(tabId);
+                    const tNav0 = Date.now();
+                    const navSt = await waitForNavigationSettlement(tabId, clickUrl, 8000);
+                    navWaitMs += (Date.now() - tNav0);
+                    curTabUrl = navSt.url || postUrl || curTabUrl;
+                    didNavigate = true;
+                    forceReinit = true;
+                    if (!reqPayload.skipSnapshot) curDiff = false;
+                  } else if (postUrl) {
+                    curTabUrl = postUrl;
+                  }
+                }
+              } catch (_) {}
+            }
+            if (reqPayload.skipSnapshot && curSteps.length === 0) {
+              batchRes = {
+                didNavigate,
+                url: curTabUrl || clickUrl,
+                title: String(batchRes.title || ""),
+                errors: accErrors,
+                evalOutputs: accEvals,
+                rawEvalValues: accRawVals,
+                escalations: accEscalations,
+                cursor: lastCursor,
+                canvases: [],
+                timings: { execMs: Math.round(accExecMs * 100) / 100 },
+                lines: []
+              };
+              break;
+            }
+            continue;
+          }
+
+          if (batchRes && batchRes.navigated) {
+            const navFrom = String(batchRes.url || curTabUrl || "");
+            const nextIdx = typeof batchRes.nextStepIndex === "number" ? batchRes.nextStepIndex : curSteps.length;
+            stepOffset += nextIdx;
+            curSteps = nextIdx < curSteps.length ? curSteps.slice(nextIdx) : [];
+            hadPreSteps = true;
+            initializedRuntimeTabs.delete(tabId);
+            const tNav0 = Date.now();
+            const navSt = await waitForNavigationSettlement(tabId, navFrom, 8000);
+            navWaitMs += (Date.now() - tNav0);
+            curTabUrl = navSt.url || navFrom || curTabUrl;
+            didNavigate = true;
+            forceReinit = true;
+            if (!reqPayload.skipSnapshot) curDiff = false;
+            if (reqPayload.skipSnapshot && curSteps.length === 0) {
+              batchRes = {
+                didNavigate: true,
+                url: curTabUrl,
+                title: navSt.title || batchRes.title || "",
+                errors: accErrors,
+                evalOutputs: accEvals,
+                rawEvalValues: accRawVals,
+                escalations: accEscalations,
+                cursor: lastCursor,
+                canvases: [],
+                timings: { ...(batchRes.timings || {}), execMs: Math.round(accExecMs * 100) / 100 },
+                lines: []
+              };
+              break;
+            }
+            continue;
+          }
+
+          if (batchRes && typeof batchRes === "object") {
+            if (didNavigate) batchRes.didNavigate = true;
+            batchRes.errors = accErrors;
+            batchRes.evalOutputs = accEvals;
+            batchRes.rawEvalValues = accRawVals;
+            batchRes.escalations = accEscalations;
+            if (lastCursor && !batchRes.cursor) batchRes.cursor = lastCursor;
+            if (batchRes.timings && typeof batchRes.timings === "object") {
+              batchRes.timings.execMs = Math.round(accExecMs * 100) / 100;
+            }
+          }
+          break;
         }
       }
 
@@ -1571,7 +1748,7 @@ async function handleRpc(msg) {
               esc.handled = true;
               didMutate = true;
               try {
-                await setInputFilesOnTab(tabId, sel, files, stepObj.inlineFiles || null);
+                await setInputFilesOnTab(tabId, sel, files, stepObj.inlineFiles || null, stepObj.inlineSkipped || "");
               } catch (upErr) {
                 batchRes.errors.push(String((upErr && upErr.message) || upErr));
               }
@@ -1637,8 +1814,54 @@ async function handleRpc(msg) {
       if (sessionId) sessionTabs.delete(sessionId);
       return { id, result: { closed: Boolean(targetId) } };
     }
+    if (method === "closeAgentTabs") {
+      clearPendingPreview();
+      const { owner } = params;
+      await loadAgentTabClaims();
+      const tabIds = [...agentTabClaims]
+        .filter(([, c]) => c.opened && (!owner || c.owner === owner))
+        .map(([tabId]) => tabId);
+      for (const tid of tabIds) {
+        stopLiveScreencast(tid);
+        attachedDebuggers.delete(tid);
+        initializedRuntimeTabs.delete(tid);
+      }
+      const removals = await Promise.allSettled(tabIds.map(tid => chrome.tabs.remove(tid)));
+      await releaseTabClaims(tabIds);
+      for (const [sid, tid] of sessionTabs) {
+        if (tabIds.includes(tid)) sessionTabs.delete(sid);
+      }
+      return { id, result: { tabIds, closedCount: removals.filter(r => r.status === "fulfilled").length } };
+    }
+    if (method === "retireOwner") {
+      const { owner, titles = [] } = params;
+      await loadAgentTabClaims();
+      const owned = [...agentTabClaims].filter(([, c]) => c.owner === owner);
+      const blankIds = [];
+      for (const [tid, claim] of owned) {
+        if (!claim.opened) continue;
+        try {
+          const t = await chrome.tabs.get(tid);
+          const u = String(t.url || t.pendingUrl || "");
+          if (!u || u === "about:blank" || u.startsWith("chrome://newtab")) blankIds.push(tid);
+        } catch (_) {}
+      }
+      await Promise.allSettled(blankIds.map(tid => chrome.tabs.remove(tid)));
+      await releaseTabClaims(owned.map(([tid]) => tid));
+      let collapsed = 0;
+      for (const title of titles) {
+        for (const g of await chrome.tabGroups.query({ title })) {
+          try {
+            await chrome.tabGroups.update(g.id, { collapsed: true });
+            collapsed += 1;
+          } catch (_) {}
+        }
+        sessionGroups.delete(title);
+      }
+      return { id, result: { closedCount: blankIds.length, collapsed } };
+    }
     if (method === "closeTabGroup") {
-      const { sessionName = "🤖 Agent" } = params;
+      const { sessionName = "Agent" } = params;
       const groups = await chrome.tabGroups.query({ title: sessionName });
       let closedCount = 0;
       for (const g of groups) {
@@ -1675,7 +1898,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.4.4" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.4.5" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

@@ -5,7 +5,7 @@ Measures:
   1. Token Efficiency (Schema Tokens, Raw Observation Tokens, Cumulative Input Tokens via o200k_base)
   2. Context Window Efficiency (Peak Context Window Tokens, Context Growth Slope)
   3. Speed (Local Engine ms — Warm & Cold, LLM Turn Count, End-to-End Task Wall-Clock Seconds)
-  4. Background Safety (50Hz Cursor & Focus Intrusion Guard, Chrome '🤖 Agent' Tab Group, Mac AX Fallback)
+  4. Background Safety (50Hz Cursor & Focus Intrusion Guard, Chrome 'Agent' Tab Group, Mac AX Fallback)
 """
 
 from __future__ import annotations
@@ -206,7 +206,7 @@ def run_workload_a_web(base_url: str) -> list[CompetitorResult]:
     rt_wmcp.execute({"reset": True})
     with BackgroundIntrusionGuard() as guard_wmcp:
         t0 = time.perf_counter()
-        wc1 = f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "🤖 Agent"}});'
+        wc1 = f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "Agent"}});'
         wo1 = rt_wmcp.execute({"code": wc1})
         wc2 = (
             'await tab.callTool("approveOrder", '
@@ -266,7 +266,7 @@ def run_workload_a_web(base_url: str) -> list[CompetitorResult]:
             )
             with BackgroundIntrusionGuard() as guard_vmcp:
                 t0 = time.perf_counter()
-                vc1 = f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "🤖 Agent"}});'
+                vc1 = f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "Agent"}});'
                 vo1 = rt_wmcp.execute({"code": vc1})
                 vc2 = (
                     'await tab.callTool("virtualApproveOrder", '
@@ -311,7 +311,7 @@ def run_workload_a_web(base_url: str) -> list[CompetitorResult]:
     rt_wmcp.execute({"reset": True})
     with BackgroundIntrusionGuard() as guard:
         t0 = time.perf_counter()
-        c1 = f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "🤖 Agent"}});'
+        c1 = f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "Agent"}});'
         o1 = rt_wmcp.execute({"code": c1})
 
         # Turn 2: Batch filter search + select status + check priority + apply filters + open #ORD-409 drawer (5 actions)
@@ -430,7 +430,7 @@ def run_workload_a_web(base_url: str) -> list[CompetitorResult]:
         cursor_moved_px=0.0,
         focus_changes=0,
         multi_cursor=False,
-        notes="Stateful JS REPL + Chrome '🔎 Task' group; full unfolded state on inspect; single-cursor",
+        notes="Stateful JS REPL + Chrome 'Task' group; full unfolded state on inspect; single-cursor",
     ))
 
     # --- 5: OpenBrowser MCP (`openbrowser-ai` CodeAgent over CDP) ---
@@ -998,7 +998,7 @@ def run_workload_b_mac() -> list[CompetitorResult]:
 
 
 # =============================================================================
-# WORKLOAD C: Cross-Surface Hybrid (Multi-Tab '🤖 Agent' Focus Emulation + File Upload + Mac AX)
+# WORKLOAD C: Cross-Surface Hybrid (Multi-Tab 'Agent' Focus Emulation + File Upload + Mac AX)
 # =============================================================================
 
 def run_workload_c_hybrid(base_url: str) -> list[CompetitorResult]:
@@ -1014,9 +1014,9 @@ def run_workload_c_hybrid(base_url: str) -> list[CompetitorResult]:
     rt.mac.ensure_daemon()
     with BackgroundIntrusionGuard() as guard:
         t0 = time.perf_counter()
-        # Turn 1: Open /pricing in unfocused '🤖 Agent' tab & trigger rAF Focus-Emulated promo quote
+        # Turn 1: Open /pricing in unfocused 'Agent' tab & trigger rAF Focus-Emulated promo quote
         c1 = (
-            f'let pricing = await cua.createBrowserTab("chrome", "{base_url}/pricing", {{sessionName: "🤖 Agent"}}); '
+            f'let pricing = await cua.createBrowserTab("chrome", "{base_url}/pricing", {{sessionName: "Agent"}}); '
             'await pricing.click("Generate Quote Token");'
         )
         o1 = rt.execute({"code": c1})
@@ -1031,9 +1031,9 @@ def run_workload_c_hybrid(base_url: str) -> list[CompetitorResult]:
         )
         o2 = rt.execute({"code": c2})
 
-        # Turn 3: Open /orders in same '🤖 Agent' group, inspect #ORD-409, upload PO via background CDP, fill $15,133 + quote token, approve!
+        # Turn 3: Open /orders in same 'Agent' group, inspect #ORD-409, upload PO via background CDP, fill $15,133 + quote token, approve!
         c3 = (
-            f'let orders = await cua.createBrowserTab("chrome", "{base_url}/orders", {{sessionName: "🤖 Agent"}}); '
+            f'let orders = await cua.createBrowserTab("chrome", "{base_url}/orders", {{sessionName: "Agent"}}); '
             'await orders.click("Inspect #ORD-409"); '
             f'await orders.upload("Attach signed PO", "{po_path}"); '
             'await orders.fill("Approval note", "Quote ENT-1000-OK | Verified $15,133"); '
@@ -1165,7 +1165,7 @@ def run_workload_d_multi_cursor(base_url: str) -> list[CompetitorResult]:
                 {
                     "agent": "agent-1",
                     "code": (
-                        f'let t=await cua.createBrowserTab("chrome","{orders_url}",{{sessionName:"🤖 Agent 1"}});'
+                        f'let t=await cua.createBrowserTab("chrome","{orders_url}",{{sessionName:"Agent 1"}});'
                         'await t.move("Search orders");await t.fill("Search orders","Enterprise");'
                         'await t.select("Order status","pending");await t.click("Priority Only");'
                         'await t.click("Apply Filters");await t.click("Inspect #ORD-409");'
@@ -1174,7 +1174,7 @@ def run_workload_d_multi_cursor(base_url: str) -> list[CompetitorResult]:
                 {
                     "agent": "agent-2",
                     "code": (
-                        f'let t=await cua.createBrowserTab("chrome","{pricing_url}",{{sessionName:"🤖 Agent 2"}});'
+                        f'let t=await cua.createBrowserTab("chrome","{pricing_url}",{{sessionName:"Agent 2"}});'
                         'await t.move("Generate Quote Token");await t.click("Generate Quote Token");'
                     ),
                 },
@@ -1416,7 +1416,7 @@ def run_workload_e_long_horizon_ocr(base_url: str) -> list[CompetitorResult]:
         t0 = time.perf_counter()
         # Turn 1 (9 UI ops): Open /orders, filter pending priority Enterprise, inspect & approve #ORD-402
         c1 = (
-            f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "🤖 Agent"}}); '
+            f'let tab = await cua.createBrowserTab("chrome", "{orders_url}", {{sessionName: "Agent"}}); '
             'await tab.fill("Search orders", "Enterprise"); '
             'await tab.select("Order status", "pending"); '
             'await tab.click("Priority Only"); '
@@ -1452,7 +1452,7 @@ def run_workload_e_long_horizon_ocr(base_url: str) -> list[CompetitorResult]:
 
         # Turn 4 (8 UI ops): Open /pricing rAF promo quote + compute 415 * 37 = 15355 on macOS Calculator
         c4 = (
-            f'let pricing = await cua.createBrowserTab("chrome", "{pricing_url}", {{sessionName: "🤖 Agent"}}); '
+            f'let pricing = await cua.createBrowserTab("chrome", "{pricing_url}", {{sessionName: "Agent"}}); '
             'await pricing.click("Generate Quote Token"); '
             'let calc = await cua.getApp("Calculator"); '
             'await calc.pressKey("escape"); '

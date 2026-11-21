@@ -11,7 +11,8 @@ import time
 from typing import Any
 
 from .cli import DEFAULT_RUNTIME_SOCK, execute_via_daemon
-from .browser_engine import BrowserEngine, _HAS_SCHEME_RE, _normalize_nav_url
+from .browser_engine import BrowserEngine, _HAS_SCHEME_RE, _normalize_nav_url, _url_matches_target
+from .sessions import AgentClient, CallerIdentity, peer_pid, resolve_caller
 from .mac_engine import (
     USER_STOPPED_ERROR,
     MacNativeEngine,
@@ -316,7 +317,7 @@ class TabHandle:
         tab_id: str,
         url: str | None = None,
         mode: str = "chrome",
-        session_name: str = "🤖 Agent",
+        session_name: str = "Agent",
         agent_id: str = "default",
         window: str | None = None,
         window_id: int | None = None,
@@ -850,6 +851,16 @@ class CuaNamespace:
         host_part = s.split("/", 1)[0].split("?", 1)[0]
         return "." in host_part and not host_part.startswith(".") and not host_part.endswith(".")
 
+    @property
+    def _session_scope(self) -> str | None:
+        """This namespace's agent id when it belongs to an identified harness session (`devin1`, `devin1.audit`)."""
+        client, _ = self.runtime.browser.clients.lookup(self.agent_id)
+        return self.agent_id if client is not None else None
+
+    def _shares_session(self, tab_id: str) -> bool:
+        client, _ = self.runtime.browser.clients.lookup(self.agent_id)
+        return self.runtime.browser.in_scope(tab_id, client.short_id if client is not None else None)
+
     def _bind_existing_session(self, sess: Any) -> TabHandle:
         tid = str(sess.tab_id)
         want_mode = "extension" if sess.is_extension else "headless"
@@ -868,7 +879,7 @@ class CuaNamespace:
             tab_id=tid,
             url=None,
             mode="extension" if sess.is_extension else "headless",
-            session_name=str(sess.group_name or "🤖 Agent"),
+            session_name=str(sess.group_name or self.runtime.browser.group_title(self.agent_id)),
             agent_id=self.agent_id,
             window_id=int(win_id) if win_id is not None else None,
             chrome_tab_id=int(chrome_tid) if chrome_tid is not None else None,
@@ -949,7 +960,7 @@ class CuaNamespace:
             actual_url = str(opts.get("url") or url or "about:blank") if url == "about:blank" and opts.get("url") else url
             b_id = str(opts.get("browser") or opts.get("mode") or browser_id or "chrome")
 
-        default_group = "🤖 Agent" if self.agent_id == "default" else f"🤖 {self.agent_id}"
+        default_group = self.runtime.browser.group_title(self.agent_id)
         session_name = str(
             opts.get("sessionName")
             or opts.get("session_name")
@@ -957,6 +968,29 @@ class CuaNamespace:
             or default_group
         )
         explicit_tid = opts.get("tabId") or opts.get("tab_id") or opts.get("session")
+        raw_chrome_tid = opts.get("chromeTabId") if opts.get("chromeTabId") is not None else opts.get("chrome_tab_id")
+        chrome_tid = int(raw_chrome_tid) if raw_chrome_tid is not None else None
+        reuse_existing = bool(
+            opts.get("reuseExisting")
+            if opts.get("reuseExisting") is not None
+            else opts.get("reuse_existing")
+        )
+        if reuse_existing and not explicit_tid:
+            browser = self.runtime.browser
+            for b_tid, b_s in reversed(list(browser._tabs.items())):
+                if not self._shares_session(b_tid):
+                    continue
+                if b_s.is_extension and b_id == "headless":
+                    continue
+                if not b_s.is_extension and b_id in ("extension", "chrome-extension", "live"):
+                    continue
+                if not browser._is_session_alive(b_s):
+                    continue
+                live_ctid = getattr(b_s._raw_page, "chrome_tab_id", None) if b_s.is_extension else None
+                if (chrome_tid is not None and live_ctid == chrome_tid) or (
+                    chrome_tid is None and _url_matches_target(b_s.last_url, actual_url)
+                ):
+                    return self._bind_existing_session(b_s)
         prefix = "" if self.agent_id == "default" else f"{self.agent_id}:"
         if explicit_tid:
             tab_id = str(explicit_tid)
@@ -975,13 +1009,6 @@ class CuaNamespace:
         win_filter = str(win_raw) if win_raw else None
         raw_win_id = opts.get("windowId") if opts.get("windowId") is not None else opts.get("window_id")
         win_id = int(raw_win_id) if raw_win_id is not None else None
-        raw_chrome_tid = opts.get("chromeTabId") if opts.get("chromeTabId") is not None else opts.get("chrome_tab_id")
-        chrome_tid = int(raw_chrome_tid) if raw_chrome_tid is not None else None
-        reuse_existing = bool(
-            opts.get("reuseExisting")
-            if opts.get("reuseExisting") is not None
-            else opts.get("reuse_existing")
-        )
         req_ext_opt = (
             opts.get("requireExtension")
             if opts.get("requireExtension") is not None
@@ -1038,6 +1065,7 @@ class CuaNamespace:
             sess = self.runtime.browser.attach_existing_tab(
                 chrome_tab_id=int(criteria),
                 group_color=self.runtime.browser._get_agent_color(self.agent_id),
+                scope=self._session_scope,
             )
             if sess is not None:
                 return self._bind_existing_session(sess)
@@ -1066,6 +1094,7 @@ class CuaNamespace:
                 sess = self.runtime.browser.attach_existing_tab(
                     chrome_tab_id=int(stripped),
                     group_color=self.runtime.browser._get_agent_color(self.agent_id),
+                    scope=self._session_scope,
                 )
                 if sess is not None:
                     return self._bind_existing_session(sess)
@@ -1095,8 +1124,8 @@ class CuaNamespace:
                 return live_candidates[0]
 
             # Check other agent sessions' live tabs before spawning a new tab
-            for b_s in reversed(list(self.runtime.browser._tabs.values())):
-                if self.runtime.browser._is_session_alive(b_s):
+            for b_tid, b_s in reversed(list(self.runtime.browser._tabs.items())):
+                if self._shares_session(b_tid) and self.runtime.browser._is_session_alive(b_s):
                     if needle in (b_s.last_url or "").lower() or needle in (b_s.last_title or "").lower():
                         if not ext_connected or b_s.is_extension:
                             return self._bind_existing_session(b_s)
@@ -1106,6 +1135,7 @@ class CuaNamespace:
                 url_pattern=stripped,
                 window=stripped,
                 group_color=self.runtime.browser._get_agent_color(self.agent_id),
+                scope=self._session_scope,
             )
             if attached is not None:
                 return self._bind_existing_session(attached)
@@ -1124,6 +1154,7 @@ class CuaNamespace:
                 sess = self.runtime.browser.attach_existing_tab(
                     chrome_tab_id=int(raw_ctid),
                     group_color=self.runtime.browser._get_agent_color(self.agent_id),
+                    scope=self._session_scope,
                 )
                 if sess is not None:
                     return self._bind_existing_session(sess)
@@ -1136,6 +1167,7 @@ class CuaNamespace:
                     sess = self.runtime.browser.attach_existing_tab(
                         chrome_tab_id=int(tid_str),
                         group_color=self.runtime.browser._get_agent_color(self.agent_id),
+                        scope=self._session_scope,
                     )
                     if sess is not None:
                         return self._bind_existing_session(sess)
@@ -1240,6 +1272,7 @@ class CuaNamespace:
                         window_id=int(want_win_id) if want_win_id is not None else None,
                         session_name=str(want_session) if want_session else None,
                         group_color=self.runtime.browser._get_agent_color(self.agent_id),
+                        scope=self._session_scope,
                     )
                     if attached is not None:
                         return self._bind_existing_session(attached)
@@ -1264,6 +1297,7 @@ class CuaNamespace:
         if self.runtime.browser.extension_connected:
             attached = self.runtime.browser.attach_existing_tab(
                 group_color=self.runtime.browser._get_agent_color(self.agent_id),
+                scope=self._session_scope,
             )
             if attached is not None:
                 return self._bind_existing_session(attached)
@@ -2417,6 +2451,41 @@ class FasterMacUseRuntime:
                 agent="parallel",
             )
 
+    def execute_for_client(self, req: dict[str, Any], ident: CallerIdentity | None) -> str:
+        """Daemon entry: give each harness session its own agent namespace, tab group, and color."""
+        for dead in self.browser.clients.take_dead():
+            self._pool.submit(self._retire_client, dead)
+        if ident is None:
+            return self.execute(req)
+        client = self.browser.clients.client_for(ident)
+        return self.execute(self._scope_request(req, client.short_id))
+
+    def _retire_client(self, client: AgentClient) -> None:
+        with self._global_lock:
+            for key in [k for k in self._agents if k == client.short_id or k.startswith(f"{client.short_id}.")]:
+                self._agents.pop(key, None)
+        self.browser.retire_client(client)
+
+    @classmethod
+    def _scope_request(cls, req: dict[str, Any], base: str) -> dict[str, Any]:
+        out = dict(req)
+        raw = str(out.pop("cursor", None) or out.get("agent") or "").strip()
+        if raw in ("", "default", base) or raw.startswith(f"{base}."):
+            out["agent"] = raw if raw.startswith(f"{base}.") else base
+        else:
+            out["agent"] = f"{base}.{raw}"
+        for key in ("session", "tab"):
+            tid = out.get(key)
+            if isinstance(tid, str) and tid and ":" not in tid and not tid.isdigit():
+                out[key] = f"{out['agent']}:{tid}"
+        if isinstance(out.get("parallel"), list):
+            out["parallel"] = [
+                cls._scope_request({**t, "agent": t.get("agent") or t.get("cursor") or f"agent-{i + 1}"}, base)
+                for i, t in enumerate(out["parallel"])
+                if isinstance(t, dict)
+            ]
+        return out
+
     def execute(self, req: dict[str, Any]) -> str:
         if getattr(self, "_is_mcp_stdio", False):
             return execute_via_daemon(req, Path(__file__).resolve().parent / "cli.py")
@@ -2438,6 +2507,12 @@ class FasterMacUseRuntime:
         if req.get("highlightWindow"):
             return highlight_target_window(socket_path=self.mac.socket_path)
 
+        if "liveView" in req:
+            return self.mac.execute({"liveView": bool(req["liveView"])})
+
+        if req.get("menuOutline") or req.get("menuAction"):
+            return self.mac.execute({k: req[k] for k in ("menuOutline", "menuAction") if req.get(k)})
+
         if req.get("togglePreview"):
             return self.mac.execute({"togglePreview": True})
 
@@ -2449,6 +2524,28 @@ class FasterMacUseRuntime:
 
         if req.get("bridgeStatus"):
             return self.browser.execute_batch({"bridgeStatus": True})
+
+        if req.get("agentSessions"):
+            sessions = self.browser.agent_sessions()
+            if isinstance(req["agentSessions"], dict) and req["agentSessions"].get("format") == "json":
+                return json.dumps(sessions, ensure_ascii=False)
+            lines = [f"# agent sessions count={len(sessions)}"]
+            for ses in sessions:
+                lines.append(
+                    f'@session id={ses["id"]} label="{ses["label"]}" color={ses["color"]} '
+                    f'tabs={ses["tabs"]} idle={ses["idleSec"]}s'
+                )
+            return "\n".join(lines)
+
+        if req.get("closeAgentTabs"):
+            client, _ = self.browser.clients.lookup(str(req.get("owner") or req.get("agent") or ""))
+            out = self.browser.close_agent_tabs(scope=client.short_id if client is not None else None)
+            with self._global_lock:
+                for a_sess in self._agents.values():
+                    for hid, h in list(a_sess.cua.handles.items()):
+                        if isinstance(h, TabHandle) and h.tab_id not in self.browser._tabs:
+                            a_sess.cua.handles.pop(hid, None)
+            return out
 
         if req.get("listTabs"):
             return self.browser.execute_batch(req)
@@ -2491,7 +2588,8 @@ class FasterMacUseRuntime:
                 self.mac.execute({"reset": True, "agent": agent_id})
                 self.browser.reset(agent=agent_id)
                 with self._global_lock:
-                    self._agents.pop(agent_id, None)
+                    for key in [k for k in self._agents if k == agent_id or k.startswith(f"{agent_id}.")]:
+                        self._agents.pop(key, None)
                 return f"# fmu runtime reset agent={agent_id}"
             self.mac.reset()
             self.browser.reset()
@@ -2511,7 +2609,7 @@ class FasterMacUseRuntime:
             raw_surface = str(req.get("surface") or ("app" if "app" in req else "web")).lower()
             surface = "web" if raw_surface in ("web", "browser") else raw_surface
             if surface == "app":
-                out = self.mac.execute(req)
+                out = self.mac.execute({**req, "agentLabel": self.browser.group_title(agent_id)})
                 sess.context_tracker.record_turn(f"app:{req.get('app', '')}", out)
                 return out
 
@@ -2582,7 +2680,8 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
                 except Exception:
                     pass
                 return
-            resp = runtime.execute(req)
+            ident = resolve_caller(peer_pid(conn), label=str(req.get("sessionLabel") or "").strip() or None)
+            resp = runtime.execute_for_client(req, ident)
             conn.sendall((resp + "\n").encode("utf-8"))
         except Exception as exc:
             try:
@@ -2617,16 +2716,18 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
 MCP_TOOL_SCHEMA = {
     "name": "cua",
     "description": (
-        "Background Chrome ('🤖 Agent' Tab Group) & macOS AX control with multi-cursor isolation, stateful REPL (`code`), "
+        "Background Chrome ('Agent' Tab Group) & macOS AX control with multi-cursor isolation, stateful REPL (`code`), "
         "or `steps` batching and `+/~/-` UID diffs. Zero focus/cursor theft. "
         "Pass `code` (`tab=cua.createBrowserTab('chrome',url); tab.click('@u1').waitFor('Confirmed')`, `cua.listTabs()`, `tab.text()`, or `app=cua.getApp('Calculator'); app.click('@a6')`), "
-        "`{app|url, steps, agent}`, or `{parallel:[...]}`."
+        "`{app|url, steps, agent}`, or `{parallel:[...]}`. "
+        "Each agent session gets its own Chrome tab group; pass `sessionLabel` (task/project name) to title it."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "code": {"type": "string"},
             "agent": {"type": "string"},
+            "sessionLabel": {"type": "string"},
             "parallel": {"type": "array", "items": {"type": "object"}},
             "surface": {"type": "string", "enum": ["web", "browser", "app"]},
             "app": {"type": "string"},

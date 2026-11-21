@@ -70,7 +70,7 @@ def execute_via_daemon(
         is_user_stopped,
     )
 
-    is_control = any(
+    is_control = "liveView" in req or "menuAction" in req or "menuOutline" in req or any(
         req.get(k)
         for k in (
             "stop",
@@ -85,6 +85,8 @@ def execute_via_daemon(
             "perfReport",
             "bridgeStatus",
             "listTabs",
+            "closeAgentTabs",
+            "agentSessions",
         )
     )
     if not is_control and is_user_stopped():
@@ -96,6 +98,10 @@ def execute_via_daemon(
         return MacNativeEngine().execute({"clickStatusBar": True})
     if req.get("highlightWindow"):
         return highlight_target_window()
+    if "liveView" in req:
+        return MacNativeEngine().execute({"liveView": bool(req["liveView"])})
+    if req.get("menuOutline") or req.get("menuAction"):
+        return MacNativeEngine().execute({k: req[k] for k in ("menuOutline", "menuAction") if req.get(k)})
     if req.get("togglePreview"):
         return MacNativeEngine().execute({"togglePreview": True})
     if req.get("dumpUiSnapshots"):
@@ -272,8 +278,9 @@ USAGE_TEXT = """Usage:
   fmu mcp                 Run as an MCP stdio server
   fmu --status            Show macOS menu bar & agent working/stopped status
   fmu --highlight         Flash neon highlight border around active target window on screen
-  fmu --stop              Immediately stop active fmu agent work (same as menu bar ⏹ Stop)
-  fmu --resume            Clear user stop latch and resume fmu (same as menu bar ▶ Resume)
+  fmu --stop              Immediately stop active fmu agent work (same as menu bar Stop)
+  fmu --resume            Clear user stop latch and resume fmu (same as menu bar Resume)
+  fmu --live-view on|off  Show or permanently hide the floating Live View monitor (saved in ~/.fmu/prefs.json)
   fmu --perf [days]       Summarize recent fmu performance & error logs (~/.fmu/logs)
   fmu --perf --clear      Remove all recorded fmu session/perf logs (~/.fmu/logs/perf-*.jsonl)
   fmu --reset             Reset warm browser & macOS AX daemon state
@@ -312,6 +319,11 @@ def main(bin_path: Path | None = None) -> None:
         from fmu.mac_engine import clear_user_stop
 
         print(clear_user_stop())
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] in ("--live-view", "live-view") and sys.argv[2] in ("on", "off"):
+        from fmu.mac_engine import MacNativeEngine
+
+        print(MacNativeEngine().execute({"liveView": sys.argv[2] == "on"}))
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("--clear-logs", "clear-logs"):
         from fmu.telemetry import clear_perf_logs, get_log_dir

@@ -467,6 +467,14 @@ def summarize_perf_events(events: list[dict[str, Any]], *, days: int = 7, log_di
         recommendations.append(
             f"{eval_truncations} oversized eval outputs were capped at FMU_MAX_EVAL_CHARS — prefer tab.text(selector) or targeted JS projections over full-DOM dumps."
         )
+    latency_total_ms = sum(sum(v) for v in by_surface.values())
+    fixed_wait_total_ms = phase_sums.get("fixed_wait", 0.0)
+    if latency_total_ms > 0 and fixed_wait_total_ms > 0.1 * latency_total_ms:
+        recommendations.append(
+            f"{round(fixed_wait_total_ms / 1000.0, 1)}s of {round(latency_total_ms / 1000.0, 1)}s total latency "
+            f"({round(100.0 * fixed_wait_total_ms / latency_total_ms, 1)}%) was caller-requested fixed wait/sleep — "
+            "replace wait(ms) polling with waitFor(text/selector) so batches return as soon as the page is ready."
+        )
     if error_calls > 0:
         recommendations.append(
             f"{error_calls}/{total_calls} calls reported step/bridge errors — inspect top_errors to harden selectors, aliases, or permission diagnostics."

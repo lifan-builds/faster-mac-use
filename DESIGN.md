@@ -185,6 +185,15 @@ This system is flat and structural by default. Depth is conveyed through tonal l
 ### Navigation
 - **Style:** Top horizontal bar with breadcrumb identity (`Lifan Chen / faster-mac-use`) and `v0.1.0 · MIT` badge on the left, and section anchor links (`0.9375rem`, weight `600`, `#344b5c` → `#0c1720` on hover) on the right.
 
+## Iconography
+
+Prefer words plus fmu's own vector glyphs over emoji. Where fmu draws its own UI (menu bar capsule, context menu, Live View HUD, highlight frame), use `FMUIcon`; emoji and Unicode dingbats there are a bug. On text-only surfaces (Chrome tab group titles, extension name, CLI output) an emoji is fine when it carries meaning that plain words cannot fit, but never as decoration.
+
+- **Source of truth:** `FMUIcon` in `src/fmu/native/fmu_ax.swift` draws every glyph (`play`, `stop`, `target`, `monitor`, `expand`, `compact`, `dock`, `reset`, `close`, `closeTabs`) as `NSBezierPath` strokes. Menu items use `FMUIcon.menuImage()` template images so they follow light/dark menus; HUD buttons use `drawIconLabel`.
+- **New icons:** add a case to `FMUIcon` built from the same stroke weight and rounded caps rather than reaching for an SF Symbol, emoji, or dingbat character.
+- **Status color:** state is carried by drawn dots and capsule colors (`FMUIcon.statusDotImage`), not colored emoji circles.
+- **Enforced by:** `test_native_ui_has_no_emoji_or_pictograph_glyphs` in `tests/test_fmu.py` (native Swift UI only).
+
 ## Do's and Don'ts
 
 ### Do:

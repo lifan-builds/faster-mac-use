@@ -36,7 +36,7 @@ _kCGEventFlagsChanged = 12
 def get_cursor_position() -> tuple[float, float]:
     ev = _cg.CGEventCreate(None)
     if not ev:
-        return (0.0, 0.0)
+        raise RuntimeError("CGEventCreate returned NULL; cursor probe unavailable")
     try:
         pt = _cg.CGEventGetLocation(ev)
         return (float(pt.x), float(pt.y))
@@ -128,7 +128,11 @@ class BackgroundIntrusionGuard:
         self.focus_probe_failures = 0
         self.focus_samples = 0
         self.samples = 0
-        self.initial_cursor = get_cursor_position()
+        try:
+            self.initial_cursor = get_cursor_position()
+        except RuntimeError:
+            self.initial_cursor = (math.nan, math.nan)
+            self._worker_failed = True
         self._prev_cursor = self.initial_cursor
         self.initial_front_asn = get_frontmost_app_id()
         self._prev_asn = self.initial_front_asn

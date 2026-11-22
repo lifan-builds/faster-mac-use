@@ -157,7 +157,7 @@ def execute_via_daemon(
             finally:
                 try:
                     fcntl.flock(spawn_lock_fp.fileno(), fcntl.LOCK_UN)
-                except Exception:
+                except OSError:
                     pass
 
     payload = (json.dumps(req) + "\n").encode("utf-8")

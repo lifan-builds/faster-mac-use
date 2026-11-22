@@ -2072,8 +2072,8 @@ class FasterMacUseRuntime:
         try:
             mac_raw = self.mac.execute({"getCursors": True})
             mac_lines = [l for l in mac_raw.splitlines() if l.startswith("@cursor ")]
-        except Exception:
-            pass
+        except (OSError, RuntimeError, TimeoutError):
+            mac_lines = []
         out_lines: list[str] = []
         for aid in sorted(web_cursors.keys()):
             c = web_cursors[aid]
@@ -2677,7 +2677,7 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
                     s_wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     s_wake.connect(socket_path)
                     s_wake.close()
-                except Exception:
+                except OSError:
                     pass
                 return
             ident = resolve_caller(peer_pid(conn), label=str(req.get("sessionLabel") or "").strip() or None)
@@ -2686,7 +2686,7 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
         except Exception as exc:
             try:
                 conn.sendall(f"Error: {exc}\n".encode("utf-8"))
-            except Exception:
+            except OSError:
                 pass
         finally:
             conn.close()
@@ -2707,7 +2707,7 @@ def serve_runtime_daemon(socket_path: str = DEFAULT_RUNTIME_SOCK) -> None:
         runtime.shutdown()
         try:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
-        except Exception:
+        except (OSError, ValueError):
             pass
         lock_fp.close()
         lock_path.unlink(missing_ok=True)

@@ -37,6 +37,17 @@ from fmu.telemetry import (
 
 _HAS_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
+try:
+    from playwright.sync_api import Error as _PlaywrightError
+except ImportError:
+    _PlaywrightError = None  # type: ignore[assignment]
+
+_BROWSER_OPS_ERRORS: tuple[type[BaseException], ...] = (
+    (OSError, RuntimeError, TimeoutError, ValueError, KeyError, AttributeError, TypeError, _PlaywrightError)
+    if _PlaywrightError is not None
+    else (OSError, RuntimeError, TimeoutError, ValueError, KeyError, AttributeError, TypeError)
+)
+
 
 def _normalize_nav_url(raw_url: str | None) -> str:
     s = str(raw_url or "").strip()
@@ -75,7 +86,7 @@ def _url_matches_target(live_url: str | None, requested_url: str | None) -> bool
         rh = (rp.hostname or "").lower().removeprefix("www.")
         if lh and lh == rh and (rp.path in ("", "/")) and not rp.query and not rp.fragment:
             return True
-    except Exception:
+    except ValueError:
         pass
     return False
 
@@ -3032,7 +3043,7 @@ class ExtensionWebSocketBridge:
         if old_srv is not None:
             try:
                 old_srv.close()
-            except Exception:
+            except OSError:
                 pass
         t = threading.Thread(target=self._accept_loop, name="fmu-ext-ws-bridge", daemon=True)
         t.start()
@@ -3167,7 +3178,7 @@ class ExtensionWebSocketBridge:
                 if self._client_sock is not None:
                     try:
                         self._client_sock.close()
-                    except Exception:
+                    except OSError:
                         pass
                 self._client_sock = conn
                 self._sent_runtime_version = ""
@@ -3195,7 +3206,7 @@ class ExtensionWebSocketBridge:
                     if msg_type and self.on_event is not None:
                         try:
                             self.on_event(msg)
-                        except Exception:
+                        except _BROWSER_OPS_ERRORS:
                             pass
                         continue
                     req_id = msg.get("id")
@@ -3207,7 +3218,7 @@ class ExtensionWebSocketBridge:
                             box.append(msg.get("result"))
                             box.append(msg.get("error"))
                             ev.set()
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         finally:
             with self._client_lock:
@@ -3223,7 +3234,7 @@ class ExtensionWebSocketBridge:
                 self._pending.clear()
             try:
                 conn.close()
-            except Exception:
+            except OSError:
                 pass
 
     def call_rpc(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> Any:
@@ -3267,13 +3278,13 @@ class ExtensionWebSocketBridge:
             if self._client_sock is not None:
                 try:
                     self._client_sock.close()
-                except Exception:
+                except OSError:
                     pass
                 self._client_sock = None
         if self._srv_sock is not None:
             try:
                 self._srv_sock.close()
-            except Exception:
+            except OSError:
                 pass
             self._srv_sock = None
 
@@ -3338,7 +3349,7 @@ class _ExtensionPageAdapter:
         if isinstance(res, dict) and isinstance(res.get("preview"), dict) and self._on_preview is not None:
             try:
                 self._on_preview(res["preview"], self.url)
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
         return res or {"url": self.url}
 
@@ -3425,7 +3436,7 @@ class _ExtensionPageAdapter:
                 if isinstance(res.get("preview"), dict) and self._on_preview is not None:
                     try:
                         self._on_preview(res["preview"], self.url)
-                    except Exception:
+                    except _BROWSER_OPS_ERRORS:
                         pass
             return res
         return self._bridge.call_rpc(
@@ -3438,7 +3449,7 @@ class _ExtensionPageAdapter:
             self._closed = True
             try:
                 self._bridge.call_rpc("closeTab", {"tabId": self.chrome_tab_id}, timeout=2.0)
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
 
 
@@ -3525,7 +3536,7 @@ class BrowserTabSession:
                 page.on("console", self._on_playwright_console)
                 page.on("response", self._on_playwright_response)
                 page.on("requestfailed", self._on_playwright_requestfailed)
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
 
     def record_diagnostic(
@@ -3631,11 +3642,11 @@ class BrowserTabSession:
             return
         try:
             self._raw_cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         try:
             self._raw_cdp.send("Page.setWebLifecycleState", {"state": "active"})
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         self._focus_emulated = True
 
@@ -3684,7 +3695,7 @@ class BrowserTabSession:
                     page_y = max(0.0, float(vp.get("pageY") or 0.0))
                     vw = int(round(float(vp["clientWidth"])))
                     vh = int(round(float(vp["clientHeight"])))
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
             scale = min(1.0, max(0.25, 1440.0 / max(320, vw)))
             shot = self._raw_cdp.send(
@@ -3709,7 +3720,7 @@ class BrowserTabSession:
                 self.last_vw = vw
                 self.last_vh = vh
                 return p_path
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         return self.last_preview_path
 
@@ -3763,7 +3774,7 @@ class BrowserTabSession:
             self._last_layout_sig = ""
             try:
                 self._raw_cdp.send("Emulation.clearDeviceMetricsOverride", {})
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
             if not self.is_extension and not self._engine._is_cdp_chrome:
                 self._raw_page.set_viewport_size({"width": 1280, "height": 800})
@@ -3775,11 +3786,11 @@ class BrowserTabSession:
                     if vp.get("clientWidth") and vp.get("clientHeight"):
                         self.last_vw = int(round(float(vp["clientWidth"])))
                         self.last_vh = int(round(float(vp["clientHeight"])))
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
             try:
                 self._raw_page.evaluate("() => { if (window.__fmuStore) window.__fmuStore.mutationSeq++; }")
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
             return self.last_vw, self.last_vh
 
@@ -3800,7 +3811,7 @@ class BrowserTabSession:
         )
         try:
             self._raw_page.evaluate("() => { if (window.__fmuStore) window.__fmuStore.mutationSeq++; }")
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         self._custom_viewport = True
         self._last_layout_sig = ""
@@ -3823,7 +3834,7 @@ class BrowserTabSession:
             if not self.is_extension:
                 try:
                     self._raw_page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
                 self._focus_emulated = False
                 self.enable_background_focus_emulation()
@@ -4139,7 +4150,7 @@ class BrowserEngine:
                             "tools => window.__fmu && window.__fmu.registerVirtualTools && window.__fmu.registerVirtualTools(tools)",
                             [entry],
                         )
-                    except Exception:
+                    except _BROWSER_OPS_ERRORS:
                         pass
         return entry
 
@@ -4156,7 +4167,7 @@ class BrowserEngine:
                         for mname, mval in data.items():
                             if isinstance(mval, dict) and mval.get("steps"):
                                 macros_by_name[mname] = mval
-                except Exception:
+                except (OSError, json.JSONDecodeError, ValueError):
                     pass
         return list(macros_by_name.values())
 
@@ -4172,7 +4183,7 @@ class BrowserEngine:
                         for mval in data.values():
                             if isinstance(mval, dict) and mval.get("name"):
                                 results.append(mval)
-                except Exception:
+                except (OSError, json.JSONDecodeError, ValueError):
                     pass
         return results
 
@@ -4188,7 +4199,7 @@ class BrowserEngine:
                         data.pop(name, None)
                         f.write_text(json.dumps(data, indent=2), encoding="utf-8")
                         deleted = True
-                except Exception:
+                except (OSError, json.JSONDecodeError, ValueError):
                     pass
         return deleted
 
@@ -4253,7 +4264,7 @@ class BrowserEngine:
                             }
                         )
                         idx += 1
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
         try:
             sess._raw_page.evaluate(
@@ -4262,7 +4273,7 @@ class BrowserEngine:
             )
             sess._ocr_populated = True
             sess._last_ocr_items = ocr_items
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         return ocr_items
 
@@ -4278,7 +4289,7 @@ class BrowserEngine:
                     continue
                 try:
                     fn()
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
                 continue
             try:
@@ -4369,12 +4380,12 @@ class BrowserEngine:
         try:
             if self._raw_browser:
                 self._raw_browser.close()
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         try:
             if self._pw:
                 self._pw.stop()
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         self._raw_browser = None
         self._pw = None
@@ -4411,7 +4422,7 @@ class BrowserEngine:
                     )
                     self._is_cdp_chrome = True
                     return self._raw_browser
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
         headless_shells = sorted(
             (Path.home() / "Library" / "Caches" / "ms-playwright").glob(
@@ -4480,7 +4491,7 @@ class BrowserEngine:
                         {"expression": expr, "awaitPromise": True},
                     )
             b_cdp.detach()
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
 
     def _can_run_direct_mv3(self, *, mode: str = "chrome", tab_id: str | None = None) -> bool:
@@ -5009,7 +5020,7 @@ class BrowserEngine:
                             parts.append(json.dumps(t_title, ensure_ascii=False))
                             parts.append(str(t.get("url") or ""))
                             lines.append(" ".join(parts))
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
 
         for tid_k, s_v in list(self._tabs.items()):
@@ -5050,7 +5061,7 @@ class BrowserEngine:
         if sess is not None:
             try:
                 sess._raw_page.close()
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
         return f"# web tab={tab_id} closed"
 
@@ -5080,7 +5091,7 @@ class BrowserEngine:
                     continue
                 try:
                     sess._raw_page.close()
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
                 closed_pages += 1
             self._tabs.pop(tid, None)
@@ -5098,13 +5109,13 @@ class BrowserEngine:
         if self._ext_bridge_inst is not None and self._ext_bridge.is_connected():
             try:
                 self._ext_bridge.call_rpc("retireOwner", {"owner": client.owner, "titles": titles}, timeout=6.0)
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
         for tid, sess in mine.items():
             if not sess.is_extension:
                 try:
                     sess._raw_page.close()
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
             self._tabs.pop(tid, None)
             self._tab_last_urls.pop(tid, None)
@@ -5223,7 +5234,7 @@ class BrowserEngine:
                 cur_host = (urlparse(_normalize_nav_url(sess.last_url)).hostname or "").lower()
                 if cur_host:
                     self._strict_csp_hosts.add(cur_host)
-            except Exception:
+            except ValueError:
                 pass
             try:
                 has_val, val = self._eval_step_via_cdp(sess, str(esc.get("code") or ""))
@@ -5255,7 +5266,7 @@ class BrowserEngine:
                     res["seq"] = refreshed.get("seq", res.get("seq"))
                     res["count"] = refreshed.get("count", res.get("count"))
                     res["lines"] = refreshed.get("lines", res.get("lines"))
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
 
     def _settle_playwright_navigation(self, sess: BrowserTabSession, prev_url: str, tab_id: str) -> None:
@@ -5273,7 +5284,7 @@ class BrowserEngine:
             time.sleep(0.015)
         try:
             sess._raw_page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
+        except _BROWSER_OPS_ERRORS:
             pass
         if not sess._raw_page.is_closed():
             if sess._raw_page.url:
@@ -5469,7 +5480,7 @@ class BrowserEngine:
                 try:
                     if not sess._raw_page.is_closed():
                         sess._raw_page.wait_for_timeout(15)
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
                 if not sess._raw_page.is_closed():
                     post_click_url = str(getattr(sess._raw_page, "url", "") or "")
@@ -5605,7 +5616,7 @@ class BrowserEngine:
                 cur_host = ""
                 try:
                     cur_host = (urlparse(_normalize_nav_url(sess.last_url)).hostname or "").lower()
-                except Exception:
+                except ValueError:
                     pass
                 bridge_kind = "mv3" if sess.is_extension else ("cdp" if self._is_cdp_chrome else "playwright")
                 if op_name in ("eval", "evaluate") and cur_host and cur_host in self._strict_csp_hosts:
@@ -5877,7 +5888,7 @@ class BrowserEngine:
                     sess.set_viewport(reset=True)
                 try:
                     sess._raw_page.evaluate("() => { window.dispatchEvent(new Event('resize')); }")
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
             out_audit = {
                 "clean": total == 0,
@@ -6187,7 +6198,7 @@ class BrowserEngine:
             if old_sess is not None and not old_sess.is_extension:
                 try:
                     old_sess._raw_page.close()
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
             sess = self._create_tab_inner(
                 url=restore_url,
@@ -6424,7 +6435,7 @@ class BrowserEngine:
                     if not sess.is_extension and not sess._raw_page.is_closed():
                         try:
                             sess._raw_page.wait_for_load_state("domcontentloaded", timeout=5000)
-                        except Exception:
+                        except _BROWSER_OPS_ERRORS:
                             pass
                         cur_u = str(getattr(sess._raw_page, "url", "") or "")
                         if cur_u and cur_u != initial_batch_url:
@@ -6718,7 +6729,7 @@ class BrowserEngine:
                     res["seq"] = refreshed.get("seq", res.get("seq"))
                     res["count"] = refreshed.get("count", res.get("count"))
                     res["lines"] = refreshed.get("lines", res.get("lines"))
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
             ocr_ms += (time.perf_counter() - t_ocr1) * 1000.0
 
@@ -6930,20 +6941,20 @@ class BrowserEngine:
                         agent,
                     )
                     sess._documented_agents.discard(agent)
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
             self.cursors.pop(agent, None)
             return
         for sess in list(self._tabs.values()):
             try:
                 sess._raw_page.close()
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
         self._tabs.clear()
         if self._context is not None and not self._is_cdp_chrome:
             try:
                 self._context.clear_cookies()
-            except Exception:
+            except _BROWSER_OPS_ERRORS:
                 pass
         self._tab_last_urls.clear()
         self._tab_last_titles.clear()
@@ -6960,7 +6971,7 @@ class BrowserEngine:
             if not sess.is_extension:
                 try:
                     sess._raw_page.close()
-                except Exception:
+                except _BROWSER_OPS_ERRORS:
                     pass
         self._tabs.clear()
         self._evict_dead_browser()

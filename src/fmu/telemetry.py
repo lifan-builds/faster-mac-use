@@ -238,8 +238,8 @@ def record_perf_event(event: dict[str, Any], *, sync: bool = False) -> None:
         else:
             _ensure_writer()
             _log_queue.put_nowait((target_file, line))
-    except Exception:
-        pass
+    except (OSError, TypeError, ValueError, queue.Full):
+        return
 
 
 def flush_telemetry(timeout: float = 0.5) -> None:

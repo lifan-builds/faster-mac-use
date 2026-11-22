@@ -1911,7 +1911,7 @@ setInterval(() => {{}}, 1000);
             bridge.shutdown()
 
         # 2. Verify end-to-end real pixel Live View on headless web + HD Zoom toggle + native Calculator
-        with BackgroundIntrusionGuard() as guard:
+        with self._live_view_prefs_restored(), BackgroundIntrusionGuard() as guard:
             self.rt.execute({"reset": True})
             preview_jpg = Path("/tmp/fmu-preview-web.jpg")
             preview_jpg.unlink(missing_ok=True)

@@ -76,8 +76,15 @@ def _menubar_worker_loop() -> None:
                     break
         try:
             engine.execute({"statusUpdate": item})
-        except Exception:
-            pass
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            record_perf_event(
+                {
+                    "surface": "mac",
+                    "op": "menubar_status",
+                    "ok": False,
+                    "error": sanitize_error(exc),
+                }
+            )
 
 
 def notify_menubar_status(
@@ -129,8 +136,15 @@ def notify_menubar_status(
     if sync:
         try:
             MacNativeEngine(in_daemon=True).execute({"statusUpdate": payload})
-        except Exception:
-            pass
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            record_perf_event(
+                {
+                    "surface": "mac",
+                    "op": "menubar_status_sync",
+                    "ok": False,
+                    "error": sanitize_error(exc),
+                }
+            )
         return
     with _menubar_worker_lock:
         if not _menubar_worker_started:

@@ -114,8 +114,8 @@ def measure_live_mcp_schema_tokens(cmd: list[str]) -> int:
                 tools = json.loads(line).get("result", {}).get("tools", [])
                 if tools:
                     return tok(json.dumps(tools))
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
     return 0
 
 

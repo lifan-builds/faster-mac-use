@@ -1,20 +1,34 @@
 # Faster Mac Use (`fmu`)
 
-Background-first, multi-cursor browser and native macOS computer-use engine for AI agents, modeled after and extending OpenAI Codex's `cua_repl` architecture.
+[![PyPI](https://img.shields.io/pypi/v/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![Downloads](https://img.shields.io/pypi/dm/faster-mac-use)](https://pypi.org/project/faster-mac-use/) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-- **Website & Interactive Benchmark Explorer:** [https://clifan.com/faster-mac-use/](https://clifan.com/faster-mac-use/)
-- **Architecture & 5-Workload Benchmark Report:** [`docs/architecture_and_benchmarks.md`](docs/architecture_and_benchmarks.md)
+Let your AI agent drive Chrome and native Mac apps in the background. Your mouse stays where you left it, your window keeps focus, and each step comes back as a few hundred tokens of text instead of a screenshot.
+
+Try it in one command (needs macOS and [`uv`](https://docs.astral.sh/uv/)). It clicks `7 × 6 =` in Calculator without bringing the app to the front:
+
+```bash
+uvx --from faster-mac-use fmu '{"surface":"app","app":"Calculator","steps":[{"op":"key","name":"escape"},{"op":"click","name":"7"},{"op":"click","name":"Multiply"},{"op":"click","name":"6"},{"op":"click","name":"Equals"}]}'
+```
+
+Then add it to Claude Code, Codex, Cursor, or any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "faster-mac-use": { "command": "uvx", "args": ["--from", "faster-mac-use", "fmu", "mcp"] }
+  }
+}
+```
+
+If `fmu` saves your agent tokens or time, a [GitHub star](https://github.com/lifan-builds/faster-mac-use) helps other agent builders find it.
+
+## Proof
+
+Three agents working in parallel, compared against `@playwright/mcp` on the same task:
 
 ![Faster Mac Use 3-Cursor Parallel Swarm vs @playwright/mcp Live Token Counter](docs/assets/swarm-vs-mcp-demo.svg)
 
-## Why `faster-mac-use`?
-
-Most computer-use tools force a painful choice:
-- **Pixel screenshot loops** (`computer` tool) hijack your physical mouse cursor, steal window focus, and burn 40k–80k tokens across 10–30 turns.
-- **Standard Accessibility/Playwright MCPs** (`@playwright/mcp`, `chrome-devtools-mcp`) inject 4,000–12,500 tokens of tool schemas upfront and return full ARIA trees on every click.
-- **Single-session REPLs** (`cua_repl`) are fast for one agent, but serialize multi-agent workflows and fall back to screenshots on custom-rendered macOS windows or HTML5 `<canvas>` apps.
-
-`faster-mac-use` combines a **268-token single-tool MCP/CLI schema**, a **stateful async `cua_repl` sandbox**, **persistent `@u1..@uN` / `@a1..@aN` element UIDs with pre-registered table folding**, **push-based `AXObserver` `< 1 ms` dirty-subtree diffs**, **auto-synthesized Virtual WebMCP site macros (`~/.fmu/macros/`)**, **0-vision-token `<canvas>` & macOS window OCR**, **outbound MV3 extension WebSocket bridging for live logged-in Chrome `"Agent"` tab groups (zero Chrome 144 popups)**, and **true multi-cursor parallel execution** — verified at **0.0 px physical cursor movement** and **0 focus changes**.
+Cumulative input tokens and engine time across five workloads. The harness, raw JSON, and per-turn numbers are in [`benchmarks/`](benchmarks/) and the [benchmark report](docs/architecture_and_benchmarks.md); rerun them with `PYTHONPATH=src python3 benchmarks/run_benchmarks.py`.
 
 | Workload | `faster-mac-use` (Cumulative Tokens / Engine Time) | OpenAI Codex `cua_repl` Ref | `@playwright/mcp` / Stacked MCPs | Anthropic Pixel CUA |
 | :--- | :--- | :--- | :--- | :--- |
@@ -23,6 +37,33 @@ Most computer-use tools force a painful choice:
 | **C. Hybrid Web + macOS (14 ops)** | **2,179 tok / 335 ms** | 2,437 tok / 568 ms | 129,010 tok / 3,200 ms | — |
 | **D. 3-Agent Multi-Cursor Swarm (25 ops)** | **1,510 tok / 326 ms** (2 turns) | 15,923 tok / 1,122 ms (6 turns) | 293,950 tok / 4,850 ms | 430,800 tok / 7,600 ms |
 | **E. Long-Horizon 30-Op + Window OCR** | **4,584 tok / 494 ms** (0 vision tok) | 8,355 tok / 942 ms | 400,725 tok / 6,100 ms | 620,535 tok / 9,200 ms |
+
+The [interactive benchmark explorer](https://clifan.com/faster-mac-use/) breaks these down turn by turn. A test guard polls the cursor position and frontmost app at 50 Hz during runs and reports 0.0 px of cursor movement and 0 focus changes.
+
+### Replay what your agent did
+
+Set `FMU_TRACE` to record a run, then render it as a self-contained HTML player or an animated SVG you can drop into an issue or README. Each frame draws the `@u`/`@a` element bounds, colors added, changed, and removed elements, and shows the step's latency and token count. Traced calls send `"bounds": true`, which appends `box=x,y,w,h` to each element line; you can also pass that flag yourself on any web or app request.
+
+```bash
+export FMU_TRACE=~/fmu-run.jsonl        # every fmu call (CLI or MCP) appends request, output, and wall ms
+# ... let your agent work ...
+fmu replay ~/fmu-run.jsonl              # -> ~/fmu-run.html (←/→ to step, space to play)
+fmu replay ~/fmu-run.jsonl -o run.svg   # looping animated SVG
+fmu replay ~/.fmu/logs/perf-2026-11-22.jsonl   # perf logs replay as a latency-only timeline
+```
+
+![fmu replay of example.com and Calculator 7 × 6 with @uid bounds and latency HUD](docs/assets/replay-demo.svg)
+
+`fmu replay` is on `main` and ships in the next PyPI release; until then install from a clone (`pip install -e .`).
+
+## Why `faster-mac-use`?
+
+Most computer-use tools make you pick one of these trade-offs:
+- Screenshot loops (the `computer` tool) move your real cursor, steal window focus, and spend 40k–80k tokens over 10–30 turns.
+- Accessibility and Playwright MCPs (`@playwright/mcp`, `chrome-devtools-mcp`) load 4,000–12,500 tokens of tool schemas up front and return the full ARIA tree after every click.
+- Single-session REPLs like OpenAI Codex's `cua_repl` are fast for one agent, but run multi-agent work one at a time and fall back to screenshots on custom-drawn macOS windows and `<canvas>` apps.
+
+`fmu` started from the `cua_repl` design and extends it. It exposes one MCP tool with a 268-token schema and keeps a stateful async REPL. Elements get stable IDs (`@u1..@uN` on the web, `@a1..@aN` in macOS apps), so follow-up turns return only `+`/`~`/`-` diffs; on macOS those come from push-based `AXObserver` notifications in under 1 ms. It also records multi-step site flows as reusable WebMCP macros (`~/.fmu/macros/`), reads `<canvas>` and window text with on-device Vision OCR at zero vision tokens, drives your logged-in Chrome through an MV3 extension bridge inside a dedicated "Agent" tab group (no Chrome 144 remote-debugging popups), and runs several agents with separate cursors at the same time.
 
 ---
 
@@ -51,25 +92,23 @@ Most computer-use tools force a painful choice:
 
 ---
 
-## Quick Start
+## Install and Usage
 
-### 1. Install (1-Line `uvx` / `uv tool` / `pip` / Homebrew)
+### 1. Install
 ```bash
-# Option A: Run or install directly from PyPI via uv / pip (auto-compiles universal2 fmu-ax binary on macOS)
-uvx --from faster-mac-use fmu mcp
-uv tool install faster-mac-use
-pip install faster-mac-use
+# From PyPI (compiles the universal2 fmu-ax helper on first macOS run)
+uv tool install faster-mac-use      # or: pip install faster-mac-use
 
-# Option B: Clone for development
+# From source
 git clone https://github.com/lifan-builds/faster-mac-use.git
 cd faster-mac-use
 pip install -e .
 
-# Option C: Homebrew Formula
+# Homebrew formula
 brew install --Formula ./Formula/faster-mac-use.rb
 ```
 
-### 2. Add to Your MCP Client (Claude Code, Codex, Cursor, Antigravity)
+### 2. MCP client config for an installed `fmu`
 ```json
 {
   "mcpServers": {
@@ -108,7 +147,7 @@ Every request to the warm daemon is attributed to the agent session that sent it
 
 Harnesses that host many conversations in one process and reach fmu over MCP (Devin Desktop, Antigravity) can't be told apart by process; pass `sessionLabel` to give each conversation its own group.
 
-### 4. Run the 43-Test Unit & Integration Suite
+### 4. Run the Unit & Integration Suite
 ```bash
 PYTHONPATH=src python3 tests/test_fmu.py
 ```

@@ -2044,6 +2044,8 @@ class FasterMacUseRuntime:
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="fmu-agent")
         self.mac = MacNativeEngine(in_daemon=True)
         self.browser = BrowserEngine()
+        self.bounds_agents: set[str] = set()
+        self.mac.bounds_agents = self.browser.bounds_agents = self.bounds_agents
         self._agents: dict[str, AgentSession] = {}
         default_sess = self._get_agent_session("default")
         self.cua = default_sess.cua
@@ -2602,7 +2604,13 @@ class FasterMacUseRuntime:
             return "# fmu runtime reset"
 
         if "code" in req and req["code"]:
-            return self.execute_repl_code(str(req["code"]), agent_id=agent_id)
+            if not req.get("bounds"):
+                return self.execute_repl_code(str(req["code"]), agent_id=agent_id)
+            self.bounds_agents.add(agent_id)
+            try:
+                return self.execute_repl_code(str(req["code"]), agent_id=agent_id)
+            finally:
+                self.bounds_agents.discard(agent_id)
 
         sess = self._get_agent_session(agent_id)
         with sess.lock:

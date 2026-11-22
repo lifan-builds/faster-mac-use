@@ -208,6 +208,19 @@ def execute_via_daemon(
         s.close()
 
 
+def execute_traced(req: dict[str, Any], runner: Any) -> str:
+    trace_path = os.environ.get("FMU_TRACE", "").strip()
+    if not trace_path:
+        return runner(req)
+    from fmu.replay import record_trace_step, with_trace_bounds
+
+    traced = with_trace_bounds(req)
+    t0 = time.perf_counter()
+    out = runner(traced)
+    record_trace_step(trace_path, traced, out, (time.perf_counter() - t0) * 1000.0)
+    return out
+
+
 def serve_mcp(bin_path: Path | None = None) -> None:
     entry = bin_path if (bin_path and bin_path.is_file()) else Path(__file__).resolve()
     while True:
@@ -251,7 +264,7 @@ def serve_mcp(bin_path: Path | None = None) -> None:
             params = msg.get("params", {})
             args = params.get("arguments", {})
             try:
-                text = execute_via_daemon(args, entry)
+                text = execute_traced(args, lambda r: execute_via_daemon(r, entry))
                 is_err = text.startswith("Error: [USER_STOPPED]")
             except Exception as exc:
                 text = f"Error: {exc}"
@@ -283,6 +296,9 @@ USAGE_TEXT = """Usage:
   fmu --live-view on|off  Show or permanently hide the floating Live View monitor (saved in ~/.fmu/prefs.json)
   fmu --perf [days]       Summarize recent fmu performance & error logs (~/.fmu/logs)
   fmu --perf --clear      Remove all recorded fmu session/perf logs (~/.fmu/logs/perf-*.jsonl)
+  fmu replay <trace.jsonl> [-o out.html|out.svg]
+                          Render an FMU_TRACE=<file> (or perf log) run as an HTML/animated-SVG replay
+                          with @uid bounds, +/~/- diff counts, and per-step ms HUD
   fmu --reset             Reset warm browser & macOS AX daemon state
   fmu --shutdown          Stop background runtime daemon
   fmu --daemon [sock]     Run the warm runtime socket daemon
@@ -345,6 +361,25 @@ def main(bin_path: Path | None = None) -> None:
                 days = max(1, int(arg))
         sys.stdout.write(build_perf_report(days=days, fmt=fmt) + "\n")
         return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("replay", "--replay", "trace-html"):
+        from fmu.replay import render_trace
+
+        args = sys.argv[2:]
+        out_path = None
+        if "-o" in args:
+            i = args.index("-o")
+            out_path = args[i + 1] if i + 1 < len(args) else None
+            args = args[:i] + args[i + 2 :]
+        if len(args) != 1 or (("-o" in sys.argv[2:]) and not out_path):
+            sys.stderr.write("Usage: fmu replay <trace.jsonl> [-o out.html|out.svg]\n")
+            sys.exit(2)
+        try:
+            dest = render_trace(args[0], out_path)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"Error: {exc}\n")
+            sys.exit(1)
+        sys.stdout.write(f'# fmu-replay out="{dest}"\n')
+        return
     if len(sys.argv) >= 2 and sys.argv[1] in ("mcp", "--mcp"):
         serve_mcp(bin_path)
         return
@@ -401,11 +436,11 @@ def main(bin_path: Path | None = None) -> None:
     ):
         from fmu.mac_engine import MacNativeEngine
 
-        print(MacNativeEngine().execute(req))
+        print(execute_traced(req, MacNativeEngine().execute))
         return
 
     entry = bin_path if (bin_path and bin_path.is_file()) else Path(__file__).resolve()
-    print(execute_via_daemon(req, entry))
+    print(execute_traced(req, lambda r: execute_via_daemon(r, entry)))
 
 
 if __name__ == "__main__":

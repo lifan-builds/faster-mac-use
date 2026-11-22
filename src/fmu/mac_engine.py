@@ -295,6 +295,8 @@ def _resolve_ax_binary(
 class MacNativeEngine:
     """Drives macOS apps, menus, and dialogs in the background without moving the cursor or stealing focus."""
 
+    bounds_agents: set[str] | frozenset[str] = frozenset()
+
     def __init__(self, socket_path: str = DEFAULT_SOCK, *, in_daemon: bool = False) -> None:
         self.socket_path = socket_path
         self._in_daemon = in_daemon
@@ -372,6 +374,8 @@ class MacNativeEngine:
         return False
 
     def execute(self, req: dict[str, Any], *, _retried_tcc: bool = False) -> str:
+        if req.get("agent") in self.bounds_agents:
+            req = {**req, "bounds": True}
         t0 = time.perf_counter()
         is_control = "liveView" in req or "menuAction" in req or any(
             req.get(k) is not None and req.get(k) is not False

@@ -3638,6 +3638,151 @@ setInterval(() => {{}}, 1000);
                 node_proc.stderr.close()
 
 
+class TestTraceReplay(unittest.TestCase):
+    WEB_FULL = (
+        '# web tab=devin1:t1 group="Devin" agent="devin1" vp=1280x800 els=3 crc=aa seq=1 ms=42.5\n'
+        '@u1 link "Learn more" box=10,20,100,24\n'
+        '@u2 button "Save" box=200,20,80,30\n'
+        '@u3 textbox "Name" box=10,80,300,32'
+    )
+    WEB_DIFF = (
+        '# web tab=devin1:t1 group="Devin" agent="devin1" vp=1280x800 els=3 crc=bb seq=2 ms=18.0\n'
+        '! errors: step 1 (click): boom\n'
+        '+ @u4 text "Saved!" box=10,140,120,20\n'
+        '~ @u3 textbox "Name" val="" -> val="Ada" box=10,80,300,32\n'
+        '- @u2 button "Save" box=200,20,80,30'
+    )
+
+    def _write_trace(self, tmp: str) -> Path:
+        from fmu.replay import record_trace_step
+
+        trace = Path(tmp) / "run.jsonl"
+        record_trace_step(trace, {"url": "https://example.com"}, self.WEB_FULL, 120.4)
+        record_trace_step(trace, {"steps": [{"op": "fill", "uid": "@u3", "value": "Ada"}, {"op": "click", "uid": "@u2"}]}, self.WEB_DIFF, 55.2)
+        record_trace_step(trace, {"code": "await tab.diff()"}, '# app="Calculator" pid=1 win="Calculator" frame=100,50,230,400 els=1 crc=cc obs=3 ms=0.4\n= unchanged (crc=cc)', 3.0)
+        return trace
+
+    def test_parse_output_reads_headers_marks_boxes_and_errors(self) -> None:
+        from fmu.replay import parse_output
+
+        blocks = parse_output(self.WEB_DIFF)
+        self.assertEqual(len(blocks), 1)
+        b = blocks[0]
+        self.assertEqual(b["meta"]["vp"], "1280x800")
+        self.assertEqual(b["meta"]["tab"], "devin1:t1")
+        self.assertEqual(b["errors"], ["errors: step 1 (click): boom"])
+        self.assertEqual([(e["mark"], e["uid"]) for e in b["elements"]], [("+", "@u4"), ("~", "@u3"), ("-", "@u2")])
+        self.assertEqual(b["elements"][1]["box"], (10, 80, 300, 32))
+        self.assertEqual(b["elements"][1]["label"], "Ada")
+
+    def test_build_frames_carries_state_across_diffs_and_counts(self) -> None:
+        from fmu.replay import build_frames, load_trace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            frames = build_frames(load_trace(self._write_trace(tmp)))
+        self.assertEqual(len(frames), 3)
+        first, second, third = frames
+        self.assertEqual(first["counts"], {"+": 0, "~": 0, "-": 0})
+        self.assertEqual(first["view"], (0.0, 0.0, 1280.0, 800.0))
+        self.assertEqual(second["counts"], {"+": 1, "~": 1, "-": 1})
+        self.assertEqual(second["ms"], 55.2)
+        self.assertEqual(second["engine_ms"], 18.0)
+        self.assertEqual(second["ops"], "fill(@u3) → click(@u2)")
+        marks = {e["uid"]: e["mark"] for e in second["elements"]}
+        self.assertEqual(marks, {"@u1": "", "@u3": "~", "@u4": "+", "@u2": "-"})
+        self.assertEqual(third["view"], (100.0, 50.0, 230.0, 400.0))
+        self.assertEqual(third["counts"], {"+": 0, "~": 0, "-": 0})
+
+    def test_perf_log_records_replay_as_latency_frames(self) -> None:
+        from fmu.replay import build_frames
+
+        frames = build_frames([
+            {"ts": "t", "surface": "web", "target": "example.com/", "ops": ["click"], "els": 7, "est_tokens": 90,
+             "errors": ["x"], "timings_ms": {"total": 183.1}},
+        ])
+        self.assertEqual(frames[0]["ms"], 183.1)
+        self.assertEqual(frames[0]["ops"], "click")
+        self.assertEqual(frames[0]["errors"], ["x"])
+
+    def test_render_html_and_svg_include_uid_boxes_diff_hud_and_latency(self) -> None:
+        from fmu.replay import render_trace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = self._write_trace(tmp)
+            html_path = render_trace(trace)
+            self.assertEqual(html_path, trace.with_suffix(".html"))
+            page = html_path.read_text()
+            svg = render_trace(trace, Path(tmp) / "run.svg").read_text()
+        self.assertEqual(page.count('<svg class="frame"'), 3)
+        self.assertIn(">@u4</text>", page)
+        self.assertIn(">55 ms</text>", page)
+        self.assertIn(">+1</tspan>", page)
+        self.assertIn("! errors: step 1 (click): boom", page)
+        self.assertIn('@u3 textbox "Ada"</title>', page)
+        self.assertTrue(svg.startswith("<svg xmlns="))
+        self.assertEqual(svg.count('<animate attributeName="visibility"'), 3)
+        self.assertIn('stroke-dasharray="4 3"', svg)
+
+    def test_cli_replay_and_fmu_trace_recording(self) -> None:
+        from fmu import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "t.jsonl"
+            seen: list[dict] = []
+            with mock.patch.dict(os.environ, {"FMU_TRACE": str(trace)}):
+                out = cli.execute_traced(
+                    {"parallel": [{"agent": "a1", "code": "1"}]},
+                    lambda r: (seen.append(r), self.WEB_FULL)[1],
+                )
+            self.assertEqual(out, self.WEB_FULL)
+            self.assertTrue(seen[0]["bounds"] and seen[0]["parallel"][0]["bounds"])
+            rec = json.loads(trace.read_text().splitlines()[0])
+            self.assertEqual(rec["out"], self.WEB_FULL)
+            self.assertGreaterEqual(rec["ms"], 0.0)
+            with mock.patch.dict(os.environ, {"FMU_TRACE": ""}):
+                self.assertNotIn("bounds", (lambda acc: (cli.execute_traced({"x": 1}, lambda r: (acc.append(r), "")[1]), acc[0])[1])([]))
+            res = subprocess.run(
+                [sys.executable, str(ROOT / "bin" / "fmu"), "replay", str(trace), "-o", str(Path(tmp) / "o.svg")],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("# fmu-replay out=", res.stdout)
+            self.assertTrue((Path(tmp) / "o.svg").read_text().startswith("<svg"))
+            bad = subprocess.run([sys.executable, str(ROOT / "bin" / "fmu"), "replay"], capture_output=True, text=True, timeout=30)
+            self.assertEqual(bad.returncode, 2)
+
+
+class TestTraceBoundsLive(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = BenchWebServer().start()
+        cls.rt = FasterMacUseRuntime()
+        cls.rt._is_mcp_stdio = False
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.rt.shutdown()
+        cls.server.stop()
+
+    def test_web_bounds_flag_annotates_steps_and_repl_snapshots(self) -> None:
+        import re
+
+        url = f"{self.server.base_url}/orders"
+        plain = self.rt.execute({"surface": "web", "url": url, "session": "bt1", "mode": "headless"})
+        self.assertNotIn(" box=", plain)
+        snap = self.rt.execute({"surface": "web", "session": "bt1", "diff": False, "bounds": True})
+        self.assertRegex(snap.splitlines()[0], r" vp=\d+x\d+ ")
+        boxed = [l for l in snap.splitlines() if re.match(r"^@u\d+ .* box=-?\d+,-?\d+,\d+,\d+$", l)]
+        self.assertGreater(len(boxed), 3, snap)
+        repl = self.rt.execute({
+            "agent": "boundsagent",
+            "bounds": True,
+            "code": f'let bt = await cua.createBrowserTab("headless", "{url}"); await bt.snapshot();',
+        })
+        self.assertIn(" box=", repl)
+        self.assertEqual(self.rt.bounds_agents, set())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

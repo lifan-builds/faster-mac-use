@@ -407,6 +407,7 @@ struct BatchRequest: Codable {
     let menuOutline: Bool?
     let menuAction: String?
     let dumpUiSnapshots: String?
+    let bounds: Bool?
     let statusUpdate: StatusUpdateSpec?
     let imagePath: String?
     let clipX: Double?
@@ -1520,6 +1521,17 @@ func resolveTargetWindow(
         return .matched(res.0, res.1)
     }
     return .matched(appEl, app.name)
+}
+
+func appendNodeBoxes(_ lines: [String], nodes: [NodeRecord]) -> [String] {
+    var byUid: [String: NodeRecord] = [:]
+    for n in nodes where byUid[n.uid] == nil { byUid[n.uid] = n }
+    return lines.map { line in
+        var body = Substring(line)
+        if body.hasPrefix("+ ") || body.hasPrefix("~ ") || body.hasPrefix("- ") { body = body.dropFirst(2) }
+        guard let uid = body.split(separator: " ", maxSplits: 1).first, let n = byUid[String(uid)] else { return line }
+        return line + " box=\(n.x),\(n.y),\(n.w),\(n.h)"
+    }
 }
 
 func computeUidDiff(oldNodes: [NodeRecord], newNodes: [NodeRecord]) -> [String] {
@@ -5449,6 +5461,9 @@ func executeRequest(_ req: BatchRequest) -> String {
         header += " cursor=\(cur.uid)@(\(cur.x),\(cur.y))"
     }
     header += " els=\(currentNodes.count) crc=\(newCrc) obs=\(state.currentPidSeq(app.pid)) ms=\(String(format: "%.1f", elapsedMs))"
+    if req.bounds == true {
+        header += " frame=\(Int(winBounds.minX)),\(Int(winBounds.minY)),\(Int(winBounds.width)),\(Int(winBounds.height))"
+    }
     if isFirstDoc || (req.showDocs == true) {
         header += "\n# api: click(uid|name), set(uid|name,value), move(uid|name), type(value), key(chord), menu([path]), ocr(), screenshot(path?)"
     }
@@ -5464,22 +5479,21 @@ func executeRequest(_ req: BatchRequest) -> String {
         out.append(contentsOf: ocrOutput)
     }
 
+    var nodeLines: [String] = []
     if useDiff && !prevNodes.isEmpty {
         if prevCrc == newCrc {
-            out.append("= unchanged (crc=\(newCrc))")
+            nodeLines.append("= unchanged (crc=\(newCrc))")
         } else {
             let delta = computeUidDiff(oldNodes: prevNodes, newNodes: currentNodes)
-            if delta.isEmpty {
-                out.append("= unchanged (crc=\(newCrc))")
-            } else {
-                out.append(contentsOf: delta)
-            }
+            nodeLines.append(contentsOf: delta.isEmpty ? ["= unchanged (crc=\(newCrc))"] : delta)
         }
     } else {
-        for n in currentNodes {
-            out.append(n.compactLine)
-        }
+        nodeLines = currentNodes.map { $0.compactLine }
     }
+    if req.bounds == true {
+        nodeLines = appendNodeBoxes(nodeLines, nodes: currentNodes + prevNodes)
+    }
+    out.append(contentsOf: nodeLines)
     return out.joined(separator: "\n")
 }
 

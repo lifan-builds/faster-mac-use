@@ -36,6 +36,20 @@ from fmu.telemetry import (
 
 
 _HAS_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+_LINE_UID_RE = re.compile(r"^(?:[+~-] )?(@u\d+) ")
+_UID_BOXES_JS = """uids => {
+  const out = {};
+  const store = window.__fmuStore;
+  if (!store) return out;
+  for (const uid of uids) {
+    const ref = store.uidToRef.get(uid);
+    const el = ref && ref.deref();
+    if (!el || !el.isConnected || !el.getBoundingClientRect) continue;
+    const r = el.getBoundingClientRect();
+    out[uid] = [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)];
+  }
+  return out;
+}"""
 
 try:
     from playwright.sync_api import Error as _PlaywrightError
@@ -3486,6 +3500,19 @@ class _ThreadProxy:
         return attr
 
 
+def _append_uid_boxes(sess: Any, lines: list[str]) -> list[str]:
+    uids = [m.group(1) for line in lines if isinstance(line, str) and (m := _LINE_UID_RE.match(line))]
+    if not uids:
+        return lines
+    boxes = sess._raw_page.evaluate(_UID_BOXES_JS, uids) or {}
+    out_lines: list[str] = []
+    for line in lines:
+        m = _LINE_UID_RE.match(line) if isinstance(line, str) else None
+        box = boxes.get(m.group(1)) if m else None
+        out_lines.append(f"{line} box={','.join(str(int(v)) for v in box)}" if box else line)
+    return out_lines
+
+
 class BrowserTabSession:
     def __init__(
         self,
@@ -3845,6 +3872,8 @@ class BrowserTabSession:
 
 
 class BrowserEngine:
+    bounds_agents: set[str] | frozenset[str] = frozenset()
+
     def __init__(self) -> None:
         self._pw: Any = None
         self._raw_browser: Any = None
@@ -5923,6 +5952,8 @@ class BrowserEngine:
         return self._run_sync(_audit)
 
     def execute_batch(self, req: dict[str, Any]) -> str:
+        if req.get("agent") in self.bounds_agents:
+            req = {**req, "bounds": True}
         if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension", "listTabs")) and is_user_stopped():
             return USER_STOPPED_ERROR
         if req.get("bridgeStatus") or req.get("reloadExtension"):
@@ -6773,6 +6804,8 @@ class BrowserEngine:
             f' els={res.get("count", 0)} crc={res.get("crc", "")} '
             f'seq={res.get("seq", 0)} ms={elapsed_ms:.1f}'
         )
+        if req.get("bounds"):
+            header += f' vp={res.get("vw") or sess.last_vw}x{res.get("vh") or sess.last_vh}'
         if res.get("webMcpTools"):
             header += f' webmcp={json.dumps(res["webMcpTools"])}'
         if (agent_id not in sess._documented_agents and not sess.documented) or req.get("showDocs"):
@@ -6821,10 +6854,12 @@ class BrowserEngine:
                 if was_trunc:
                     any_eval_truncated = True
                 out.append(f"> {fmt_ev}")
-        out.extend(res.get("lines") or [])
+        res_lines = res.get("lines") or []
+        if req.get("bounds"):
+            res_lines = _append_uid_boxes(sess, res_lines)
+        out.extend(res_lines)
         final_out = "\n".join(out)
 
-        res_lines = res.get("lines") or []
         if res.get("unchanged") or any(isinstance(l, str) and l.startswith("= unchanged") for l in res_lines):
             mode_out = "unchanged"
         elif res.get("useDiff"):

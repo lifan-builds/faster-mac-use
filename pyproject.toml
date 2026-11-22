@@ -7,11 +7,9 @@ name = "faster-mac-use"
 version = "0.4.5"
 description = "Background-first, multi-cursor browser and native macOS computer-use engine for AI agents"
 readme = "README.md"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
-authors = [
-  { name = "Lifan Chen" }
-]
+authors = [{ name = "lifan-builds" }]
 keywords = ["mcp", "computer-use", "macos", "accessibility", "browser-automation", "cua", "ai-agents", "webmcp"]
 dependencies = [
   "playwright>=1.40.0",

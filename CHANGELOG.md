@@ -14,7 +14,7 @@ First PyPI release since 0.4.4. It also includes the unpublished 0.4.5 work.
 - Trusted CDP mouse clicks for `isTrusted`-gated targets, `fixed_wait` telemetry, and clearer inline upload errors.
 
 ### Changed
-- Package metadata declares the license as an SPDX expression (`License-Expression: LicenseRef-lifan-builds-Proprietary`) and builds with setuptools 77+.
+- Package metadata declares the license as an SPDX expression (`License-Expression: AGPL-3.0-only`, with `LICENSE` and `ATTRIBUTION.md` as license files) and builds with setuptools 77+.
 - License is now open source `AGPL-3.0-only` with Section 7 attribution terms (`LICENSE`, `ATTRIBUTION.md`). `fmu --version` and MCP `serverInfo.title` print the attribution. Contributions need a one-time CLA (`CLA.md`).
 - README leads with a one-command `uvx` quickstart, a `uvx`-based MCP config, and a Proof section.
 

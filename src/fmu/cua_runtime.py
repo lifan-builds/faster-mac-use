@@ -2542,8 +2542,17 @@ class FasterMacUseRuntime:
             return "\n".join(lines)
 
         if req.get("closeAgentTabs"):
-            client, _ = self.browser.clients.lookup(str(req.get("owner") or req.get("agent") or ""))
-            out = self.browser.close_agent_tabs(scope=client.short_id if client is not None else None)
+            if req.get("all"):
+                scope = None
+            elif req.get("owner"):
+                client, _ = self.browser.clients.lookup(str(req["owner"]))
+                if client is None:
+                    return "# web agent tabs closed chrome=0 playwright=0"
+                scope = client.short_id
+            else:
+                client, _ = self.browser.clients.lookup(str(req.get("agent") or ""))
+                scope = client.short_id if client is not None else None
+            out = self.browser.close_agent_tabs(scope=scope)
             with self._global_lock:
                 for a_sess in self._agents.values():
                     for hid, h in list(a_sess.cua.handles.items()):

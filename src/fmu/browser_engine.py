@@ -5107,7 +5107,13 @@ class BrowserEngine:
             if not self._ext_bridge.is_connected():
                 self._ext_bridge.wait_connected(timeout=2.0)
             if self._ext_bridge.is_connected():
-                params = {"owner": self.owner_for(scope)} if scope else {}
+                client = self.clients.by_short(scope) if scope else None
+                params: dict[str, Any] = {}
+                if client is not None:
+                    params["owner"] = client.owner
+                    params["groupTitle"] = client.label
+                elif scope:
+                    params["owner"] = self.owner_for(scope)
                 res = self._ext_bridge.call_rpc("closeAgentTabs", params, timeout=10.0)
                 closed_chrome_ids = {int(t) for t in res.get("tabIds") or []}
                 closed_chrome = int(res.get("closedCount") or 0)

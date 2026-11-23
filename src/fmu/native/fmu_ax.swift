@@ -4424,7 +4424,7 @@ final class MenuBarController: NSObject {
     @objc private func menuCloseAgentTabsClicked() {
         let rtSock = self.runtimeSocketPath
         DispatchQueue.global(qos: .userInteractive).async {
-            _ = trySendToDaemon(socketPath: rtSock, payload: "{\"closeAgentTabs\":true}")
+            _ = trySendToDaemon(socketPath: rtSock, payload: "{\"closeAgentTabs\":true,\"all\":true}")
         }
     }
 

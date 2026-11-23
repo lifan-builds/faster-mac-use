@@ -19,22 +19,31 @@ let lastScreencastPushAt = 0;
 let pendingPreviewTimer = null;
 
 const AGENT_TAB_CLAIMS_KEY = "fmuAgentTabClaims";
+const AGENT_GROUP_TITLE_RE = /^(?:(?:🤖\s*)?Agent(?:$|\s)|(?:Devin|Codex|Claude|Antigravity|Gemini|Cursor|OpenCode|Goose|Amp)(?:$|\s+\d+$| · ))/;
 const agentTabClaims = new Map();
 let agentTabClaimsLoaded = null;
 
+function claimStorage() {
+  return (chrome.storage && (chrome.storage.local || chrome.storage.session)) || null;
+}
+
 function loadAgentTabClaims() {
   if (!agentTabClaimsLoaded) {
-    agentTabClaimsLoaded = chrome.storage.session.get(AGENT_TAB_CLAIMS_KEY).then(saved => {
-      for (const [tabId, claim] of Object.entries(saved[AGENT_TAB_CLAIMS_KEY] || {})) {
-        agentTabClaims.set(Number(tabId), claim);
-      }
-    });
+    const store = claimStorage();
+    agentTabClaimsLoaded = store
+      ? store.get(AGENT_TAB_CLAIMS_KEY).then(saved => {
+          for (const [tabId, claim] of Object.entries((saved && saved[AGENT_TAB_CLAIMS_KEY]) || {})) {
+            agentTabClaims.set(Number(tabId), claim);
+          }
+        })
+      : Promise.resolve();
   }
   return agentTabClaimsLoaded;
 }
 
 function saveAgentTabClaims() {
-  return chrome.storage.session.set({ [AGENT_TAB_CLAIMS_KEY]: Object.fromEntries(agentTabClaims) });
+  const store = claimStorage();
+  return store ? store.set({ [AGENT_TAB_CLAIMS_KEY]: Object.fromEntries(agentTabClaims) }) : Promise.resolve();
 }
 
 async function claimTab(tabId, owner, opened) {
@@ -1818,11 +1827,36 @@ async function handleRpc(msg) {
     }
     if (method === "closeAgentTabs") {
       clearPendingPreview();
-      const { owner } = params;
+      const { owner = "", groupTitle = "" } = params;
       await loadAgentTabClaims();
-      const tabIds = [...agentTabClaims]
-        .filter(([, c]) => c.opened && (!owner || c.owner === owner))
-        .map(([tabId]) => tabId);
+      const targetIds = new Set(
+        [...agentTabClaims]
+          .filter(([, c]) => c.opened && (!owner || c.owner === owner))
+          .map(([tabId]) => tabId)
+      );
+      if (chrome.tabGroups && typeof chrome.tabGroups.query === "function" && chrome.tabs && typeof chrome.tabs.query === "function") {
+        try {
+          const allGroups = (await chrome.tabGroups.query({})) || [];
+          const matchingGroupIds = new Set();
+          for (const g of allGroups) {
+            const title = String((g && g.title) || "").trim();
+            if (!title) continue;
+            const matches = owner
+              ? Boolean(groupTitle && (title === groupTitle || title.startsWith(`${groupTitle} · `)))
+              : AGENT_GROUP_TITLE_RE.test(title);
+            if (matches) matchingGroupIds.add(g.id);
+          }
+          if (matchingGroupIds.size > 0) {
+            const allTabs = (await chrome.tabs.query({})) || [];
+            for (const t of allTabs) {
+              if (!t || t.id === undefined || !matchingGroupIds.has(t.groupId)) continue;
+              if (agentTabClaims.has(t.id)) continue;
+              targetIds.add(t.id);
+            }
+          }
+        } catch (_) {}
+      }
+      const tabIds = [...targetIds];
       for (const tid of tabIds) {
         stopLiveScreencast(tid);
         attachedDebuggers.delete(tid);
@@ -1831,8 +1865,9 @@ async function handleRpc(msg) {
       const removals = await Promise.allSettled(tabIds.map(tid => chrome.tabs.remove(tid)));
       await releaseTabClaims(tabIds);
       for (const [sid, tid] of sessionTabs) {
-        if (tabIds.includes(tid)) sessionTabs.delete(sid);
+        if (targetIds.has(tid)) sessionTabs.delete(sid);
       }
+      if (!owner) sessionGroups.clear();
       return { id, result: { tabIds, closedCount: removals.filter(r => r.status === "fulfilled").length } };
     }
     if (method === "retireOwner") {
@@ -1840,16 +1875,30 @@ async function handleRpc(msg) {
       await loadAgentTabClaims();
       const owned = [...agentTabClaims].filter(([, c]) => c.owner === owner);
       const blankIds = [];
+      const deadIds = [];
       for (const [tid, claim] of owned) {
-        if (!claim.opened) continue;
         try {
           const t = await chrome.tabs.get(tid);
-          const u = String(t.url || t.pendingUrl || "");
-          if (!u || u === "about:blank" || u.startsWith("chrome://newtab")) blankIds.push(tid);
-        } catch (_) {}
+          if (claim.opened) {
+            const u = String(t.url || t.pendingUrl || "");
+            if (!u || u === "about:blank" || u.startsWith("chrome://newtab")) blankIds.push(tid);
+          }
+        } catch (_) {
+          deadIds.push(tid);
+        }
       }
       await Promise.allSettled(blankIds.map(tid => chrome.tabs.remove(tid)));
-      await releaseTabClaims(owned.map(([tid]) => tid));
+      const dropIds = new Set([...blankIds, ...deadIds]);
+      let changed = false;
+      for (const [tid, claim] of owned) {
+        if (dropIds.has(tid)) {
+          changed = agentTabClaims.delete(tid) || changed;
+        } else {
+          agentTabClaims.set(tid, { owner: "", opened: Boolean(claim.opened) });
+          changed = true;
+        }
+      }
+      if (changed) await saveAgentTabClaims();
       let collapsed = 0;
       for (const title of titles) {
         for (const g of await chrome.tabGroups.query({ title })) {

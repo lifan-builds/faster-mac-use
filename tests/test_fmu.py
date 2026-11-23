@@ -2487,8 +2487,20 @@ const fs = require("fs");
 const state = {{
   tabs: [
     {{ id: 501, windowId: 88, groupId: 12, active: true, title: "Hertz Vehicle Selection", url: "https://www.hertz.com/us/en/book/vehicles", status: "complete" }},
-    {{ id: 502, windowId: 88, groupId: -1, active: false, title: "Expedia Car Search", url: "https://www.expedia.ca/carsearch?locn=YYC", status: "complete" }}
+    {{ id: 502, windowId: 88, groupId: -1, active: false, title: "Expedia Car Search", url: "https://www.expedia.ca/carsearch?locn=YYC", status: "complete" }},
+    {{ id: 504, windowId: 88, groupId: 13, active: false, title: "Legacy Agent Tab", url: "https://example.com/legacy", status: "complete" }},
+    {{ id: 505, windowId: 88, groupId: 14, active: false, title: "Old Antigravity Tab", url: "https://example.com/old-ag", status: "complete" }},
+    {{ id: 506, windowId: 88, groupId: 15, active: false, title: "User Work Tab", url: "https://example.com/work", status: "complete" }},
+    {{ id: 507, windowId: 88, groupId: 16, active: false, title: "User Gemini Notes", url: "https://example.com/notes", status: "complete" }}
   ],
+  groups: [
+    {{ id: 12, windowId: 88, title: "Agent" }},
+    {{ id: 13, windowId: 88, title: "🤖 Agent" }},
+    {{ id: 14, windowId: 88, title: "Antigravity · old-task" }},
+    {{ id: 15, windowId: 88, title: "Work" }},
+    {{ id: 16, windowId: 88, title: "Gemini Notes" }}
+  ],
+  nextTabId: 503,
   updateCalls: [],
   createdUrls: [],
   removedIds: [],
@@ -2497,7 +2509,7 @@ const state = {{
   batchEvals: 0,
 }};
 global.chrome = {{
-  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
+  storage: {{ local: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
   tabs: {{
     query: async (q) => state.tabs.filter(t => (q.windowId === undefined || t.windowId === q.windowId) && (q.groupId === undefined || t.groupId === q.groupId)),
     get: async (id) => {{
@@ -2507,7 +2519,8 @@ global.chrome = {{
     }},
     create: async (opts) => {{
       state.createdUrls.push(opts.url);
-      const nt = {{ id: 503, windowId: opts.windowId || 88, groupId: -1, active: false, title: "Avis", url: opts.url, status: "complete" }};
+      const id = state.nextTabId === 503 ? (state.nextTabId = 508, 503) : state.nextTabId++;
+      const nt = {{ id, windowId: opts.windowId || 88, groupId: -1, active: false, title: "Avis", url: opts.url, status: "complete" }};
       state.tabs.push(nt);
       return nt;
     }},
@@ -2528,8 +2541,8 @@ global.chrome = {{
     onRemoved: {{ addListener: (fn) => state.onRemoved.push(fn) }},
   }},
   tabGroups: {{
-    get: async (gid) => ({{ id: gid, windowId: 88, title: "Agent" }}),
-    query: async () => [{{ id: 12, windowId: 88, title: "Agent" }}],
+    get: async (gid) => state.groups.find(g => g.id === gid) || {{ id: gid, windowId: 88, title: "Agent" }},
+    query: async (q) => state.groups.filter(g => (!q || q.title === undefined || g.title === q.title) && (!q || q.windowId === undefined || g.windowId === q.windowId)),
     update: async (gid) => ({{ id: gid, windowId: 88 }}),
   }},
   windows: {{
@@ -2649,19 +2662,32 @@ setInterval(() => {{}}, 1000);
                 "a session must never close another session's tabs",
             )
             self.assertEqual(
+                self.rt.execute({"closeAgentTabs": True, "owner": "nonexistent99"}),
+                "# web agent tabs closed chrome=0 playwright=0",
+                "unknown explicit owner must never fall back to closing all tabs",
+            )
+            self.assertEqual(
                 self.rt.execute_for_client({"closeAgentTabs": True}, devin),
                 "# web agent tabs closed chrome=1 playwright=0",
             )
+            # Retired session leaves non-blank agent tab 508 open; closeAgentTabs(all=True) must still close 508 + legacy/unclaimed Agent group tabs 504 & 505,
+            # while preserving attached user tab 501, ungrouped tab 502, and user tab groups 506 ("Work") & 507 ("Gemini Notes").
+            self.rt.execute_for_client(
+                {"code": 'await cua.createBrowserTab({mode: "chrome", url: "https://example.com/retired", reuseExisting: false});'},
+                devin,
+            )
+            devin_client = self.rt.browser.clients.by_short(adopted.split(":", 1)[0])
+            self.rt.browser.retire_client(devin_client)
             pw_open = sum(1 for s in self.rt.browser._tabs.values() if not s.is_extension)
-            close_out = self.rt.execute({"closeAgentTabs": True})
-            self.assertEqual(close_out, f"# web agent tabs closed chrome=0 playwright={pw_open}")
+            close_out = self.rt.execute_for_client({"closeAgentTabs": True, "all": True}, codex)
+            self.assertEqual(close_out, f"# web agent tabs closed chrome=3 playwright={pw_open}")
             live_ctids = sorted(
                 getattr(s._raw_page, "chrome_tab_id", None) for s in self.rt.browser._tabs.values() if s.is_extension
             )
-            self.assertEqual(live_ctids, [501], "only the agent-created tab 503 may close; attached user tab 501 stays")
+            self.assertEqual(live_ctids, [501], "attached user tab 501 must stay")
             after_state = json.loads(self.rt.execute({"code": 'return await cua.getTab("hertz.com").eval("__state__");'}))
-            self.assertEqual(after_state["removedIds"], [503])
-            self.assertEqual(sorted(t["id"] for t in after_state["tabs"]), [501, 502])
+            self.assertEqual(sorted(after_state["removedIds"]), [503, 504, 505, 508])
+            self.assertEqual(sorted(t["id"] for t in after_state["tabs"]), [501, 502, 506, 507])
             # Tab 501 ran multiple executeBatch calls, yet runtimeInitEvals on tab 501 + tab 503 should be 2 total (1 per tab, not per batch!)
             self.assertEqual(harness_state["runtimeInitEvals"], 2)
             self.assertGreaterEqual(harness_state["batchEvals"], 4)
@@ -2732,6 +2758,46 @@ setInterval(() => {{}}, 1000);
             self.assertFalse(any(k.startswith("claude1") for k in rt._agents))
         finally:
             rt.shutdown()
+
+    def test_ensure_daemon_strips_test_env_for_default_ax_socket(self) -> None:
+        from fmu.mac_engine import DEFAULT_SOCK, MacNativeEngine
+
+        captured: list[dict[str, str] | None] = []
+
+        class _FakeProc:
+            def poll(self) -> None:
+                return None
+
+        def _fake_popen(_cmd: list[str], **kwargs: Any) -> _FakeProc:
+            captured.append(kwargs.get("env"))
+            return _FakeProc()
+
+        with tempfile.TemporaryDirectory(prefix="fmu-ax-env-") as tmp:
+            fake_bin = Path(tmp) / "fmu-ax"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            marker = Path(f"{DEFAULT_SOCK}.bin")
+            saved_marker = marker.read_text(encoding="utf-8") if marker.exists() else None
+            try:
+                eng = MacNativeEngine(socket_path=DEFAULT_SOCK)
+                with (
+                    mock.patch("fmu.mac_engine._resolve_ax_binary", return_value=fake_bin),
+                    mock.patch.object(eng, "_can_connect", side_effect=[False, True]),
+                    mock.patch("fmu.mac_engine.subprocess.run"),
+                    mock.patch("fmu.mac_engine.subprocess.Popen", side_effect=_fake_popen),
+                    mock.patch.object(Path, "unlink"),
+                    mock.patch.dict(
+                        os.environ,
+                        {"FMU_RUNTIME_SOCK": "/tmp/fmu-test-suite.sock", "FMU_LOG_DIR": "/tmp/test-logs", "FMU_TRACE": "/tmp/trace.jsonl"},
+                    ),
+                ):
+                    eng.ensure_daemon()
+                self.assertEqual(len(captured), 1)
+                self.assertIsNotNone(captured[0])
+                for leaked in ("FMU_RUNTIME_SOCK", "FMU_LOG_DIR", "FMU_TRACE"):
+                    self.assertNotIn(leaked, captured[0])
+            finally:
+                if saved_marker is not None:
+                    marker.write_text(saved_marker, encoding="utf-8")
 
     def test_resolve_caller_walks_to_harness_and_names_project_from_workspace_cwd(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fmu-harness-") as tmp:

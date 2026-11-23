@@ -345,8 +345,16 @@ class MacNativeEngine:
                 if launchctl_bin.is_file()
                 else [str(ax_bin), "--daemon", self.socket_path]
             )
+            spawn_env = None
+            if self.socket_path == DEFAULT_SOCK:
+                spawn_env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if k not in ("FMU_RUNTIME_SOCK", "FMU_LOG_DIR", "FMU_TRACE")
+                }
             proc = subprocess.Popen(
                 spawn_cmd,
+                env=spawn_env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,

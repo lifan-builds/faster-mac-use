@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Comprehensive unit and integration test suite for Faster Mac Use (fmu)."""
 
 from __future__ import annotations
@@ -562,6 +564,7 @@ class TestFasterMacUse(unittest.TestCase):
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
         self.assertIn("faster-mac-use 0.5.0", ver_proc.stdout)
+        self.assertIn("Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
         self.assertEqual(bad_proc.returncode, 2)
@@ -582,6 +585,7 @@ class TestFasterMacUse(unittest.TestCase):
         mcp_replies = [json.loads(line) for line in mcp_proc.stdout.splitlines()]
         self.assertEqual([r["id"] for r in mcp_replies], [0, 1, 2])
         self.assertEqual(mcp_replies[0]["error"]["code"], -32601)
+        self.assertIn("by lifan-builds", mcp_replies[1]["result"]["serverInfo"]["title"])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)

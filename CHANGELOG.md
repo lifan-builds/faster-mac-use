@@ -15,7 +15,7 @@ First PyPI release since 0.4.4. It also includes the unpublished 0.4.5 work.
 
 ### Changed
 - Package metadata declares the license as an SPDX expression (`License-Expression: LicenseRef-lifan-builds-Proprietary`) and builds with setuptools 77+.
-- License is now the lifan-builds source-available license (`LicenseRef-lifan-builds-Proprietary`); see `LICENSE`.
+- License is now open source `AGPL-3.0-only` with Section 7 attribution terms (`LICENSE`, `ATTRIBUTION.md`). `fmu --version` and MCP `serverInfo.title` print the attribution. Contributions need a one-time CLA (`CLA.md`).
 - README leads with a one-command `uvx` quickstart, a `uvx`-based MCP config, and a Proof section.
 
 ### Fixed

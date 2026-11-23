@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 const DEFAULT_RELAY_URL = "ws://127.0.0.1:19222/ext";
 let relayUrl = DEFAULT_RELAY_URL;
 let ws = null;

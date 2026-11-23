@@ -165,4 +165,8 @@ Results are written to [`benchmarks/results/latest_benchmark.md`](https://github
 
 ## License
 
-Copyright © 2026 [lifan-builds](https://github.com/lifan-builds). **All Rights Reserved** — source-available for **personal non-commercial use** and **upstream Pull Request contributions only** under [LICENSE](https://github.com/lifan-builds/faster-mac-use/blob/main/LICENSE) (`LicenseRef-lifan-builds-Proprietary`). Commercial use, hosted wrappers, rebranding, standalone forks/mirrors, and dataset/HTML extraction without prior written permission are prohibited. Pull Requests are welcome under [CONTRIBUTING.md](https://github.com/lifan-builds/faster-mac-use/blob/main/CONTRIBUTING.md).
+Open source under [AGPL-3.0-only](https://github.com/lifan-builds/faster-mac-use/blob/main/LICENSE), with the Section 7 attribution terms in [ATTRIBUTION.md](https://github.com/lifan-builds/faster-mac-use/blob/main/ATTRIBUTION.md). Copies and modified versions must keep this credit in their README and `--version` or About output, mark their changes, and may not use the Faster Mac Use name:
+
+> Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)
+
+Copyright © 2026 [lifan-builds](https://github.com/lifan-builds). Pull requests are welcome under [CONTRIBUTING.md](https://github.com/lifan-builds/faster-mac-use/blob/main/CONTRIBUTING.md) with a one-time [CLA](https://github.com/lifan-builds/faster-mac-use/blob/main/CLA.md). For licensing outside AGPL, open an issue.

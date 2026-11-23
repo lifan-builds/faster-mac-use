@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """fmu CLI, Warm Daemon & MCP Server entrypoint for Faster Mac Use."""
 
 from __future__ import annotations

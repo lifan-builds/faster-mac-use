@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """User preferences shared by the Python runtime and the fmu-ax menu bar app (`~/.fmu/prefs.json`)."""
 
 from __future__ import annotations

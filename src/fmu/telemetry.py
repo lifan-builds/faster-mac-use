@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Zero-overhead, privacy-safe performance & invocation telemetry for Faster Mac Use (fmu).
 
 Writes structured JSONL records to ``~/.fmu/logs/perf-YYYY-MM-DD.jsonl`` (overridable via

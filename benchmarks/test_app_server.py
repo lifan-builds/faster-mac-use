@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Deterministic local SaaS web benchmark server testing dense DOMs, top-banner index shifts, and Focus Emulation."""
 
 from __future__ import annotations

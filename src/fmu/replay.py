@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Trace recording and self-contained HTML / animated SVG replay for fmu runs.
 
 Set ``FMU_TRACE=/path/run.jsonl`` to append one record per fmu call (request, output, wall ms);

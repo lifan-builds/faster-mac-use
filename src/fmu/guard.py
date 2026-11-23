@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """50Hz Background Intrusion Guard: Verifies zero cursor movement and zero focus changes during runs."""
 
 from __future__ import annotations

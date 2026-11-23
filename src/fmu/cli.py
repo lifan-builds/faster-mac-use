@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """CLI, Warm Daemon & MCP Server entrypoint for Faster Mac Use (fmu)."""
 
 from __future__ import annotations
@@ -237,7 +239,7 @@ def serve_mcp(bin_path: Path | None = None) -> None:
         mid = msg.get("id")
         method = msg.get("method")
         if method == "initialize":
-            from fmu import __version__
+            from fmu import ATTRIBUTION, __version__
 
             resp = {
                 "jsonrpc": "2.0",
@@ -245,7 +247,7 @@ def serve_mcp(bin_path: Path | None = None) -> None:
                 "result": {
                     "protocolVersion": "2025-03-26",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "faster-mac-use", "version": __version__},
+                    "serverInfo": {"name": "faster-mac-use", "title": ATTRIBUTION, "version": __version__},
                 },
             }
             sys.stdout.write(json.dumps(resp) + "\n")
@@ -312,9 +314,9 @@ def main(bin_path: Path | None = None) -> None:
         sys.stdout.write(USAGE_TEXT)
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("-v", "--version", "version"):
-        from fmu import __version__
+        from fmu import ATTRIBUTION, __version__
 
-        sys.stdout.write(f"faster-mac-use {__version__}\n")
+        sys.stdout.write(f"faster-mac-use {__version__}\n{ATTRIBUTION}\nLicense: AGPL-3.0-only with Section 7 attribution terms (ATTRIBUTION.md)\n")
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("--status", "status", "--menubar"):
         from fmu.mac_engine import get_menubar_status

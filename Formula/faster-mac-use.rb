@@ -5,7 +5,7 @@ class FasterMacUse < Formula
   homepage "https://clifan.com/faster-mac-use/"
   url "https://github.com/lifan-builds/faster-mac-use/archive/refs/heads/main.tar.gz"
   version "0.5.0"
-  license "MIT"
+  license "AGPL-3.0-only"
   head "https://github.com/lifan-builds/faster-mac-use.git", branch: "main"
 
   depends_on :macos

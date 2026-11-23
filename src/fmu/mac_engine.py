@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Persistent Unix-socket client for the native macOS Accessibility engine (fmu-ax)."""
 
 from __future__ import annotations

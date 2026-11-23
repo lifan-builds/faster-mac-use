@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Unified Faster Mac Use Runtime: Codex-style stateful cua_repl + 1-Trip JSON Batch + Context Window Compactor + Warm Unix Daemon."""
 
 from __future__ import annotations

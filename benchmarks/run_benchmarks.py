@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Head-to-head benchmark suite comparing Faster Mac Use against OpenAI Codex CUA and 2025-2026 market competitors.
 
 Measures:

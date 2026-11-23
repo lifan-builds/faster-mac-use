@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lifan-builds. Faster Mac Use; Section 7 attribution terms in ATTRIBUTION.md.
 """Browser Interaction Engine: Unfocused 'Agent' tabs, Outbound MV3 WebSocket Bridge, Multi-Cursor Isolation, Focus Emulation, WeakRef UIDs, Native + Virtual WebMCP Macros, <canvas> Vision OCR Fusion, and CRC-32 Delta Reader."""
 
 from __future__ import annotations

@@ -320,12 +320,14 @@ class MacNativeEngine:
             if not ax_bin.is_file():
                 raise FileNotFoundError(f"Native binary not found at {ax_bin}")
             sock_path = Path(self.socket_path)
+            owner_marker = Path(f"{self.socket_path}.bin")
+            identity = f"{ax_bin.resolve()}:{ax_bin.stat().st_mtime_ns}"
             if self._can_connect():
                 try:
-                    if ax_bin.stat().st_mtime <= sock_path.stat().st_mtime + 0.5:
+                    if owner_marker.read_text(encoding="utf-8") == identity:
                         return False
                 except OSError:
-                    return False
+                    pass
             if self._daemon_proc and self._daemon_proc.poll() is None:
                 self._daemon_proc.terminate()
             subprocess.run(
@@ -351,6 +353,7 @@ class MacNativeEngine:
             )
             proc._child_created = False  # Detach intentional background daemon from Popen.__del__ warning
             self._daemon_proc = proc
+            owner_marker.write_text(identity, encoding="utf-8")
             for _ in range(80):
                 if self._can_connect():
                     return True

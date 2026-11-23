@@ -3751,6 +3751,29 @@ class TestTraceReplay(unittest.TestCase):
             bad = subprocess.run([sys.executable, str(ROOT / "bin" / "fmu"), "replay"], capture_output=True, text=True, timeout=30)
             self.assertEqual(bad.returncode, 2)
 
+    def test_ensure_daemon_replaces_daemon_started_by_a_different_binary(self) -> None:
+        from fmu import mac_engine
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ax_bin = Path(tmp) / "fmu-ax"
+            ax_bin.write_text("new")
+            sock = Path(tmp) / "ax.sock"
+            sock.write_text("")
+            eng = mac_engine.MacNativeEngine(socket_path=str(sock))
+            spawned: list[list[str]] = []
+            with mock.patch.object(mac_engine, "_resolve_ax_binary", return_value=ax_bin), \
+                 mock.patch.object(eng, "_can_connect", return_value=True), \
+                 mock.patch.object(mac_engine.subprocess, "run"), \
+                 mock.patch.object(mac_engine.subprocess, "Popen", side_effect=lambda cmd, **kw: (spawned.append(cmd), mock.Mock())[1]):
+                self.assertTrue(eng.ensure_daemon(), "socket newer than binary but no marker: stale daemon must be replaced")
+                self.assertEqual(spawned[-1][-3:], [str(ax_bin), "--daemon", str(sock)])
+                eng._cached_ax_bin = None
+                self.assertFalse(eng.ensure_daemon(), "daemon started by the same binary must be reused")
+                Path(f"{sock}.bin").write_text("/other/fmu-ax:1")
+                eng._cached_ax_bin = None
+                self.assertTrue(eng.ensure_daemon(), "daemon started by another install must be replaced")
+                self.assertEqual(len(spawned), 2)
+
 
 class TestTraceBoundsLive(unittest.TestCase):
     @classmethod

@@ -432,11 +432,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.5.0"
+_FMU_RUNTIME_VERSION = "0.5.1"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.5.0";
+  const FMU_RUNTIME_VERSION = "0.5.1";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {

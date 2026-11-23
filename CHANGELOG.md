@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1 (2026-11-22)
+
+### Fixed
+- The menu bar "Close All Agent-Opened Chrome Tabs" action now closes every agent tab. It sends `{"closeAgentTabs": true, "all": true}`, and the extension also closes tabs inside agent-titled tab groups (`Agent`, `Devin`, `Codex`, `Claude`, ...) that it has no claim record for.
+- Per-session close (`{"closeAgentTabs": true, "owner": ...}`) matches that session's tab group title, and an unknown `owner` closes nothing instead of falling back to every tab.
+- Agent tab claims persist in `chrome.storage.local`, so they survive an extension service-worker restart. When a harness exits, its blank tabs close, claims on tabs that no longer exist are dropped, and its remaining tabs stay claimed but unowned.
+- The native `fmu-ax` daemon no longer inherits `FMU_RUNTIME_SOCK`, `FMU_LOG_DIR`, or `FMU_TRACE` from whichever process happened to spawn it.
+
 ## 0.5.0 (2026-11-22)
 
 First PyPI release since 0.4.4. It also includes the unpublished 0.4.5 work.

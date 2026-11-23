@@ -1949,7 +1949,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.0" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.1" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

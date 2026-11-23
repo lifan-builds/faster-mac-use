@@ -26,9 +26,9 @@ If `fmu` saves your agent tokens or time, a [GitHub star](https://github.com/lif
 
 Three agents working in parallel, compared against `@playwright/mcp` on the same task:
 
-![Faster Mac Use 3-Cursor Parallel Swarm vs @playwright/mcp Live Token Counter](docs/assets/swarm-vs-mcp-demo.svg)
+![Faster Mac Use 3-Cursor Parallel Swarm vs @playwright/mcp Live Token Counter](https://raw.githubusercontent.com/lifan-builds/faster-mac-use/main/docs/assets/swarm-vs-mcp-demo.svg)
 
-Cumulative input tokens and engine time across five workloads. The harness, raw JSON, and per-turn numbers are in [`benchmarks/`](benchmarks/) and the [benchmark report](docs/architecture_and_benchmarks.md); rerun them with `PYTHONPATH=src python3 benchmarks/run_benchmarks.py`.
+Cumulative input tokens and engine time across five workloads. The harness, raw JSON, and per-turn numbers are in [`benchmarks/`](https://github.com/lifan-builds/faster-mac-use/tree/main/benchmarks) and the [benchmark report](https://github.com/lifan-builds/faster-mac-use/blob/main/docs/architecture_and_benchmarks.md); rerun them with `PYTHONPATH=src python3 benchmarks/run_benchmarks.py`.
 
 | Workload | `faster-mac-use` (Cumulative Tokens / Engine Time) | OpenAI Codex `cua_repl` Ref | `@playwright/mcp` / Stacked MCPs | Anthropic Pixel CUA |
 | :--- | :--- | :--- | :--- | :--- |
@@ -52,9 +52,14 @@ fmu replay ~/fmu-run.jsonl -o run.svg   # looping animated SVG
 fmu replay ~/.fmu/logs/perf-2026-11-22.jsonl   # perf logs replay as a latency-only timeline
 ```
 
-![fmu replay of example.com and Calculator 7 × 6 with @uid bounds and latency HUD](docs/assets/replay-demo.svg)
+![fmu replay of example.com and Calculator 7 × 6 with @uid bounds and latency HUD](https://raw.githubusercontent.com/lifan-builds/faster-mac-use/main/docs/assets/replay-demo.svg)
 
-`fmu replay` is on `main` and ships in the next PyPI release; until then install from a clone (`pip install -e .`).
+Try it without installing (needs 0.5.0 or later):
+
+```bash
+FMU_TRACE=/tmp/run.jsonl uvx --from 'faster-mac-use>=0.5.0' fmu '{"surface":"app","app":"Calculator","steps":[{"op":"click","name":"7"}]}'
+uvx --from 'faster-mac-use>=0.5.0' fmu replay /tmp/run.jsonl   # -> /tmp/run.html
+```
 
 ## Why `faster-mac-use`?
 
@@ -69,26 +74,26 @@ Most computer-use tools make you pick one of these trade-offs:
 
 ## Core Architecture
 
-1. **Tier 1 — Native Browser Engine ([`BrowserEngine`](src/fmu/browser_engine.py))**
+1. **Tier 1 — Native Browser Engine ([`BrowserEngine`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/browser_engine.py))**
    - **Dual-Mode Zero-Popup Chrome Control**:
-     - **Live Logged-In Chrome via Outbound MV3 Extension WebSocket Bridge (`ws://127.0.0.1:19222/ext`)**: [`extension/background.js`](extension/background.js) connects outward to `/tmp/fmu-runtime.sock`'s single-owner `ExtensionWebSocketBridge` (`fmu mcp` proxies calls through the daemon so port `19222` is never contested; inspectable via `{"bridgeStatus": true}` / `await cua.getBridgeStatus()`) and drives unfocused, per-agent color-coded **`"Agent"` Tab Groups** (`active: false`, with multi-window `window`, `windowId`, and `reuseExisting` tab targeting) via `chrome.debugger` / `chrome.scripting` / `chrome.tabGroups` with **zero Chrome 144 `DevToolsActivePort` `"Allow remote debugging?"` modal popups**. When `mode: "extension"` (or `"live"` / `requireExtension: true`) is requested while disconnected, `fmu` fails fast with an actionable setup diagnostic; when default `mode: "chrome"` targets an external URL without the extension connected, `fmu` tags the header `bridge="headless-fallback"` and emits an explicit `! warning:` (and `! errors:` if `els=0`) instead of silently failing in an unauthenticated session.
+     - **Live Logged-In Chrome via Outbound MV3 Extension WebSocket Bridge (`ws://127.0.0.1:19222/ext`)**: [`extension/background.js`](https://github.com/lifan-builds/faster-mac-use/blob/main/extension/background.js) connects outward to `/tmp/fmu-runtime.sock`'s single-owner `ExtensionWebSocketBridge` (`fmu mcp` proxies calls through the daemon so port `19222` is never contested; inspectable via `{"bridgeStatus": true}` / `await cua.getBridgeStatus()`) and drives unfocused, per-agent color-coded **`"Agent"` Tab Groups** (`active: false`, with multi-window `window`, `windowId`, and `reuseExisting` tab targeting) via `chrome.debugger` / `chrome.scripting` / `chrome.tabGroups` with **zero Chrome 144 `DevToolsActivePort` `"Allow remote debugging?"` modal popups**. When `mode: "extension"` (or `"live"` / `requireExtension: true`) is requested while disconnected, `fmu` fails fast with an actionable setup diagnostic; when default `mode: "chrome"` targets an external URL without the extension connected, `fmu` tags the header `bridge="headless-fallback"` and emits an explicit `! warning:` (and `! errors:` if `els=0`) instead of silently failing in an unauthenticated session.
      - **Zero-Config Background Worker (`mode: "headless"` & local dev URLs)**: When running in `"headless"` mode or against local/test URLs without the extension bridge, `fmu` uses a thread-safe background Playwright worker (`fmu-pw-worker`) with per-tab background focus and lifecycle emulation (`Emulation.setFocusEmulationEnabled({enabled: true})` + `Page.setWebLifecycleState({state: "active"})`).
    - **Persistent `WeakMap` UIDs (`@u1..@uN`) + Pre-Registered Table Row Folding (`foldTables`)**: Indexes all table rows in `uidToRef` so agents can target folded rows by label or UID while cutting initial dense table snapshots by >2.5×.
    - **Native WebMCP (`navigator.modelContext`) + Auto-Synthesized Virtual WebMCP Macros (`~/.fmu/macros/`)**: Detects page-registered WebMCP tools and allows agents to synthesize multi-step DOM trajectories into reusable 1-turn Virtual WebMCP tools (`await tab.saveMacro(name, steps, desc)` -> `await tab.callTool(name, args)`), auto-loaded per domain in the `# web ... webmcp=[...]` header.
    - **In-Browser `<canvas>` / WebGL Semantic OCR Fusion**: Clip-captures `<canvas>` elements via CDP and runs Apple Silicon `Vision.framework` (`VNRecognizeTextRequest`) via `fmu-ax` to inject clickable `@ocr1..@ocrN canvas-text "..." (x,y) [wxh]` targets directly into the web snapshot (`await tab.ocr()` or automatic canvas detection) with **0 VLM image tokens**.
    - **Deterministic Rich-Text Editing & Zero-Dialog File Uploads**: Replaces (or appends with `append: true`) multi-block `contenteditable` / Draft.js / ProseMirror editors in `< 50 ms` without touching the system clipboard, and intercepts `<input type="file">` uploads via CDP (`DOM.setFileInputFiles`) so native macOS `NSOpenPanel` dialogs never open or get blocked by AppKit/TCC.
 
-2. **Tier 2 — Native macOS Accessibility, Push-Based `AXObserver` & Vision OCR ([`fmu_ax.swift`](src/fmu/native/fmu_ax.swift) / [`MacNativeEngine`](src/fmu/mac_engine.py))**
+2. **Tier 2 — Native macOS Accessibility, Push-Based `AXObserver` & Vision OCR ([`fmu_ax.swift`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/native/fmu_ax.swift) / [`MacNativeEngine`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/mac_engine.py))**
    - **Persistent Unix Socket Daemon (`/tmp/fmu-ax.sock`, universal2 binary `bin/fmu-ax`)**: Keeps a warm 4,000-element `AXUIElement` LRU cache, PID/window cache, per-agent `+/~/-` diff baselines, and per-agent virtual cursors (`VirtualCursorState`) across turns.
    - **Push-Based `AXObserver` Dirty-Subtree Tracking**: Subscribes to `kAXValueChangedNotification`, `kAXTitleChangedNotification`, `kAXCreatedNotification`, `kAXUIElementDestroyedNotification`, and window/layout notifications on a dedicated `CFRunLoop` thread (`fmu-ax-observer`). Turn 2+ unchanged or leaf-dirty snapshots short-circuit full AX tree walks in **`< 1 ms`** (`obs=` sequence telemetry).
    - **Batched Attribute Reads, Non-Destructive Clipboard Hygiene & Multi-Window Guards**: Batches reads via `AXUIElementCopyMultipleAttributeValues`, lazily wakes background Electron/Chromium AX trees (`AXManualAccessibility = true`), never overwrites `NSPasteboard.general` on `op: "set"` (verifying `AXTextArea` read-back and detecting `NSOpenPanel` TCC-disabled `Open` buttons), and guards `CGEvent.postToPid` key routing when targeting a non-main window of a multi-window process.
    - **0-Vision-Token Apple Silicon Window & Canvas OCR**: Built-in `CGWindowListCreateImage` + `ImageIO` + `VNRecognizeTextRequest` engine (`op: "ocr"` / `await app.ocr()`) extracts clickable text and bounding boxes in `< 70 ms`.
    - **Real-Time Pixel `fmu Live View` HUD & One-Click Menu Bar Stop**: Streams live pixels of the actual controlled background Chrome tab (`Page.startScreencast` + async post-action `Page.captureScreenshot` over `ws://127.0.0.1:19222/ext`) or native macOS app window (`ScreenCaptureKit`) into a non-activating floating PiP monitor with target cursor reticles, HD Zoom (`460px` / `740px`, `{"toggleZoom": true}`), `Highlight` (`fmu --highlight`), draggable positioning, persistent Live View toggle (`fmu --live-view on|off`, `~/.fmu/prefs.json`), per-session & global agent Chrome tab cleanup, and instant `Stop` / `Resume` (`fmu --stop` / `fmu --resume`).
 
-3. **Tier 3 — Unified Multi-Cursor / Multi-Agent Stateful REPL, Warm Daemon & Context Hygiene ([`FasterMacUseRuntime`](src/fmu/cua_runtime.py))**
+3. **Tier 3 — Unified Multi-Cursor / Multi-Agent Stateful REPL, Warm Daemon & Context Hygiene ([`FasterMacUseRuntime`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/cua_runtime.py))**
    - **268-Token Single-Tool Schema & Strict `steps` Validation**: Supports OpenAI Codex-style stateful `cua_repl` scripts (`cua.createBrowserTab`, `cua.getTab`, `cua.getApp`, `cua.getBridgeStatus`, `cua.saveMacro`, `cua.listMacros`, `cua.getState`, `cua.getCursors`), 1-trip declarative `steps` batches (with `op`/`uid` and `action`/`target`/`text` normalization plus explicit error reporting on missing or unsupported `"op"`), and concurrent multi-agent swarms (`{"parallel": [{"agent": "agent-1", "code": "..."}, ...]}`).
    - **Per-Agent Isolation & Stale-Observation Masking**: Each `AgentSession` has independent REPL handles, virtual cursor `(x, y)` coordinates (`tab.moveCursor` / `app.moveCursor`), and `ContextWindowTracker` 18-token tombstones that replace superseded snapshots to prevent quadratic O(N²) context growth.
-   - **50Hz Hardware Intrusion Guard ([`BackgroundIntrusionGuard`](src/fmu/guard.py))**: Polls CoreGraphics (`CGEventGetLocation` + `CGEventSourceSecondsSinceLastEventType`) and `lsappinfo front` at 50Hz to prove `0.0 px` cursor displacement and `0` automated focus changes.
+   - **50Hz Hardware Intrusion Guard ([`BackgroundIntrusionGuard`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/guard.py))**: Polls CoreGraphics (`CGEventGetLocation` + `CGEventSourceSecondsSinceLastEventType`) and `lsappinfo front` at 50Hz to prove `0.0 px` cursor displacement and `0` automated focus changes.
 
 ---
 
@@ -156,8 +161,8 @@ PYTHONPATH=src python3 tests/test_fmu.py
 ```bash
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 ```
-Results are written to [`benchmarks/results/latest_benchmark.md`](benchmarks/results/latest_benchmark.md) and [`benchmarks/results/latest_benchmark.json`](benchmarks/results/latest_benchmark.json).
+Results are written to [`benchmarks/results/latest_benchmark.md`](https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/results/latest_benchmark.md) and [`benchmarks/results/latest_benchmark.json`](https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/results/latest_benchmark.json).
 
 ## License
 
-Copyright © 2026 [lifan-builds](https://github.com/lifan-builds). **All Rights Reserved** — source-available for **personal non-commercial use** and **upstream Pull Request contributions only** under [LICENSE](LICENSE) (`LicenseRef-lifan-builds-Proprietary`). Commercial use, hosted wrappers, rebranding, standalone forks/mirrors, and dataset/HTML extraction without prior written permission are prohibited. Pull Requests are welcome under [CONTRIBUTING.md](CONTRIBUTING.md).
+Copyright © 2026 [lifan-builds](https://github.com/lifan-builds). **All Rights Reserved** — source-available for **personal non-commercial use** and **upstream Pull Request contributions only** under [LICENSE](https://github.com/lifan-builds/faster-mac-use/blob/main/LICENSE) (`LicenseRef-lifan-builds-Proprietary`). Commercial use, hosted wrappers, rebranding, standalone forks/mirrors, and dataset/HTML extraction without prior written permission are prohibited. Pull Requests are welcome under [CONTRIBUTING.md](https://github.com/lifan-builds/faster-mac-use/blob/main/CONTRIBUTING.md).

@@ -561,7 +561,7 @@ class TestFasterMacUse(unittest.TestCase):
 
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
-        self.assertIn("faster-mac-use 0.4.5", ver_proc.stdout)
+        self.assertIn("faster-mac-use 0.5.0", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
         self.assertEqual(bad_proc.returncode, 2)
@@ -2594,7 +2594,7 @@ setInterval(() => {{}}, 1000);
         try:
             self.assertTrue(bridge.wait_connected(timeout=3.0))
             bridge_st = self.rt.execute({"bridgeStatus": True})
-            self.assertIn('version="0.4.5"', bridge_st)
+            self.assertIn('version="0.5.0"', bridge_st)
 
             tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
             self.assertIn('@tab id=501', tabs_list)

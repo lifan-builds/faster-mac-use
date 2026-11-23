@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "faster-mac-use"
-version = "0.4.5"
+version = "0.5.0"
 description = "Background-first, multi-cursor browser and native macOS computer-use engine for AI agents"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "LicenseRef-lifan-builds-Proprietary"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "lifan-builds" }]
 keywords = ["mcp", "computer-use", "macos", "accessibility", "browser-automation", "cua", "ai-agents", "webmcp"]

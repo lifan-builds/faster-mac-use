@@ -8,8 +8,12 @@ let reconnectTimer = null;
 const sessionGroups = new Map();
 const sessionTabs = new Map();
 const attachedDebuggers = new Set();
+const debuggerLastUsedAt = new Map();
+const IDLE_DEBUGGER_DETACH_MS = 5 * 60 * 1000;
 const initializedRuntimeTabs = new Map();
+const STRICT_CSP_HOSTS_KEY = "fmuStrictCspHosts";
 const strictCspHosts = new Set();
+let strictCspHostsLoaded = null;
 const pendingNetRequests = new Map();
 let cachedRuntimeJs = "";
 let cachedRuntimeVersion = "";
@@ -46,6 +50,17 @@ function saveAgentTabClaims() {
   return store ? store.set({ [AGENT_TAB_CLAIMS_KEY]: Object.fromEntries(agentTabClaims) }) : Promise.resolve();
 }
 
+async function isAgentGroupId(groupId) {
+  if (groupId === undefined || groupId === null || groupId < 0) return false;
+  if (!chrome.tabGroups || typeof chrome.tabGroups.get !== "function") return false;
+  try {
+    const g = await chrome.tabGroups.get(groupId);
+    return Boolean(g && AGENT_GROUP_TITLE_RE.test(String(g.title || "").trim()));
+  } catch (_) {
+    return false;
+  }
+}
+
 async function claimTab(tabId, owner, opened) {
   await loadAgentTabClaims();
   const prev = agentTabClaims.get(tabId);
@@ -56,9 +71,12 @@ async function claimTab(tabId, owner, opened) {
   await saveAgentTabClaims();
 }
 
-async function bindSessionTab(sessionId, tabId, owner) {
+async function bindSessionTab(sessionId, tabId, owner, prevGroupId = undefined) {
   sessionTabs.set(sessionId, tabId);
-  await claimTab(tabId, owner, false);
+  await loadAgentTabClaims();
+  const prev = agentTabClaims.get(tabId);
+  const inheritedOpened = !prev && (await isAgentGroupId(prevGroupId));
+  await claimTab(tabId, owner, inheritedOpened);
 }
 
 async function foreignTabIds(owner) {
@@ -74,7 +92,70 @@ async function releaseTabClaims(tabIds) {
   if (changed) await saveAgentTabClaims();
 }
 
-chrome.tabs.onRemoved.addListener(tabId => releaseTabClaims([tabId]));
+function loadStrictCspHosts() {
+  if (!strictCspHostsLoaded) {
+    const store = claimStorage();
+    strictCspHostsLoaded = store
+      ? store.get(STRICT_CSP_HOSTS_KEY).then(saved => {
+          const list = (saved && saved[STRICT_CSP_HOSTS_KEY]) || [];
+          if (Array.isArray(list)) {
+            for (const host of list) {
+              if (host) strictCspHosts.add(String(host));
+            }
+          }
+        })
+      : Promise.resolve();
+  }
+  return strictCspHostsLoaded;
+}
+
+async function rememberStrictCspHost(host) {
+  if (!host) return;
+  await loadStrictCspHosts();
+  if (strictCspHosts.has(host)) return;
+  strictCspHosts.add(host);
+  if (strictCspHosts.size > 256) {
+    const oldest = strictCspHosts.values().next().value;
+    if (oldest) strictCspHosts.delete(oldest);
+  }
+  const store = claimStorage();
+  if (store) await store.set({ [STRICT_CSP_HOSTS_KEY]: Array.from(strictCspHosts) });
+}
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  debuggerLastUsedAt.delete(tabId);
+  attachedDebuggers.delete(tabId);
+  initializedRuntimeTabs.delete(tabId);
+  return releaseTabClaims([tabId]);
+});
+
+if (chrome.tabs && chrome.tabs.onCreated && typeof chrome.tabs.onCreated.addListener === "function") {
+  chrome.tabs.onCreated.addListener(tab => {
+    if (!tab || tab.id === undefined) return;
+    void (async () => {
+      await loadAgentTabClaims();
+      if (agentTabClaims.has(tab.id)) return;
+      const openerClaim = tab.openerTabId !== undefined ? agentTabClaims.get(tab.openerTabId) : null;
+      let inheritedOwner = "";
+      let shouldClaim = false;
+      if (openerClaim && openerClaim.opened) {
+        inheritedOwner = openerClaim.owner || "";
+        shouldClaim = true;
+      } else if (await isAgentGroupId(tab.groupId)) {
+        inheritedOwner = (openerClaim && openerClaim.owner) || "";
+        shouldClaim = true;
+      } else if (!openerClaim && tab.openerTabId !== undefined && chrome.tabs && typeof chrome.tabs.get === "function") {
+        try {
+          const openerTab = await chrome.tabs.get(tab.openerTabId);
+          if (openerTab && (await isAgentGroupId(openerTab.groupId))) {
+            shouldClaim = true;
+          }
+        } catch (_) {}
+      }
+      if (shouldClaim) await claimTab(tab.id, inheritedOwner, true);
+    })();
+  });
+}
 
 function scheduleReconnect(delayMs = 500) {
   if (reconnectTimer) return;
@@ -86,11 +167,29 @@ function scheduleReconnect(delayMs = 500) {
   }, delayMs);
 }
 
+async function detachIdleDebuggers(now = Date.now(), maxIdleMs = IDLE_DEBUGGER_DETACH_MS) {
+  if (!chrome.debugger || typeof chrome.debugger.detach !== "function") return 0;
+  let detached = 0;
+  for (const tabId of Array.from(attachedDebuggers)) {
+    if (tabId === activeScreencastTabId) continue;
+    const lastUsed = debuggerLastUsedAt.get(tabId) || 0;
+    if (now - lastUsed < maxIdleMs) continue;
+    attachedDebuggers.delete(tabId);
+    debuggerLastUsedAt.delete(tabId);
+    try {
+      await chrome.debugger.detach({ tabId });
+      detached += 1;
+    } catch (_) {}
+  }
+  return detached;
+}
+
 chrome.alarms.create("fmu-keepalive", { periodInMinutes: 0.25 });
 chrome.alarms.onAlarm.addListener(() => {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     connectRelay();
   }
+  void detachIdleDebuggers();
 });
 if (chrome.runtime && chrome.runtime.onStartup) {
   chrome.runtime.onStartup.addListener(() => connectRelay());
@@ -234,6 +333,7 @@ async function waitForTabLoad(tabId, timeoutMs = 10000, expectedUrl = "", prevUr
 }
 
 async function ensureDebuggerAndFocusEmulation(tabId) {
+  debuggerLastUsedAt.set(tabId, Date.now());
   if (attachedDebuggers.has(tabId)) return;
   try {
     await chrome.debugger.attach({ tabId }, "1.3");
@@ -244,6 +344,7 @@ async function ensureDebuggerAndFocusEmulation(tabId) {
     }
   }
   attachedDebuggers.add(tabId);
+  debuggerLastUsedAt.set(tabId, Date.now());
   try {
     await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
   } catch (_) {}
@@ -284,6 +385,7 @@ if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
       attachedDebuggers.delete(source.tabId);
+      debuggerLastUsedAt.delete(source.tabId);
       initializedRuntimeTabs.delete(source.tabId);
       if (activeScreencastTabId === source.tabId) {
         activeScreencastTabId = null;
@@ -920,10 +1022,11 @@ async function handleRpc(msg) {
         if (!directTab || directTab.id === undefined) {
           throw new Error(`No Chrome tab found with tabId=${targetCid}`);
         }
+        const prevGroupId = directTab.groupId;
         const groupId = params.assignGroup === false
           ? directTab.groupId
           : await ensureAgentGroup(directTab.id, sessionName, color, directTab.windowId);
-        await bindSessionTab(sessionId, directTab.id, owner);
+        await bindSessionTab(sessionId, directTab.id, owner, prevGroupId);
         if (params.focusEmulation !== false) {
           try { await ensureDebuggerAndFocusEmulation(directTab.id); } catch (_) {}
         }
@@ -969,8 +1072,9 @@ async function handleRpc(msg) {
           }
         }
         if (reattachedTab && reattachedTab.id !== undefined) {
+          const prevGroupId = reattachedTab.groupId;
           const groupId = await ensureAgentGroup(reattachedTab.id, sessionName, color, reattachedTab.windowId);
-          await bindSessionTab(sessionId, reattachedTab.id, owner);
+          await bindSessionTab(sessionId, reattachedTab.id, owner, prevGroupId);
           if (params.focusEmulation !== false) {
             try { await ensureDebuggerAndFocusEmulation(reattachedTab.id); } catch (_) {}
           }
@@ -1013,8 +1117,9 @@ async function handleRpc(msg) {
               : null;
             const match = exactUrlMatch || wfTabs[0];
             if (match && match.id !== undefined) {
+              const prevGroupId = match.groupId;
               const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-              await bindSessionTab(sessionId, match.id, owner);
+              await bindSessionTab(sessionId, match.id, owner, prevGroupId);
               const curMatchUrl = String(match.url || match.pendingUrl || "");
               const alreadyMatchesUrl = !urlStr
                 || urlStr === "about:blank"
@@ -1073,8 +1178,9 @@ async function handleRpc(msg) {
           return false;
         });
         if (match && match.id !== undefined) {
+          const prevGroupId = match.groupId;
           const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-          await bindSessionTab(sessionId, match.id, owner);
+          await bindSessionTab(sessionId, match.id, owner, prevGroupId);
           if (params.focusEmulation !== false) {
             try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
           }
@@ -1106,8 +1212,9 @@ async function handleRpc(msg) {
             ? nonBlank[nonBlank.length - 1]
             : (groupTabs.length > 0 ? groupTabs[groupTabs.length - 1] : null);
           if (match && match.id !== undefined) {
+            const prevGroupId = match.groupId;
             const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-            await bindSessionTab(sessionId, match.id, owner);
+            await bindSessionTab(sessionId, match.id, owner, prevGroupId);
             if (params.focusEmulation !== false) {
               try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
             }
@@ -1363,7 +1470,7 @@ async function handleRpc(msg) {
         if (allowMissing) return { id, result: { found: false } };
         throw new Error(`No matching Chrome tab found for '${urlPattern || queryFilter || windowFilter || sessionName || sessionId}'`);
       }
-      await bindSessionTab(sessionId, match.id, owner);
+      await bindSessionTab(sessionId, match.id, owner, match.groupId);
       if (params.assignGroup === true && sessionName) {
         try { await ensureAgentGroup(match.id, sessionName, params.color || "blue", match.windowId); } catch (_) {}
       }
@@ -1480,6 +1587,7 @@ async function handleRpc(msg) {
 
       const origSteps = Array.isArray(reqPayload.steps) ? reqPayload.steps : [];
       const tabHost = getHostname(curTabUrl);
+      if (tabHost) await loadStrictCspHosts();
       const isPureEvalOnKnownCspHost = (
         tabHost
         && strictCspHosts.has(tabHost)
@@ -1739,7 +1847,7 @@ async function handleRpc(msg) {
             esc.handled = true;
             didMutate = true;
             const escHost = getHostname((batchRes && batchRes.url) || curTabUrl);
-            if (escHost) strictCspHosts.add(escHost);
+            if (escHost) await rememberStrictCspHost(escHost);
             try {
               const evalBox = await evalStepCodeOnTab(tabId, esc.code);
               if (evalBox && evalBox.hasValue) {
@@ -1820,6 +1928,7 @@ async function handleRpc(msg) {
         stopLiveScreencast(targetId);
         try { await chrome.tabs.remove(targetId); } catch (_) {}
         attachedDebuggers.delete(targetId);
+        debuggerLastUsedAt.delete(targetId);
         initializedRuntimeTabs.delete(targetId);
       }
       if (sessionId) sessionTabs.delete(sessionId);
@@ -1834,24 +1943,37 @@ async function handleRpc(msg) {
           .filter(([, c]) => c.opened && (!owner || c.owner === owner))
           .map(([tabId]) => tabId)
       );
-      if (chrome.tabGroups && typeof chrome.tabGroups.query === "function" && chrome.tabs && typeof chrome.tabs.query === "function") {
+      const ungroupIds = [];
+      let liveTabIds = null;
+      if (chrome.tabs && typeof chrome.tabs.query === "function") {
         try {
-          const allGroups = (await chrome.tabGroups.query({})) || [];
-          const matchingGroupIds = new Set();
-          for (const g of allGroups) {
-            const title = String((g && g.title) || "").trim();
-            if (!title) continue;
-            const matches = owner
-              ? Boolean(groupTitle && (title === groupTitle || title.startsWith(`${groupTitle} · `)))
-              : AGENT_GROUP_TITLE_RE.test(title);
-            if (matches) matchingGroupIds.add(g.id);
-          }
-          if (matchingGroupIds.size > 0) {
-            const allTabs = (await chrome.tabs.query({})) || [];
-            for (const t of allTabs) {
-              if (!t || t.id === undefined || !matchingGroupIds.has(t.groupId)) continue;
-              if (agentTabClaims.has(t.id)) continue;
-              targetIds.add(t.id);
+          const allTabs = (await chrome.tabs.query({})) || [];
+          liveTabIds = new Set(allTabs.filter(t => t && t.id !== undefined).map(t => t.id));
+          if (chrome.tabGroups && typeof chrome.tabGroups.query === "function") {
+            const allGroups = (await chrome.tabGroups.query({})) || [];
+            const matchingGroupIds = new Set();
+            for (const g of allGroups) {
+              const title = String((g && g.title) || "").trim();
+              if (!title) continue;
+              const matches = owner
+                ? Boolean(groupTitle && (title === groupTitle || title.startsWith(`${groupTitle} · `)))
+                : AGENT_GROUP_TITLE_RE.test(title);
+              if (matches) matchingGroupIds.add(g.id);
+            }
+            if (matchingGroupIds.size > 0) {
+              for (const t of allTabs) {
+                if (!t || t.id === undefined || !matchingGroupIds.has(t.groupId)) continue;
+                const claim = agentTabClaims.get(t.id);
+                if (!claim) {
+                  targetIds.add(t.id);
+                } else if (!claim.opened) {
+                  if (!owner && !claim.owner) {
+                    targetIds.add(t.id);
+                  } else if (!owner || claim.owner === owner) {
+                    ungroupIds.push(t.id);
+                  }
+                }
+              }
             }
           }
         } catch (_) {}
@@ -1860,10 +1982,22 @@ async function handleRpc(msg) {
       for (const tid of tabIds) {
         stopLiveScreencast(tid);
         attachedDebuggers.delete(tid);
+        debuggerLastUsedAt.delete(tid);
         initializedRuntimeTabs.delete(tid);
       }
       const removals = await Promise.allSettled(tabIds.map(tid => chrome.tabs.remove(tid)));
-      await releaseTabClaims(tabIds);
+      if (ungroupIds.length > 0 && chrome.tabs && typeof chrome.tabs.ungroup === "function") {
+        try {
+          await chrome.tabs.ungroup(ungroupIds);
+        } catch (_) {}
+      }
+      const pruneIds = [...tabIds];
+      if (liveTabIds) {
+        for (const tid of agentTabClaims.keys()) {
+          if (!liveTabIds.has(tid)) pruneIds.push(tid);
+        }
+      }
+      await releaseTabClaims(pruneIds);
       for (const [sid, tid] of sessionTabs) {
         if (targetIds.has(tid)) sessionTabs.delete(sid);
       }
@@ -1876,25 +2010,33 @@ async function handleRpc(msg) {
       const owned = [...agentTabClaims].filter(([, c]) => c.owner === owner);
       const blankIds = [];
       const deadIds = [];
+      const ungroupIds = [];
       for (const [tid, claim] of owned) {
         try {
           const t = await chrome.tabs.get(tid);
           if (claim.opened) {
             const u = String(t.url || t.pendingUrl || "");
             if (!u || u === "about:blank" || u.startsWith("chrome://newtab")) blankIds.push(tid);
+          } else if (await isAgentGroupId(t.groupId)) {
+            ungroupIds.push(tid);
           }
         } catch (_) {
           deadIds.push(tid);
         }
       }
       await Promise.allSettled(blankIds.map(tid => chrome.tabs.remove(tid)));
+      if (ungroupIds.length > 0 && chrome.tabs && typeof chrome.tabs.ungroup === "function") {
+        try {
+          await chrome.tabs.ungroup(ungroupIds);
+        } catch (_) {}
+      }
       const dropIds = new Set([...blankIds, ...deadIds]);
       let changed = false;
       for (const [tid, claim] of owned) {
-        if (dropIds.has(tid)) {
+        if (dropIds.has(tid) || !claim.opened) {
           changed = agentTabClaims.delete(tid) || changed;
         } else {
-          agentTabClaims.set(tid, { owner: "", opened: Boolean(claim.opened) });
+          agentTabClaims.set(tid, { owner: "", opened: true });
           changed = true;
         }
       }

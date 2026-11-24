@@ -2486,7 +2486,7 @@ setInterval(() => {{}}, 1000);
 const fs = require("fs");
 const state = {{
   tabs: [
-    {{ id: 501, windowId: 88, groupId: 12, active: true, title: "Hertz Vehicle Selection", url: "https://www.hertz.com/us/en/book/vehicles", status: "complete" }},
+    {{ id: 501, windowId: 88, groupId: 15, active: true, title: "Hertz Vehicle Selection", url: "https://www.hertz.com/us/en/book/vehicles", status: "complete" }},
     {{ id: 502, windowId: 88, groupId: -1, active: false, title: "Expedia Car Search", url: "https://www.expedia.ca/carsearch?locn=YYC", status: "complete" }},
     {{ id: 504, windowId: 88, groupId: 13, active: false, title: "Legacy Agent Tab", url: "https://example.com/legacy", status: "complete" }},
     {{ id: 505, windowId: 88, groupId: 14, active: false, title: "Old Antigravity Tab", url: "https://example.com/old-ag", status: "complete" }},
@@ -2504,6 +2504,8 @@ const state = {{
   updateCalls: [],
   createdUrls: [],
   removedIds: [],
+  ungroupedIds: [],
+  onCreated: [],
   onRemoved: [],
   runtimeInitEvals: 0,
   batchEvals: 0,
@@ -2522,6 +2524,7 @@ global.chrome = {{
       const id = state.nextTabId === 503 ? (state.nextTabId = 508, 503) : state.nextTabId++;
       const nt = {{ id, windowId: opts.windowId || 88, groupId: -1, active: false, title: "Avis", url: opts.url, status: "complete" }};
       state.tabs.push(nt);
+      for (const fn of state.onCreated) fn(nt);
       return nt;
     }},
     update: async (id, opts) => {{
@@ -2530,13 +2533,30 @@ global.chrome = {{
       if (f && opts.url) f.url = opts.url;
       return f || {{ id, windowId: 88, url: opts.url || "", status: "complete" }};
     }},
-    group: async () => 12,
+    group: async (opts) => {{
+      const gid = (opts && opts.groupId !== undefined) ? opts.groupId : 12;
+      const ids = Array.isArray(opts && opts.tabIds) ? opts.tabIds : ((opts && opts.tabIds !== undefined) ? [opts.tabIds] : []);
+      for (const tid of ids) {{
+        const f = state.tabs.find(t => t.id === tid);
+        if (f) f.groupId = gid;
+      }}
+      return gid;
+    }},
+    ungroup: async (tabIds) => {{
+      const ids = Array.isArray(tabIds) ? tabIds : [tabIds];
+      for (const tid of ids) {{
+        state.ungroupedIds.push(tid);
+        const f = state.tabs.find(t => t.id === tid);
+        if (f) f.groupId = -1;
+      }}
+    }},
     remove: async (id) => {{
       if (!state.tabs.some(t => t.id === id)) throw new Error("No tab with id: " + id);
       state.removedIds.push(id);
       state.tabs = state.tabs.filter(t => t.id !== id);
       for (const fn of state.onRemoved) fn(id);
     }},
+    onCreated: {{ addListener: (fn) => state.onCreated.push(fn) }},
     onUpdated: {{ addListener: () => {{}} }},
     onRemoved: {{ addListener: (fn) => state.onRemoved.push(fn) }},
   }},
@@ -2563,7 +2583,15 @@ global.chrome = {{
           const steps = payload.steps || [];
           const evalOuts = steps
             .filter(s => (s.op || s.action) === "eval")
-            .map(() => JSON.stringify(state));
+            .map(s => {{
+              if (JSON.stringify(s).includes("__spawn_child__")) {{
+                const child = {{ id: 509, windowId: 88, groupId: 12, openerTabId: 508, active: false, title: "Offer Popup", url: "https://example.com/popup-offer", status: "complete" }};
+                state.tabs.push(child);
+                for (const fn of state.onCreated) fn(child);
+                return "509";
+              }}
+              return JSON.stringify(state);
+            }});
           return {{
             result: {{
               value: {{
@@ -2615,9 +2643,12 @@ setInterval(() => {{}}, 1000);
 
             tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
             self.assertIn('@tab id=501', tabs_list)
-            self.assertIn('group="Agent"', tabs_list)
+            self.assertIn('group="Work"', tabs_list)
             self.assertIn("https://www.hertz.com/us/en/book/vehicles", tabs_list)
             self.assertNotIn("expedia.ca", tabs_list)
+            legacy_list = self.rt.execute({"code": 'return await cua.listTabs("legacy");'})
+            self.assertIn('@tab id=504', legacy_list)
+            self.assertIn('group="🤖 Agent"', legacy_list)
 
             # Attach via getTab("hertz.com") AND createBrowserTab({url: "hertz.com", reuseExisting: true})
             # Neither should clobber the deep /us/en/book/vehicles URL!
@@ -2670,24 +2701,34 @@ setInterval(() => {{}}, 1000);
                 self.rt.execute_for_client({"closeAgentTabs": True}, devin),
                 "# web agent tabs closed chrome=1 playwright=0",
             )
-            # Retired session leaves non-blank agent tab 508 open; closeAgentTabs(all=True) must still close 508 + legacy/unclaimed Agent group tabs 504 & 505,
-            # while preserving attached user tab 501, ungrouped tab 502, and user tab groups 506 ("Work") & 507 ("Gemini Notes").
+            # Retired session leaves non-blank agent tab 508 open; a target=_blank child tab 509 opened from 508 (and later attached via getTab)
+            # AND a legacy Agent-group tab 504 reattached via reuseExisting must all still close on closeAgentTabs(all=True),
+            # while attached user tab 501 (in "Work") and reused user tab 502 (moved into "Agent", then ungrouped back out) stay open.
             self.rt.execute_for_client(
-                {"code": 'await cua.createBrowserTab({mode: "chrome", url: "https://example.com/retired", reuseExisting: false});'},
+                {
+                    "code": (
+                        'const r1 = await cua.createBrowserTab({mode: "chrome", url: "https://example.com/retired", reuseExisting: false});\n'
+                        'await r1.eval("__spawn_child__").diff();\n'
+                        'await cua.getTab("popup-offer");\n'
+                        'await cua.createBrowserTab({mode: "chrome", url: "https://example.com/legacy", reuseExisting: true});\n'
+                        'await cua.createBrowserTab({mode: "chrome", url: "expedia.ca", reuseExisting: true});'
+                    )
+                },
                 devin,
             )
             devin_client = self.rt.browser.clients.by_short(adopted.split(":", 1)[0])
             self.rt.browser.retire_client(devin_client)
             pw_open = sum(1 for s in self.rt.browser._tabs.values() if not s.is_extension)
             close_out = self.rt.execute_for_client({"closeAgentTabs": True, "all": True}, codex)
-            self.assertEqual(close_out, f"# web agent tabs closed chrome=3 playwright={pw_open}")
+            self.assertEqual(close_out, f"# web agent tabs closed chrome=4 playwright={pw_open}")
             live_ctids = sorted(
                 getattr(s._raw_page, "chrome_tab_id", None) for s in self.rt.browser._tabs.values() if s.is_extension
             )
             self.assertEqual(live_ctids, [501], "attached user tab 501 must stay")
             after_state = json.loads(self.rt.execute({"code": 'return await cua.getTab("hertz.com").eval("__state__");'}))
-            self.assertEqual(sorted(after_state["removedIds"]), [503, 504, 505, 508])
+            self.assertEqual(sorted(after_state["removedIds"]), [503, 504, 505, 508, 509])
             self.assertEqual(sorted(t["id"] for t in after_state["tabs"]), [501, 502, 506, 507])
+            self.assertIn(502, after_state["ungroupedIds"], "reused user tab moved into Agent group must be ungrouped")
             # Tab 501 ran multiple executeBatch calls, yet runtimeInitEvals on tab 501 + tab 503 should be 2 total (1 per tab, not per batch!)
             self.assertEqual(harness_state["runtimeInitEvals"], 2)
             self.assertGreaterEqual(harness_state["batchEvals"], 4)
@@ -2798,6 +2839,88 @@ setInterval(() => {{}}, 1000);
             finally:
                 if saved_marker is not None:
                     marker.write_text(saved_marker, encoding="utf-8")
+
+    def test_csp_host_persistence_idle_debugger_detach_and_cold_reconnect_grace(self) -> None:
+        from fmu.browser_engine import BrowserEngine
+
+        bg_js = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        # 1. Verify strictCspHosts persistence & idle debugger detach directly in Node against background.js
+        node_script = f"""
+const detached = [];
+const stored = {{ fmuStrictCspHosts: ["x.com"] }};
+global.WebSocket = class {{ static OPEN = 1; constructor() {{ this.readyState = 3; }} close() {{}} }};
+global.chrome = {{
+  storage: {{
+    local: {{
+      async get(k) {{ return {{ [k]: stored[k] }}; }},
+      async set(o) {{ Object.assign(stored, o); }},
+    }},
+  }},
+  tabs: {{
+    onRemoved: {{ addListener() {{}} }},
+    onCreated: {{ addListener() {{}} }},
+    onUpdated: {{ addListener() {{}} }},
+  }},
+  debugger: {{
+    attach: async () => ({{}}),
+    sendCommand: async () => ({{}}),
+    detach: async (t) => {{ detached.push(t.tabId); }},
+    onDetach: {{ addListener() {{}} }},
+  }},
+  alarms: {{ create() {{}}, onAlarm: {{ addListener() {{}} }} }},
+  runtime: {{ onStartup: {{ addListener() {{}} }}, onInstalled: {{ addListener() {{}} }} }},
+}};
+{bg_js}
+(async () => {{
+  await loadStrictCspHosts();
+  if (!strictCspHosts.has("x.com")) throw new Error("failed to hydrate persisted CSP host");
+  await rememberStrictCspHost("github.com");
+  if (!Array.isArray(stored.fmuStrictCspHosts) || !stored.fmuStrictCspHosts.includes("github.com")) {{
+    throw new Error("failed to persist new CSP host");
+  }}
+  await ensureDebuggerAndFocusEmulation(101);
+  await ensureDebuggerAndFocusEmulation(102);
+  debuggerLastUsedAt.set(101, Date.now() - IDLE_DEBUGGER_DETACH_MS - 1000);
+  const count = await detachIdleDebuggers(Date.now(), IDLE_DEBUGGER_DETACH_MS);
+  console.log(JSON.stringify({{ count, detached, attached: Array.from(attachedDebuggers), hosts: stored.fmuStrictCspHosts }}));
+  process.exit(0);
+}})().catch(err => {{ console.error(err); process.exit(1); }});
+"""
+        out = subprocess.check_output(["node", "-e", node_script], text=True)
+        res = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["detached"], [101])
+        self.assertEqual(res["attached"], [102])
+        self.assertEqual(sorted(res["hosts"]), ["github.com", "x.com"])
+
+        # 2. Verify cold preferred-port daemon uses 1.8s reconnect grace, while warm/non-preferred stays fast (0.35s)
+        eng = BrowserEngine()
+        timeouts: list[float] = []
+
+        class _FakeBridge:
+            preferred_port = 19222
+            port = 19222
+            port_fallback_reason = ""
+            on_event = None
+
+            def ensure_preferred_port(self) -> None:
+                pass
+
+            def is_connected(self) -> bool:
+                return False
+
+            def wait_connected(self, timeout: float = 2.0) -> bool:
+                timeouts.append(timeout)
+                return False
+
+        eng._ext_bridge_inst = _FakeBridge()
+        with mock.patch.object(eng, "_find_chrome_devtools_ws", return_value=None):
+            with self.assertRaises(RuntimeError):
+                eng._should_use_extension_bridge("chrome", require_extension=True)
+            eng._init_mono -= 10.0
+            with self.assertRaises(RuntimeError):
+                eng._should_use_extension_bridge("chrome", require_extension=True)
+        self.assertEqual(timeouts, [1.8, 0.35])
 
     def test_resolve_caller_walks_to_harness_and_names_project_from_workspace_cwd(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fmu-harness-") as tmp:

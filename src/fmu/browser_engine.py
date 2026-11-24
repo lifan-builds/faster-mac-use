@@ -4614,7 +4614,11 @@ class BrowserEngine:
         )
         if must_use_ext:
             if not self._ext_bridge.is_connected():
-                self._ext_bridge.wait_connected(timeout=0.35)
+                cold_preferred = (
+                    self._ext_bridge.port == self._ext_bridge.preferred_port
+                    and (time.monotonic() - self._init_mono) < 5.0
+                )
+                self._ext_bridge.wait_connected(timeout=1.8 if cold_preferred else 0.35)
             if not self._ext_bridge.is_connected():
                 raise RuntimeError(self._extension_diagnostic_error())
             return True
@@ -4728,7 +4732,7 @@ class BrowserEngine:
                     rpc_params["reuseExisting"] = True
                 if reattach:
                     rpc_params["reattach"] = True
-                ext_res = self._ext_bridge.call_rpc("createBrowserTab", rpc_params)
+                ext_res = self._ext_bridge.call_rpc("createBrowserTab", rpc_params, timeout=15.0)
                 ext_chrome_tid = int(ext_res.get("tabId", chrome_tab_id or 1))
                 chrome_win_id = ext_res.get("windowId")
                 actual_url = str(ext_res.get("url") or effective_url)

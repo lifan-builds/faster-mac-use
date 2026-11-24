@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.2 (2026-11-23)
+
+### Fixed
+- Agent-spawned child tabs (`target="_blank"` / `window.open`) now inherit `opened: true` via `chrome.tabs.onCreated`, and reattaching to pre-existing unclaimed tabs inside Agent tab groups no longer downgrades them to `opened: false`, so "Close All Agent-Opened Chrome Tabs" closes them reliably.
+- `retireOwner` and `closeAgentTabs` now drop non-opened claims on retirement, close legacy unowned Agent-group tabs, ungroup preserved user tabs out of closing Agent groups, and prune dead tab IDs from `fmuAgentTabClaims`.
+- Persisted `fmuStrictCspHosts` in `chrome.storage.local` to eliminate cold strict-CSP eval retries across MV3 service-worker restarts.
+- Auto-detached idle non-screencast CDP debuggers after 5 minutes on the `fmu-keepalive` alarm to avoid lingering Chrome debugger overhead.
+- Extended the cold-boot preferred-port extension reconnect grace window to `1.8s` (while keeping warm/fallback fast-fail at `0.35s`) and increased `createBrowserTab` RPC timeout to `15.0s`.
+
 ## 0.5.1 (2026-11-22)
 
 ### Fixed

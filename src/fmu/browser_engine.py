@@ -3983,13 +3983,18 @@ class _ExtensionPageAdapter:
             {"tabId": self.chrome_tab_id, "expression": expr_str, "arg": arg},
         )
 
-    def close(self) -> None:
+    def close(self, *, force: bool = False) -> dict[str, Any]:
         if not self._closed:
             self._closed = True
             try:
-                self._bridge.call_rpc("closeTab", {"tabId": self.chrome_tab_id}, timeout=2.0)
+                params: dict[str, Any] = {"tabId": self.chrome_tab_id}
+                if force:
+                    params["force"] = True
+                res = self._bridge.call_rpc("closeTab", params, timeout=2.0)
+                return res if isinstance(res, dict) else {"closed": True}
             except _BROWSER_OPS_ERRORS:
                 pass
+        return {"closed": False}
 
 
 class _ThreadProxy:
@@ -4890,15 +4895,34 @@ class BrowserEngine:
     def _browser(self, val: Any) -> None:
         self._raw_browser = val
 
+    _AUTO_GROUP_SUB_RE = re.compile(r"^(?:cua-[0-9a-f]{6,}|agent-\d+)$")
+
+    @classmethod
+    def _group_sub_label(cls, sub: str) -> str:
+        parts = [p for p in str(sub or "").split(".") if p and not cls._AUTO_GROUP_SUB_RE.fullmatch(p)]
+        return ".".join(parts)
+
     def group_title(self, agent_id: str) -> str:
         client, sub = self.clients.lookup(agent_id)
         if client is None:
             return "Agent" if agent_id == "default" else f"Agent {agent_id}"
-        return f"{client.label} · {sub}" if sub else client.label
+        clean_sub = self._group_sub_label(sub)
+        return f"{client.label} · {clean_sub}" if clean_sub else client.label
 
     def owner_for(self, scoped_id: str | None) -> str:
         client, _ = self.clients.lookup(scoped_id)
         return client.owner if client is not None else ""
+
+    def agent_tag_for(self, scoped_id: str | None) -> str:
+        scope = str(scoped_id or "").split(":", 1)[0]
+        client, sub = self.clients.lookup(scope)
+        if client is not None:
+            return sub
+        return "" if scope in ("", "default") else scope
+
+    @staticmethod
+    def _tag_matches(candidate: str, target_tag: str) -> bool:
+        return bool(candidate and target_tag and (candidate == target_tag or candidate.startswith(f"{target_tag}.")))
 
     def in_scope(self, tab_id: str, scope: str | None) -> bool:
         """True when `tab_id` belongs to the caller's session scope (unscoped callers see every tab)."""
@@ -5244,6 +5268,7 @@ class BrowserEngine:
                     "sessionName": session_name,
                     "color": group_color,
                     "owner": self.owner_for(tid),
+                    "agent": self.agent_tag_for(tid),
                     "skipPreview": not _preview_enabled(),
                 }
                 if window:
@@ -5423,6 +5448,9 @@ class BrowserEngine:
         owner = self.owner_for(scope or tab_id)
         if owner:
             rpc_params["owner"] = owner
+        agent_tag = self.agent_tag_for(scope or tab_id)
+        if agent_tag:
+            rpc_params["agent"] = agent_tag
 
         try:
             ext_res = self._ext_bridge.call_rpc("getTab", rpc_params, timeout=4.0)
@@ -5761,26 +5789,97 @@ class BrowserEngine:
             self._tabs.pop(tid, None)
         return self._create_tab_inner(self._tab_last_urls.get(tab_id or "t1", "about:blank"), tab_id=tab_id)
 
-    def close_tab(self, tab_id: str) -> str:
-        return self._run_sync(lambda: self._close_tab_inner(tab_id))
+    def close_tab(self, tab_id: str, *, force: bool = False) -> str:
+        return self._run_sync(lambda: self._close_tab_inner(tab_id, force=force))
 
-    def _close_tab_inner(self, tab_id: str) -> str:
+    def _close_tab_inner(self, tab_id: str, *, force: bool = False) -> str:
         self._cancel_pending_preview()
         sess = self._tabs.pop(tab_id, None)
         self._tab_last_urls.pop(tab_id, None)
         self._tab_last_titles.pop(tab_id, None)
         if sess is not None:
             try:
-                sess._raw_page.close()
+                if sess.is_extension:
+                    res = sess._raw_page.close(force=force)
+                    if isinstance(res, dict) and res.get("keptUserTab"):
+                        return f"# web tab={tab_id} detached (kept user-opened tab)"
+                else:
+                    sess._raw_page.close()
             except _BROWSER_OPS_ERRORS:
                 pass
         return f"# web tab={tab_id} closed"
 
-    def close_agent_tabs(self, scope: str | None = None) -> str:
-        return self._run_sync(lambda: self._close_agent_tabs_inner(scope))
+    def close_chrome_tab(self, chrome_tab_id: int, *, force: bool = False) -> str:
+        return self._run_sync(lambda: self._close_chrome_tab_inner(chrome_tab_id, force=force))
 
-    def _close_agent_tabs_inner(self, scope: str | None = None) -> str:
+    def _close_chrome_tab_inner(self, chrome_tab_id: int, *, force: bool = False) -> str:
         self._cancel_pending_preview()
+        for tid, sess in list(self._tabs.items()):
+            if sess.is_extension and getattr(sess._raw_page, "chrome_tab_id", None) == int(chrome_tab_id):
+                return self._close_tab_inner(tid, force=force)
+        if self._ext_bridge_inst is not None:
+            if not self._ext_bridge.is_connected():
+                self._ext_bridge.wait_connected(timeout=2.0)
+            if self._ext_bridge.is_connected():
+                params: dict[str, Any] = {"tabId": int(chrome_tab_id)}
+                if force:
+                    params["force"] = True
+                res = self._ext_bridge.call_rpc("closeTab", params, timeout=4.0)
+                if isinstance(res, dict) and res.get("keptUserTab"):
+                    return f"# web tab={chrome_tab_id} detached (kept user-opened tab)"
+        return f"# web tab={chrome_tab_id} closed"
+
+    def close_agent_tabs(
+        self,
+        scope: str | None = None,
+        *,
+        agent_tag: str | None = None,
+        keep_chrome_ids: set[int] | None = None,
+        keep_tab_ids: set[str] | None = None,
+        only_chrome_ids: set[int] | None = None,
+        only_tab_ids: set[str] | None = None,
+    ) -> str:
+        return self._run_sync(
+            lambda: self._close_agent_tabs_inner(
+                scope,
+                agent_tag=agent_tag,
+                keep_chrome_ids=keep_chrome_ids,
+                keep_tab_ids=keep_tab_ids,
+                only_chrome_ids=only_chrome_ids,
+                only_tab_ids=only_tab_ids,
+            )
+        )
+
+    def _close_agent_tabs_inner(
+        self,
+        scope: str | None = None,
+        *,
+        agent_tag: str | None = None,
+        keep_chrome_ids: set[int] | None = None,
+        keep_tab_ids: set[str] | None = None,
+        only_chrome_ids: set[int] | None = None,
+        only_tab_ids: set[str] | None = None,
+    ) -> str:
+        self._cancel_pending_preview()
+        eff_keep_tabs = set(keep_tab_ids or set())
+        eff_keep_chrome = {int(c) for c in (keep_chrome_ids or set())}
+        for tid in eff_keep_tabs:
+            sess = self._tabs.get(tid)
+            if sess is not None and sess.is_extension:
+                ctid = getattr(sess._raw_page, "chrome_tab_id", None)
+                if ctid is not None:
+                    eff_keep_chrome.add(int(ctid))
+        eff_only_tabs = set(only_tab_ids) if only_tab_ids is not None else None
+        eff_only_chrome = {int(c) for c in only_chrome_ids} if only_chrome_ids is not None else None
+        if eff_only_tabs is not None:
+            if eff_only_chrome is None:
+                eff_only_chrome = set()
+            for tid in eff_only_tabs:
+                sess = self._tabs.get(tid)
+                if sess is not None and sess.is_extension:
+                    ctid = getattr(sess._raw_page, "chrome_tab_id", None)
+                    if ctid is not None:
+                        eff_only_chrome.add(int(ctid))
         closed_chrome_ids: set[int] = set()
         closed_chrome = 0
         if self._ext_bridge_inst is not None:
@@ -5793,7 +5892,15 @@ class BrowserEngine:
                     params["owner"] = client.owner
                     params["groupTitle"] = client.label
                 elif scope:
-                    params["owner"] = self.owner_for(scope)
+                    owner_val = self.owner_for(scope)
+                    if owner_val:
+                        params["owner"] = owner_val
+                if agent_tag:
+                    params["agent"] = str(agent_tag)
+                if eff_keep_chrome:
+                    params["keepTabIds"] = sorted(eff_keep_chrome)
+                if eff_only_chrome is not None:
+                    params["tabIds"] = sorted(eff_only_chrome)
                 res = self._ext_bridge.call_rpc("closeAgentTabs", params, timeout=10.0)
                 closed_chrome_ids = {int(t) for t in res.get("tabIds") or []}
                 closed_chrome = int(res.get("closedCount") or 0)
@@ -5804,7 +5911,13 @@ class BrowserEngine:
                     continue
                 sess._raw_page._closed = True
             else:
-                if not self.in_scope(tid, scope):
+                if tid in eff_keep_tabs:
+                    continue
+                if eff_only_tabs is not None and tid not in eff_only_tabs:
+                    continue
+                if scope and not self.in_scope(tid, scope):
+                    continue
+                if agent_tag and not self._tag_matches(self.agent_tag_for(tid), str(agent_tag)):
                     continue
                 try:
                     sess._raw_page.close()

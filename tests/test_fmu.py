@@ -5135,6 +5135,223 @@ class TestReplTabErgonomics(unittest.TestCase):
         esc = res["escalations"][0]
         self.assertTrue(esc.get("cached"))
 
+    def test_close_my_tabs_user_tab_guard_agent_tag_and_group_consolidation(self) -> None:
+        """tab.close() keeps user tabs, closeMyTabs({keep}) and post-retire agentTag stay scoped, and parallel groups consolidate."""
+        from fmu.sessions import CallerIdentity, proc_info
+
+        rt = FasterMacUseRuntime()
+        bridge = rt.browser.ensure_bridge()
+        bg_js = (Path(__file__).resolve().parents[1] / "extension" / "background.js").read_text(encoding="utf-8")
+        bg_js_patched = bg_js.replace("ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{bridge.port}/ext")
+
+        harness = f"""
+const state = {{
+  nextId: 610,
+  nextGroupId: 30,
+  tabs: [
+    {{ id: 601, windowId: 88, groupId: 10, active: true, title: "User Work", url: "https://user.example.com/work", status: "complete" }},
+    {{ id: 602, windowId: 88, groupId: 20, active: false, title: "Cart", url: "https://ebay.com/cart", status: "complete" }}
+  ],
+  groups: [
+    {{ id: 10, windowId: 88, title: "Work", collapsed: false }},
+    {{ id: 20, windowId: 88, title: "Antigravity · ebay-adidas-cashback", collapsed: false }}
+  ],
+  removedIds: [],
+  ungroupedIds: [],
+  storage: {{}},
+  onCreated: [],
+  onRemoved: []
+}};
+globalThis.chrome = {{
+  storage: {{
+    local: {{
+      get: async (k) => ({{ [k]: state.storage[k] }}),
+      set: async (obj) => {{ Object.assign(state.storage, obj); }}
+    }}
+  }},
+  tabs: {{
+    query: async (q) => state.tabs.filter(t => (!q || q.groupId === undefined || t.groupId === q.groupId)),
+    get: async (id) => {{
+      const f = state.tabs.find(t => t.id === id);
+      if (!f) throw new Error("No tab: " + id);
+      return f;
+    }},
+    create: async (opts) => {{
+      const id = state.nextId++;
+      const nt = {{ id, windowId: opts.windowId || 88, groupId: -1, active: false, title: opts.url, url: opts.url, status: "complete" }};
+      state.tabs.push(nt);
+      for (const fn of state.onCreated) fn(nt);
+      return nt;
+    }},
+    update: async (id, opts) => {{
+      const f = state.tabs.find(t => t.id === id);
+      if (f && opts.url) f.url = opts.url;
+      return f || {{ id, windowId: 88, url: opts.url || "", status: "complete" }};
+    }},
+    group: async (opts) => {{
+      let gid = (opts && opts.groupId !== undefined) ? opts.groupId : state.nextGroupId++;
+      if (!state.groups.some(g => g.id === gid)) {{
+        state.groups.push({{ id: gid, windowId: 88, title: "", collapsed: false }});
+      }}
+      const ids = Array.isArray(opts && opts.tabIds) ? opts.tabIds : [opts.tabIds];
+      for (const tid of ids) {{
+        const f = state.tabs.find(t => t.id === tid);
+        if (f) f.groupId = gid;
+      }}
+      return gid;
+    }},
+    ungroup: async (tabIds) => {{
+      const ids = Array.isArray(tabIds) ? tabIds : [tabIds];
+      for (const tid of ids) {{
+        state.ungroupedIds.push(tid);
+        const f = state.tabs.find(t => t.id === tid);
+        if (f) f.groupId = -1;
+      }}
+    }},
+    remove: async (id) => {{
+      if (!state.tabs.some(t => t.id === id)) throw new Error("No tab: " + id);
+      state.removedIds.push(id);
+      state.tabs = state.tabs.filter(t => t.id !== id);
+      for (const fn of state.onRemoved) fn(id);
+    }},
+    onCreated: {{ addListener: (fn) => state.onCreated.push(fn) }},
+    onUpdated: {{ addListener: () => {{}} }},
+    onRemoved: {{ addListener: (fn) => state.onRemoved.push(fn) }}
+  }},
+  tabGroups: {{
+    get: async (gid) => state.groups.find(g => g.id === gid) || {{ id: gid, windowId: 88, title: "" }},
+    query: async (q) => state.groups.filter(g => (!q || q.title === undefined || g.title === q.title) && (!q || q.windowId === undefined || g.windowId === q.windowId)),
+    update: async (gid, opts) => {{
+      const g = state.groups.find(x => x.id === gid);
+      if (g && opts) Object.assign(g, opts);
+      return g || {{ id: gid, windowId: 88 }};
+    }}
+  }},
+  windows: {{ getAll: async () => [{{ id: 88, focused: false }}] }},
+  debugger: {{
+    attach: async () => ({{}}),
+    detach: async () => ({{}}),
+    sendCommand: async (_target, method, params) => {{
+      if (method === "Runtime.evaluate") {{
+        const expr = String((params && params.expression) || "");
+        if (expr.includes("FMU_RUNTIME_VERSION")) return {{ result: {{ value: true }} }};
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          return {{
+            result: {{
+              value: {{
+                url: "https://example.com",
+                title: "Page",
+                vw: 1280,
+                vh: 800,
+                crc: "11111111",
+                seq: 1,
+                count: 1,
+                useDiff: false,
+                unchanged: false,
+                webMcpTools: [],
+                canvases: [],
+                errors: [],
+                evalOutputs: [JSON.stringify(state)],
+                rawEvalValues: [JSON.stringify(state)],
+                escalations: [],
+                lines: ['@u1 link "Ok"']
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: false }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }}
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }}
+}};
+{bg_js_patched}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(["node", "-e", harness], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(bridge.wait_connected(timeout=3.0))
+            start = proc_info(os.getpid()).start
+            unlabeled_agy = CallerIdentity("Antigravity", os.getpid(), start, None)
+            codex_worker = CallerIdentity("Codex", os.getpid(), start, "cashback")
+            other_codex = CallerIdentity("Codex", os.getpid(), start + 1, "cashback")
+
+            # 1. tab.close() on user-opened tab 601 detaches without removing it
+            user_close_out = rt.execute_for_client(
+                {"code": "const u = await cua.getTab(601); return u.close();"},
+                unlabeled_agy,
+            )
+            self.assertIn("kept user-opened tab", user_close_out)
+
+            # 2. Unlabeled "Antigravity" calling closeMyTabs() must NOT touch tab 602 in "Antigravity · ebay-adidas-cashback"
+            agy_out = rt.execute_for_client(
+                {
+                    "code": (
+                        'const t1 = await cua.createBrowserTab("chrome", "https://a.example.com");\n'
+                        'const t2 = await cua.createBrowserTab("chrome", "https://b.example.com");\n'
+                        "return cua.closeMyTabs({keep: [t2]});"
+                    )
+                },
+                unlabeled_agy,
+            )
+            self.assertEqual(agy_out, "# web agent tabs closed chrome=1 playwright=0")
+
+            # 3. Parallel sub-agents under a gpt-delegate cua-* worker consolidate into one group "Codex · cashback"
+            #    and post-retire closeAgentTabs(agentTag=...) closes ONLY that worker's tabs
+            rt.execute_for_client(
+                {
+                    "agent": "cua-deadbeef1234",
+                    "parallel": [
+                        {"url": "https://p1.example.com", "mode": "chrome"},
+                        {"url": "https://p2.example.com", "mode": "chrome"},
+                    ],
+                },
+                codex_worker,
+            )
+            rt.execute_for_client(
+                {"agent": "cua-other9999999", "url": "https://other.example.com", "mode": "chrome"},
+                other_codex,
+            )
+            codex_client = rt.browser.clients.client_for(codex_worker)
+            self.assertEqual(rt.browser.group_title(f"{codex_client.short_id}.cua-deadbeef1234.agent-1"), "Codex · cashback")
+            self.assertEqual(rt.browser.group_title(f"{codex_client.short_id}.cua-deadbeef1234.audit"), "Codex · cashback · audit")
+
+            # Simulate codex subprocess exiting and retiring before gpt-delegate invokes agentTag cleanup
+            rt.browser.retire_client(codex_client)
+            post_retire_close = rt.execute_for_client(
+                {"closeAgentTabs": True, "agentTag": "cua-deadbeef1234"},
+                unlabeled_agy,
+            )
+            self.assertEqual(post_retire_close, "# web agent tabs closed chrome=2 playwright=0")
+
+            # Inspect live Chrome mock state via user tab 601
+            st_raw = rt.execute({"code": 'const u = await cua.getTab(601); return await u.eval("1");'})
+            st = json.loads(st_raw)
+            remaining_urls = {t["url"] for t in st["tabs"]}
+            self.assertIn("https://user.example.com/work", remaining_urls)
+            self.assertIn("https://ebay.com/cart", remaining_urls)
+            self.assertIn("https://b.example.com", remaining_urls)
+            self.assertIn("https://other.example.com", remaining_urls)
+            self.assertNotIn("https://a.example.com", remaining_urls)
+            self.assertNotIn("https://p1.example.com", remaining_urls)
+            self.assertNotIn("https://p2.example.com", remaining_urls)
+            group_titles = [g["title"] for g in st["groups"] if g.get("title")]
+            self.assertFalse(any("cua-deadbeef1234" in t for t in group_titles), f"Expected consolidated group, got {group_titles}")
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
+            rt.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

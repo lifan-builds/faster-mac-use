@@ -89,6 +89,7 @@ def execute_via_daemon(
             "listTabs",
             "listExtensions",
             "closeAgentTabs",
+            "closeMyTabs",
             "agentSessions",
         )
     )

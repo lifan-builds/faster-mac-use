@@ -62,22 +62,23 @@ async function isAgentGroupId(groupId) {
   }
 }
 
-async function claimTab(tabId, owner, opened) {
+async function claimTab(tabId, owner, opened, agent = "") {
   await loadAgentTabClaims();
   const prev = agentTabClaims.get(tabId);
   agentTabClaims.set(tabId, {
     owner: owner || (prev ? prev.owner : ""),
-    opened: Boolean(opened || (prev && prev.opened))
+    opened: Boolean(opened || (prev && prev.opened)),
+    agent: agent || (prev && prev.agent) || ""
   });
   await saveAgentTabClaims();
 }
 
-async function bindSessionTab(sessionId, tabId, owner, prevGroupId = undefined) {
+async function bindSessionTab(sessionId, tabId, owner, prevGroupId = undefined, agent = "") {
   sessionTabs.set(sessionId, tabId);
   await loadAgentTabClaims();
   const prev = agentTabClaims.get(tabId);
   const inheritedOpened = !prev && (await isAgentGroupId(prevGroupId));
-  await claimTab(tabId, owner, inheritedOpened);
+  await claimTab(tabId, owner, inheritedOpened, agent);
 }
 
 async function foreignTabIds(owner) {
@@ -139,12 +140,15 @@ if (chrome.tabs && chrome.tabs.onCreated && typeof chrome.tabs.onCreated.addList
       if (agentTabClaims.has(tab.id)) return;
       const openerClaim = tab.openerTabId !== undefined ? agentTabClaims.get(tab.openerTabId) : null;
       let inheritedOwner = "";
+      let inheritedAgent = "";
       let shouldClaim = false;
       if (openerClaim && openerClaim.opened) {
         inheritedOwner = openerClaim.owner || "";
+        inheritedAgent = openerClaim.agent || "";
         shouldClaim = true;
       } else if (await isAgentGroupId(tab.groupId)) {
         inheritedOwner = (openerClaim && openerClaim.owner) || "";
+        inheritedAgent = (openerClaim && openerClaim.agent) || "";
         shouldClaim = true;
       } else if (!openerClaim && tab.openerTabId !== undefined && chrome.tabs && typeof chrome.tabs.get === "function") {
         try {
@@ -154,7 +158,7 @@ if (chrome.tabs && chrome.tabs.onCreated && typeof chrome.tabs.onCreated.addList
           }
         } catch (_) {}
       }
-      if (shouldClaim) await claimTab(tab.id, inheritedOwner, true);
+      if (shouldClaim) await claimTab(tab.id, inheritedOwner, true, inheritedAgent);
     })();
   });
 }
@@ -1646,7 +1650,8 @@ async function handleRpc(msg) {
         reattach = false,
         navigateIfReused = false,
         timeoutMs = 10000,
-        owner = ""
+        owner = "",
+        agent = ""
       } = params;
 
       const foreign = await foreignTabIds(owner);
@@ -1669,7 +1674,7 @@ async function handleRpc(msg) {
         const groupId = params.assignGroup === false
           ? directTab.groupId
           : await ensureAgentGroup(directTab.id, sessionName, color, directTab.windowId);
-        await bindSessionTab(sessionId, directTab.id, owner, prevGroupId);
+        await bindSessionTab(sessionId, directTab.id, owner, prevGroupId, agent);
         if (params.focusEmulation !== false) {
           try { await ensureDebuggerAndFocusEmulation(directTab.id); } catch (_) {}
         }
@@ -1722,7 +1727,7 @@ async function handleRpc(msg) {
         if (reattachedTab && reattachedTab.id !== undefined) {
           const prevGroupId = reattachedTab.groupId;
           const groupId = await ensureAgentGroup(reattachedTab.id, sessionName, color, reattachedTab.windowId);
-          await bindSessionTab(sessionId, reattachedTab.id, owner, prevGroupId);
+          await bindSessionTab(sessionId, reattachedTab.id, owner, prevGroupId, agent);
           if (params.focusEmulation !== false) {
             try { await ensureDebuggerAndFocusEmulation(reattachedTab.id); } catch (_) {}
           }
@@ -1768,7 +1773,7 @@ async function handleRpc(msg) {
             if (match && match.id !== undefined) {
               const prevGroupId = match.groupId;
               const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-              await bindSessionTab(sessionId, match.id, owner, prevGroupId);
+              await bindSessionTab(sessionId, match.id, owner, prevGroupId, agent);
               const curMatchUrl = String(match.url || match.pendingUrl || "");
               const alreadyMatchesUrl = !urlStr
                 || urlStr === "about:blank"
@@ -1830,7 +1835,7 @@ async function handleRpc(msg) {
         if (match && match.id !== undefined) {
           const prevGroupId = match.groupId;
           const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-          await bindSessionTab(sessionId, match.id, owner, prevGroupId);
+          await bindSessionTab(sessionId, match.id, owner, prevGroupId, agent);
           if (params.focusEmulation !== false) {
             try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
           }
@@ -1864,7 +1869,7 @@ async function handleRpc(msg) {
           if (match && match.id !== undefined) {
             const prevGroupId = match.groupId;
             const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
-            await bindSessionTab(sessionId, match.id, owner, prevGroupId);
+            await bindSessionTab(sessionId, match.id, owner, prevGroupId, agent);
             if (params.focusEmulation !== false) {
               try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
             }
@@ -1935,10 +1940,10 @@ async function handleRpc(msg) {
           throw err;
         }
       }
-      await claimTab(tab.id, owner, true);
+      await claimTab(tab.id, owner, true, agent);
       const effectiveWinId = tab.windowId !== undefined ? tab.windowId : targetWindowId;
       const groupId = await ensureAgentGroup(tab.id, sessionName, color, effectiveWinId);
-      await bindSessionTab(sessionId, tab.id, owner);
+      await bindSessionTab(sessionId, tab.id, owner, undefined, agent);
       if (params.focusEmulation !== false && params.skipPreview !== true) {
         startLiveScreencast(tab.id);
       }
@@ -2067,7 +2072,8 @@ async function handleRpc(msg) {
         tabId,
         chromeTabId,
         allowMissing = false,
-        owner = ""
+        owner = "",
+        agent = ""
       } = params;
       const foreign = await foreignTabIds(owner);
       const allTabs = ((chrome.tabs && typeof chrome.tabs.query === "function")
@@ -2127,7 +2133,7 @@ async function handleRpc(msg) {
         if (allowMissing) return { id, result: { found: false } };
         throw new Error(`No matching Chrome tab found for '${urlPattern || queryFilter || windowFilter || sessionName || sessionId}'`);
       }
-      await bindSessionTab(sessionId, match.id, owner, match.groupId);
+      await bindSessionTab(sessionId, match.id, owner, match.groupId, agent);
       if (params.assignGroup === true && sessionName) {
         try { await ensureAgentGroup(match.id, sessionName, params.color || "blue", match.windowId); } catch (_) {}
       }
@@ -2604,25 +2610,82 @@ async function handleRpc(msg) {
     }
     if (method === "closeTab") {
       clearPendingPreview();
-      const { tabId, sessionId } = params;
+      const { tabId, sessionId, force = false } = params;
       const targetId = tabId || (sessionId ? sessionTabs.get(sessionId) : undefined);
-      if (targetId) {
-        stopLiveScreencast(targetId);
-        try { await chrome.tabs.remove(targetId); } catch (_) {}
+      if (!targetId) {
+        if (sessionId) sessionTabs.delete(sessionId);
+        return { id, result: { closed: false } };
+      }
+      await loadAgentTabClaims();
+      const claim = agentTabClaims.get(targetId);
+      let tabObj = null;
+      if (chrome.tabs && typeof chrome.tabs.get === "function") {
+        try { tabObj = await chrome.tabs.get(targetId); } catch (_) {}
+      }
+      let canClose = Boolean(force) || Boolean(claim && claim.opened);
+      if (!canClose && !claim && tabObj) {
+        canClose = await isAgentGroupId(tabObj.groupId);
+      }
+      stopLiveScreencast(targetId);
+      if (!canClose) {
+        let ungrouped = false;
+        if (tabObj && (await isAgentGroupId(tabObj.groupId)) && chrome.tabs && typeof chrome.tabs.ungroup === "function") {
+          try {
+            await chrome.tabs.ungroup([targetId]);
+            ungrouped = true;
+          } catch (_) {}
+        }
+        if (attachedDebuggers.has(targetId) && chrome.debugger && typeof chrome.debugger.detach === "function") {
+          try { await chrome.debugger.detach({ tabId: targetId }); } catch (_) {}
+        }
         attachedDebuggers.delete(targetId);
         debuggerLastUsedAt.delete(targetId);
+        verifiedRendererTabs.delete(targetId);
         initializedRuntimeTabs.delete(targetId);
+        await releaseTabClaims([targetId]);
+        if (sessionId) sessionTabs.delete(sessionId);
+        for (const [sid, tid] of sessionTabs) {
+          if (tid === targetId) sessionTabs.delete(sid);
+        }
+        return { id, result: { closed: false, keptUserTab: true, ungrouped } };
       }
+      try { await chrome.tabs.remove(targetId); } catch (_) {}
+      attachedDebuggers.delete(targetId);
+      debuggerLastUsedAt.delete(targetId);
+      verifiedRendererTabs.delete(targetId);
+      initializedRuntimeTabs.delete(targetId);
+      await releaseTabClaims([targetId]);
       if (sessionId) sessionTabs.delete(sessionId);
-      return { id, result: { closed: Boolean(targetId) } };
+      for (const [sid, tid] of sessionTabs) {
+        if (tid === targetId) sessionTabs.delete(sid);
+      }
+      return { id, result: { closed: true } };
     }
     if (method === "closeAgentTabs") {
       clearPendingPreview();
-      const { owner = "", groupTitle = "" } = params;
+      const { owner = "", groupTitle = "", agent = "", keepTabIds = [], tabIds: explicitTabIds = null } = params;
       await loadAgentTabClaims();
+      const keepSet = new Set(
+        (Array.isArray(keepTabIds) ? keepTabIds : [])
+          .map(v => Number(v))
+          .filter(v => !Number.isNaN(v))
+      );
+      const explicitSet = Array.isArray(explicitTabIds)
+        ? new Set(explicitTabIds.map(v => Number(v)).filter(v => !Number.isNaN(v)))
+        : null;
+      const matchesAgent = (claimAgent) => Boolean(
+        agent && claimAgent && (claimAgent === agent || claimAgent.startsWith(`${agent}.`))
+      );
       const targetIds = new Set(
         [...agentTabClaims]
-          .filter(([, c]) => c.opened && (!owner || c.owner === owner))
+          .filter(([, c]) => {
+            if (!c.opened) return false;
+            if (agent) {
+              if (!matchesAgent(c.agent)) return false;
+              return !owner || !c.owner || c.owner === owner;
+            }
+            return !owner || c.owner === owner;
+          })
           .map(([tabId]) => tabId)
       );
       const ungroupIds = [];
@@ -2631,14 +2694,23 @@ async function handleRpc(msg) {
         try {
           const allTabs = (await chrome.tabs.query({})) || [];
           liveTabIds = new Set(allTabs.filter(t => t && t.id !== undefined).map(t => t.id));
-          if (chrome.tabGroups && typeof chrome.tabGroups.query === "function") {
+          if (agent) {
+            for (const t of allTabs) {
+              if (!t || t.id === undefined) continue;
+              const claim = agentTabClaims.get(t.id);
+              if (claim && !claim.opened && matchesAgent(claim.agent) && (!owner || !claim.owner || claim.owner === owner)) {
+                if (await isAgentGroupId(t.groupId)) ungroupIds.push(t.id);
+              }
+            }
+          } else if (chrome.tabGroups && typeof chrome.tabGroups.query === "function") {
             const allGroups = (await chrome.tabGroups.query({})) || [];
+            const allowSubgroups = Boolean(groupTitle && groupTitle.includes(" · "));
             const matchingGroupIds = new Set();
             for (const g of allGroups) {
               const title = String((g && g.title) || "").trim();
               if (!title) continue;
               const matches = owner
-                ? Boolean(groupTitle && (title === groupTitle || title.startsWith(`${groupTitle} · `)))
+                ? Boolean(groupTitle && (title === groupTitle || (allowSubgroups && title.startsWith(`${groupTitle} · `))))
                 : AGENT_GROUP_TITLE_RE.test(title);
               if (matches) matchingGroupIds.add(g.id);
             }
@@ -2660,17 +2732,30 @@ async function handleRpc(msg) {
           }
         } catch (_) {}
       }
+      if (explicitSet !== null) {
+        for (const tid of Array.from(targetIds)) {
+          if (!explicitSet.has(tid)) targetIds.delete(tid);
+        }
+      }
+      let keptCount = 0;
+      for (const tid of keepSet) {
+        if (targetIds.delete(tid)) keptCount += 1;
+      }
+      const filteredUngroupIds = ungroupIds.filter(tid => !keepSet.has(tid) && (explicitSet === null || explicitSet.has(tid)));
       const tabIds = [...targetIds];
       for (const tid of tabIds) {
         stopLiveScreencast(tid);
         attachedDebuggers.delete(tid);
         debuggerLastUsedAt.delete(tid);
+        verifiedRendererTabs.delete(tid);
         initializedRuntimeTabs.delete(tid);
       }
       const removals = await Promise.allSettled(tabIds.map(tid => chrome.tabs.remove(tid)));
-      if (ungroupIds.length > 0 && chrome.tabs && typeof chrome.tabs.ungroup === "function") {
+      let ungroupedCount = 0;
+      if (filteredUngroupIds.length > 0 && chrome.tabs && typeof chrome.tabs.ungroup === "function") {
         try {
-          await chrome.tabs.ungroup(ungroupIds);
+          await chrome.tabs.ungroup(filteredUngroupIds);
+          ungroupedCount = filteredUngroupIds.length;
         } catch (_) {}
       }
       const pruneIds = [...tabIds];
@@ -2683,8 +2768,16 @@ async function handleRpc(msg) {
       for (const [sid, tid] of sessionTabs) {
         if (targetIds.has(tid)) sessionTabs.delete(sid);
       }
-      if (!owner) sessionGroups.clear();
-      return { id, result: { tabIds, closedCount: removals.filter(r => r.status === "fulfilled").length } };
+      if (!owner && !agent && keepSet.size === 0 && explicitSet === null) sessionGroups.clear();
+      return {
+        id,
+        result: {
+          tabIds,
+          closedCount: removals.filter(r => r.status === "fulfilled").length,
+          keptCount,
+          ungroupedCount
+        }
+      };
     }
     if (method === "retireOwner") {
       const { owner, titles = [] } = params;
@@ -2718,7 +2811,7 @@ async function handleRpc(msg) {
         if (dropIds.has(tid) || !claim.opened) {
           changed = agentTabClaims.delete(tid) || changed;
         } else {
-          agentTabClaims.set(tid, { owner: "", opened: true });
+          agentTabClaims.set(tid, { owner: "", opened: true, agent: claim.agent || "" });
           changed = true;
         }
       }

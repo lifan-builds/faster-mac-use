@@ -809,13 +809,18 @@ class TabHandle:
         self._pending_steps.append({"op": "click", "uid": str(target), "files": files})
         return self
 
-    def close(self) -> str:
+    def close(self, options: dict[str, Any] | bool | None = None, *, force: bool = False) -> str:
         self._fresh = False
         self._pending_steps.clear()
         self._pending_macros.clear()
+        eff_force = bool(force)
+        if isinstance(options, dict):
+            eff_force = bool(eff_force or options.get("force"))
+        elif isinstance(options, bool):
+            eff_force = bool(eff_force or options)
         sess = self.runtime._get_agent_session(self.agent_id)
         sess.cua.handles.pop(self.tab_id, None)
-        return self.runtime.browser.close_tab(self.tab_id)
+        return self.runtime.browser.close_tab(self.tab_id, force=eff_force)
 
     def diff(self) -> str:
         return self.flush(diff=True)
@@ -1586,6 +1591,124 @@ class CuaNamespace:
 
     def resume(self) -> str:
         return clear_user_stop(socket_path=self.runtime.mac.socket_path)
+
+    def _resolve_tab_refs(self, raw: Any) -> tuple[set[int], set[str]]:
+        chrome_ids: set[int] = set()
+        tab_ids: set[str] = set()
+        if raw is None:
+            return chrome_ids, tab_ids
+        items = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, TabHandle):
+                tab_ids.add(item.tab_id)
+                cid = item.id
+                if isinstance(cid, int) and not isinstance(cid, bool):
+                    chrome_ids.add(cid)
+            elif isinstance(item, int) and not isinstance(item, bool):
+                chrome_ids.add(item)
+            else:
+                s = str(item).strip()
+                if not s:
+                    continue
+                if s.isdigit():
+                    chrome_ids.add(int(s))
+                else:
+                    found = self._lookup_handle_by_id(s)
+                    if found is not None:
+                        tab_ids.add(found.tab_id)
+                        cid = found.id
+                        if isinstance(cid, int) and not isinstance(cid, bool):
+                            chrome_ids.add(cid)
+                    else:
+                        tab_ids.add(s)
+                        if ":" not in s and self.agent_id != "default":
+                            tab_ids.add(f"{self.agent_id}:{s}")
+        return chrome_ids, tab_ids
+
+    @staticmethod
+    def _sub_agent_close_tag(sub: str) -> str | None:
+        if not sub or re.fullmatch(r"agent-\d+", sub):
+            return None
+        first = sub.split(".", 1)[0]
+        if first.startswith("cua-"):
+            return first
+        return sub
+
+    def closeTab(
+        self,
+        target: TabHandle | int | str,
+        options: dict[str, Any] | bool | None = None,
+        *,
+        force: bool = False,
+    ) -> str:
+        eff_force = bool(force)
+        if isinstance(options, dict):
+            eff_force = bool(eff_force or options.get("force"))
+        elif isinstance(options, bool):
+            eff_force = bool(eff_force or options)
+        if isinstance(target, TabHandle):
+            return target.close(force=eff_force)
+        if isinstance(target, int) and not isinstance(target, bool):
+            out = self.runtime.browser.close_chrome_tab(target, force=eff_force)
+            self.runtime._prune_closed_tab_handles()
+            return out
+        s = str(target or "").strip()
+        if s.isdigit():
+            out = self.runtime.browser.close_chrome_tab(int(s), force=eff_force)
+            self.runtime._prune_closed_tab_handles()
+            return out
+        found = self._lookup_handle_by_id(s)
+        if found is not None:
+            return found.close(force=eff_force)
+        out = self.runtime.browser.close_tab(s, force=eff_force)
+        self.runtime._prune_closed_tab_handles()
+        return out
+
+    close_tab = closeTab
+
+    def closeMyTabs(self, options: dict[str, Any] | list[Any] | None = None, **kwargs: Any) -> str:
+        opts: dict[str, Any] = {}
+        if isinstance(options, dict):
+            opts.update(options)
+        elif options is not None:
+            opts["keep"] = options
+        if kwargs:
+            opts.update(kwargs)
+        keep_chrome, keep_tabs = self._resolve_tab_refs(opts.get("keep"))
+        only_chrome: set[int] | None = None
+        only_tabs: set[str] | None = None
+        if opts.get("tabs") is not None:
+            only_chrome, only_tabs = self._resolve_tab_refs(opts.get("tabs"))
+        if opts.get("all"):
+            scope: str | None = None
+            agent_tag: str | None = None
+        else:
+            client, sub = self.runtime.browser.clients.lookup(self.agent_id)
+            if client is not None:
+                scope = client.short_id
+                agent_tag = self._sub_agent_close_tag(sub)
+            elif self.agent_id != "default":
+                scope = self.agent_id
+                agent_tag = self._sub_agent_close_tag(self.agent_id)
+            else:
+                scope = None
+                agent_tag = None
+        out = self.runtime.browser.close_agent_tabs(
+            scope=scope,
+            agent_tag=agent_tag,
+            keep_chrome_ids=keep_chrome or None,
+            keep_tab_ids=keep_tabs or None,
+            only_chrome_ids=only_chrome,
+            only_tab_ids=only_tabs,
+        )
+        self.runtime._prune_closed_tab_handles()
+        return out
+
+    close_my_tabs = closeMyTabs
+    closeAgentTabs = closeMyTabs
+    close_agent_tabs = closeMyTabs
 
     def getState(self) -> str:
         items = [f"{k}:{type(v).__name__}" for k, v in self.handles.items()]
@@ -3238,6 +3361,13 @@ class FasterMacUseRuntime:
         client = self.browser.clients.client_for(ident)
         return self.execute(self._scope_request(req, client.short_id))
 
+    def _prune_closed_tab_handles(self) -> None:
+        with self._global_lock:
+            for a_sess in self._agents.values():
+                for hid, h in list(a_sess.cua.handles.items()):
+                    if isinstance(h, TabHandle) and h.tab_id not in self.browser._tabs:
+                        a_sess.cua.handles.pop(hid, None)
+
     def _retire_client(self, client: AgentClient) -> None:
         with self._global_lock:
             for key in [k for k in self._agents if k == client.short_id or k.startswith(f"{client.short_id}.")]:
@@ -3257,11 +3387,16 @@ class FasterMacUseRuntime:
             if isinstance(tid, str) and tid and ":" not in tid and not tid.isdigit():
                 out[key] = f"{out['agent']}:{tid}"
         if isinstance(out.get("parallel"), list):
-            out["parallel"] = [
-                cls._scope_request({**t, "agent": t.get("agent") or t.get("cursor") or f"agent-{i + 1}"}, base)
-                for i, t in enumerate(out["parallel"])
-                if isinstance(t, dict)
-            ]
+            par_base = out["agent"]
+            sub_prefix = par_base[len(base) + 1 :] if par_base.startswith(f"{base}.") else ""
+            scoped_par: list[dict[str, Any]] = []
+            for i, t in enumerate(out["parallel"]):
+                if not isinstance(t, dict):
+                    continue
+                sub_raw = str(t.get("agent") or t.get("cursor") or "").strip()
+                item_base = base if (sub_prefix and (sub_raw == sub_prefix or sub_raw.startswith(f"{sub_prefix}."))) else par_base
+                scoped_par.append(cls._scope_request({**t, "agent": sub_raw or f"agent-{i + 1}"}, item_base))
+            out["parallel"] = scoped_par
         return out
 
     def execute(self, req: dict[str, Any]) -> str:
@@ -3315,23 +3450,53 @@ class FasterMacUseRuntime:
                 )
             return "\n".join(lines)
 
-        if req.get("closeAgentTabs"):
-            if req.get("all"):
+        if req.get("closeAgentTabs") or req.get("closeMyTabs"):
+            spec = req.get("closeMyTabs") if isinstance(req.get("closeMyTabs"), dict) else (
+                req.get("closeAgentTabs") if isinstance(req.get("closeAgentTabs"), dict) else {}
+            )
+            eff_all = bool(req.get("all") or spec.get("all"))
+            eff_owner = req.get("owner") or spec.get("owner")
+            eff_agent_tag_raw = req.get("agentTag") or spec.get("agentTag")
+            eff_keep = req.get("keep") if req.get("keep") is not None else spec.get("keep")
+            eff_tabs = req.get("tabs") if req.get("tabs") is not None else spec.get("tabs")
+            caller_agent = str(req.get("agent") or "default").strip() or "default"
+            helper_cua = self._get_agent_session(caller_agent).cua
+            keep_chrome, keep_tabs = helper_cua._resolve_tab_refs(eff_keep)
+            only_chrome: set[int] | None = None
+            only_tabs: set[str] | None = None
+            if eff_tabs is not None:
+                only_chrome, only_tabs = helper_cua._resolve_tab_refs(eff_tabs)
+            scope: str | None = None
+            agent_tag: str | None = None
+            if eff_all:
                 scope = None
-            elif req.get("owner"):
-                client, _ = self.browser.clients.lookup(str(req["owner"]))
+                agent_tag = None
+            elif eff_agent_tag_raw is not None:
+                agent_tag = str(eff_agent_tag_raw).strip()
+                if not agent_tag:
+                    return "# web agent tabs closed chrome=0 playwright=0"
+                scope = None
+            elif eff_owner:
+                client, sub = self.browser.clients.lookup(str(eff_owner))
                 if client is None:
                     return "# web agent tabs closed chrome=0 playwright=0"
                 scope = client.short_id
+                agent_tag = CuaNamespace._sub_agent_close_tag(sub)
             else:
-                client, _ = self.browser.clients.lookup(str(req.get("agent") or ""))
+                client, sub = self.browser.clients.lookup(str(req.get("agent") or ""))
                 scope = client.short_id if client is not None else None
-            out = self.browser.close_agent_tabs(scope=scope)
-            with self._global_lock:
-                for a_sess in self._agents.values():
-                    for hid, h in list(a_sess.cua.handles.items()):
-                        if isinstance(h, TabHandle) and h.tab_id not in self.browser._tabs:
-                            a_sess.cua.handles.pop(hid, None)
+                agent_tag = CuaNamespace._sub_agent_close_tag(sub) if client is not None else (
+                    CuaNamespace._sub_agent_close_tag(caller_agent) if caller_agent != "default" else None
+                )
+            out = self.browser.close_agent_tabs(
+                scope=scope,
+                agent_tag=agent_tag,
+                keep_chrome_ids=keep_chrome or None,
+                keep_tab_ids=keep_tabs or None,
+                only_chrome_ids=only_chrome,
+                only_tab_ids=only_tabs,
+            )
+            self._prune_closed_tab_handles()
             return out
 
         if req.get("listTabs") or isinstance(req.get("listTabs"), dict):
@@ -3519,7 +3684,8 @@ MCP_TOOL_SCHEMA = {
         "or `steps` batching and `+/~/-` UID diffs. Zero focus/cursor theft. "
         "Pass `code` (`tab=cua.createBrowserTab('chrome',url); tab.click('@u1').waitFor('Confirmed')`, `cua.listTabs()`, `tab.text()`, or `app=cua.getApp('Calculator'); app.click('@a6')`), "
         "`{app|url, steps, agent}`, or `{parallel:[...]}`. "
-        "Each agent session gets its own Chrome tab group; pass `sessionLabel` (task/project name) to title it."
+        "Each agent session gets its own Chrome tab group; pass `sessionLabel` (task/project name) to title it. "
+        "Call `cua.closeMyTabs({keep:[...]})` or `{closeMyTabs:true}` ONLY when the task is completely finished with no pending login, checkout, or follow-up (closes only tabs this session opened)."
     ),
     "inputSchema": {
         "type": "object",
@@ -3527,6 +3693,10 @@ MCP_TOOL_SCHEMA = {
             "code": {"type": "string"},
             "agent": {"type": "string"},
             "sessionLabel": {"type": "string"},
+            "closeMyTabs": {"type": ["boolean", "object"]},
+            "closeAgentTabs": {"type": ["boolean", "object"]},
+            "keep": {"type": "array", "items": {"type": ["integer", "string"]}},
+            "tabs": {"type": "array", "items": {"type": ["integer", "string"]}},
             "parallel": {"type": "array", "items": {"type": "object"}},
             "surface": {"type": "string", "enum": ["web", "browser", "app"]},
             "app": {"type": "string"},

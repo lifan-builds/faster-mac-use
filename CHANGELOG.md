@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4 (2026-11-24)
+
+### Fixed
+- **OOPIF sibling disambiguation & scroll-into-viewport**: Cross-origin `<iframe>` CDP input (`dispatchCdpInput` / `_dispatch_cdp_input`) now scrolls the target iframe (and scrollable ancestors) into the visible viewport and re-measures its clamped viewport rect via `window.__fmu.prepIframeTarget` before dispatching mouse coordinates, then runs a read-only `probe` pass using `frameIndex` (`window.top[k] === window`) and `document.hasFocus()` to pin the exact Chrome `frameId` (or Playwright `Frame`) for `focus_and_select`, clearing, and verification — eliminating sibling `actual_len=0` verification failures on multi-field hosted tokenizers such as VGS Collect (`js.verygoodvault.com`).
+- **Discarded / unresponsive tab fast-fail**: `executeBatch` and `evaluate` in `extension/background.js` now check `tab.discarded` / `tab.status === "unloaded"` and missing tabs upfront and run a bounded 3s debugger/renderer responsiveness probe (`verifiedRendererTabs`) when attaching or resuming idle tabs, failing immediately with an actionable error instead of hanging 18s per RPC attempt.
+- **Attach-only `cua.getTab(...)`**: `CuaNamespace.getTab` no longer passes `window=stripped` when `stripped` is a URL/domain and never silently falls back to `createBrowserTab(...)` on miss, raising a clear `RuntimeError` pointing to `cua.listTabs()` or `cua.createBrowserTab(...)` instead of spawning stray tabs.
+- **REPL ergonomics**: Support Python control-flow blocks, `TabHandle.id`, line-iterable `listTabs()`, and `sessionLabel` / `session_label` aliases.
+
 ## 0.5.3 (2026-11-23)
 
 ### Fixed

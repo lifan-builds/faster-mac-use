@@ -1101,7 +1101,9 @@ class CuaNamespace:
             )
             if sess is not None:
                 return self._bind_existing_session(sess)
-            return self.createBrowserTab({"chromeTabId": int(criteria), "reuseExisting": True})
+            raise RuntimeError(
+                f"Chrome tab {int(criteria)} not found; call cua.listTabs() to see active tabs or cua.createBrowserTab(...) to open a new tab"
+            )
 
         if kwargs:
             merged: dict[str, Any] = {}
@@ -1130,13 +1132,19 @@ class CuaNamespace:
                 )
                 if sess is not None:
                     return self._bind_existing_session(sess)
+                found_num_h = self._lookup_handle_by_id(stripped)
+                if found_num_h is not None:
+                    return found_num_h
+                raise RuntimeError(
+                    f"Chrome tab {int(stripped)} not found; call cua.listTabs() to see active tabs or cua.createBrowserTab(...) to open a new tab"
+                )
             found_h = self._lookup_handle_by_id(stripped)
             if found_h is not None:
                 return found_h
             # Never spawn an `about:blank` tab with window="<agent>:t1" when a handle ID doesn't exist
             if self._AGENT_TAB_ID_RE.fullmatch(stripped):
                 raise RuntimeError(
-                    f"Tab handle '{stripped}' not found; call cua.listTabs() to see active tabs"
+                    f"Tab handle '{stripped}' not found; call cua.listTabs() to see active tabs or cua.createBrowserTab(...) to open a new tab"
                 )
             needle = stripped.lower()
             ext_connected = self.runtime.browser.extension_connected
@@ -1155,26 +1163,27 @@ class CuaNamespace:
                             return h
                 return live_candidates[0]
 
-            # Check other agent sessions' live tabs before spawning a new tab
+            # Check other agent sessions' live tabs before attaching via MV3 bridge
             for b_tid, b_s in reversed(list(self.runtime.browser._tabs.items())):
                 if self._shares_session(b_tid) and self.runtime.browser._is_session_alive(b_s):
                     if needle in (b_s.last_url or "").lower() or needle in (b_s.last_title or "").lower():
                         if not ext_connected or b_s.is_extension:
                             return self._bind_existing_session(b_s)
 
-            # Attach to matching live Chrome tab via MV3 bridge without navigating/clobbering its URL
+            # Attach-only to matching live Chrome tab via MV3 bridge without navigating or spawning a new tab
+            is_url_or_domain = self._looks_like_url_or_domain(stripped)
             attached = self.runtime.browser.attach_existing_tab(
-                url_pattern=stripped,
-                window=stripped,
+                url_pattern=stripped if is_url_or_domain else None,
+                window=None if is_url_or_domain else stripped,
                 group_color=self.runtime.browser._get_agent_color(self.agent_id),
                 scope=self._session_scope,
             )
             if attached is not None:
                 return self._bind_existing_session(attached)
 
-            if self._looks_like_url_or_domain(stripped):
-                return self.createBrowserTab({"url": _normalize_nav_url(stripped), "reuseExisting": True})
-            return self.createBrowserTab({"window": stripped, "reuseExisting": True})
+            raise RuntimeError(
+                f"No matching tab found for '{stripped}'; call cua.listTabs() to see active tabs or cua.createBrowserTab(...) to open a new tab"
+            )
 
         if isinstance(criteria, dict):
             raw_ctid = (
@@ -1190,7 +1199,9 @@ class CuaNamespace:
                 )
                 if sess is not None:
                     return self._bind_existing_session(sess)
-                return self.createBrowserTab({**criteria, "chromeTabId": int(raw_ctid), "reuseExisting": True})
+                raise RuntimeError(
+                    f"Chrome tab {int(raw_ctid)} not found; call cua.listTabs() to see active tabs or cua.createBrowserTab(...) to open a new tab"
+                )
 
             tid = criteria.get("tabId") or criteria.get("tab_id") or criteria.get("session")
             if tid is not None:
@@ -1206,9 +1217,11 @@ class CuaNamespace:
                 found_h = self._lookup_handle_by_id(tid_str)
                 if found_h is not None:
                     return found_h
-                if self._AGENT_TAB_ID_RE.fullmatch(tid_str) and not criteria.get("url"):
+                if self._AGENT_TAB_ID_RE.fullmatch(tid_str) or not any(
+                    criteria.get(k) for k in ("url", "window", "windowId", "window_id", "sessionName", "session_name", "sessionLabel", "session_label", "group")
+                ):
                     raise RuntimeError(
-                        f"Tab handle '{tid_str}' not found; call cua.listTabs() to see active tabs"
+                        f"Tab handle '{tid_str}' not found; call cua.listTabs() to see active tabs or cua.createBrowserTab(...) to open a new tab"
                     )
 
             filter_keys = (
@@ -1300,7 +1313,33 @@ class CuaNamespace:
                 if matched_handles and not want_url and not want_win:
                     return matched_handles[0]
 
-                # Try non-destructive MV3 attach before creating/navigating a tab
+                # Also check live sessions in the same agent scope (e.g. opened via declarative execute())
+                for b_tid, b_s in reversed(list(self.runtime.browser._tabs.items())):
+                    if not (self._shares_session(b_tid) and self.runtime.browser._is_session_alive(b_s)):
+                        continue
+                    if want_session and str(getattr(b_s, "group_name", "") or "") != str(want_session):
+                        continue
+                    if want_mode == "headless" and b_s.is_extension:
+                        continue
+                    if want_mode == "extension" and not b_s.is_extension:
+                        continue
+                    b_win_id = getattr(b_s._raw_page, "window_id", None) if b_s.is_extension else None
+                    if want_win_id is not None and b_win_id != int(want_win_id):
+                        continue
+                    b_url = str(getattr(b_s, "last_url", "") or getattr(b_s._raw_page, "url", "") or "")
+                    b_title = str(getattr(b_s, "last_title", "") or "")
+                    if want_url and str(want_url) != "about:blank":
+                        u_needle = str(want_url).lower()
+                        u_stripped = re.sub(r"^[a-z]+://(www\.)?", "", u_needle).rstrip("/")
+                        if u_needle not in b_url.lower() and (not u_stripped or u_stripped not in b_url.lower()):
+                            continue
+                    if want_win:
+                        wl = str(want_win).lower()
+                        if wl not in b_url.lower() and wl not in b_title.lower():
+                            continue
+                    return self._bind_existing_session(b_s)
+
+                # Attach-only via MV3 bridge; never silently spawn a new tab on miss
                 if want_mode != "headless":
                     attached = self.runtime.browser.attach_existing_tab(
                         url_pattern=str(want_url) if want_url and str(want_url) != "about:blank" else None,
@@ -1313,12 +1352,9 @@ class CuaNamespace:
                     if attached is not None:
                         return self._bind_existing_session(attached)
 
-                opts = dict(criteria)
-                if opts.get("url") and str(opts["url"]) != "about:blank":
-                    opts["url"] = _normalize_nav_url(str(opts["url"]))
-                if "reuseExisting" not in opts and "reuse_existing" not in opts:
-                    opts["reuseExisting"] = True
-                return self.createBrowserTab(opts)
+                raise RuntimeError(
+                    f"No matching tab found for {criteria!r}; call cua.listTabs() to see active tabs or cua.createBrowserTab(...) to open a new tab"
+                )
 
         for h in reversed(list(self.handles.values())):
             if isinstance(h, TabHandle):
@@ -1330,6 +1366,14 @@ class CuaNamespace:
                 b_s = self.runtime.browser._tabs.get(h.tab_id)
                 if b_s is not None and self.runtime.browser._is_session_alive(b_s):
                     return h
+        for b_tid, b_s in reversed(list(self.runtime.browser._tabs.items())):
+            if self._shares_session(b_tid) and self.runtime.browser._is_session_alive(b_s):
+                b_url = str(getattr(b_s, "last_url", "") or getattr(b_s._raw_page, "url", "") or "")
+                if b_url and b_url != "about:blank":
+                    return self._bind_existing_session(b_s)
+        for b_tid, b_s in reversed(list(self.runtime.browser._tabs.items())):
+            if self._shares_session(b_tid) and self.runtime.browser._is_session_alive(b_s):
+                return self._bind_existing_session(b_s)
         if self.runtime.browser.extension_connected:
             attached = self.runtime.browser.attach_existing_tab(
                 group_color=self.runtime.browser._get_agent_color(self.agent_id),
@@ -1337,7 +1381,9 @@ class CuaNamespace:
             )
             if attached is not None:
                 return self._bind_existing_session(attached)
-        return self.createBrowserTab("chrome", "about:blank")
+        raise RuntimeError(
+            "No active tab found to attach; call cua.listTabs() to see open tabs or cua.createBrowserTab(...) to open a new tab"
+        )
 
     def getBridgeStatus(self) -> str:
         return self.runtime.browser.execute_batch({"bridgeStatus": True})

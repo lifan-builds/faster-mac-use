@@ -563,7 +563,7 @@ class TestFasterMacUse(unittest.TestCase):
 
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
-        self.assertIn("faster-mac-use 0.5.3", ver_proc.stdout)
+        self.assertIn("faster-mac-use 0.5.4", ver_proc.stdout)
         self.assertIn("Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
@@ -2664,7 +2664,7 @@ setInterval(() => {{}}, 1000);
         try:
             self.assertTrue(bridge.wait_connected(timeout=3.0))
             bridge_st = self.rt.execute({"bridgeStatus": True})
-            self.assertIn('version="0.5.3"', bridge_st)
+            self.assertIn('version="0.5.4"', bridge_st)
 
             tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
             self.assertIn('@tab id=501', tabs_list)
@@ -2785,10 +2785,17 @@ setInterval(() => {{}}, 1000);
             self.assertIn('tab=codex1:t1 group="Codex · quotaswitch"', c_out)
             self.assertNotEqual(rt.browser._get_agent_color("devin1"), rt.browser._get_agent_color("codex1"))
 
-            stolen = rt.execute_for_client(
-                {"code": f'const t = await cua.getTab({{url: "{orders}", mode: "headless"}}); return t.tab_id;'}, devin
+            with self.assertRaises(RuntimeError) as get_miss:
+                rt.execute_for_client(
+                    {"code": f'const t = await cua.getTab({{url: "{orders}", mode: "headless"}}); return t.tab_id;'}, devin
+                )
+            self.assertIn("cua.listTabs()", str(get_miss.exception))
+            self.assertIn("cua.createBrowserTab(", str(get_miss.exception))
+            created_devin = rt.execute_for_client(
+                {"code": f'const t = await cua.createBrowserTab({{url: "{orders}", mode: "headless", reuseExisting: true}}); return t.tab_id;'},
+                devin,
             )
-            self.assertTrue(stolen.startswith("devin1:"), f"Devin must not adopt Codex's tab, got {stolen}")
+            self.assertTrue(created_devin.startswith("devin1:"), f"Devin must not adopt Codex's tab, got {created_devin}")
             own = rt.execute_for_client(
                 {"code": f'const t = await cua.getTab({{url: "{orders}", mode: "headless"}}); return t.tab_id;'}, codex
             )
@@ -3917,6 +3924,36 @@ setInterval(() => {{}}, 1000);
                         "});"
                         "</script></body></html>"
                     )
+                elif self.path == "/vgs-field":
+                    body = (
+                        "<!doctype html><html><body style='margin:0'>"
+                        "<input type='text' style='width:180px;height:28px'>"
+                        "<script>"
+                        "const el = document.querySelector('input');"
+                        "let idx = -1;"
+                        "try { for (let k = 0; k < window.top.length; k++) { if (window.top[k] === window) { idx = k; break; } } } catch (_) {}"
+                        "el.addEventListener('input', (e) => {"
+                        "  window.parent.postMessage({field:'vgs-' + idx, val: el.value, trusted: Boolean(e.isTrusted)}, '*');"
+                        "});"
+                        "</script></body></html>"
+                    )
+                elif self.path == "/vgs-siblings":
+                    iframe_port = int(self.server.server_port_other)  # type: ignore[attr-defined]
+                    shared_src = f"http://127.0.0.1:{iframe_port}/vgs-field"
+                    body = (
+                        "<!doctype html><html><body style='margin:0'>"
+                        "<script>"
+                        "window.__vgsEvents = [];"
+                        "window.addEventListener('message', (ev) => { window.__vgsEvents.push(ev.data); });"
+                        "</script>"
+                        "<div id='drawer' style='width:420px;overflow-x:auto;border:1px solid #ccc'>"
+                        "<div style='display:flex;gap:12px;width:3600px;padding-left:2400px'>"
+                        f"<iframe title='card-number' src='{shared_src}' width='220' height='34'></iframe>"
+                        f"<iframe title='card-expiry' src='{shared_src}' width='140' height='34'></iframe>"
+                        f"<iframe title='card-cvv' src='{shared_src}' width='140' height='34'></iframe>"
+                        f"<iframe title='card-zip' src='{shared_src}' width='140' height='34'></iframe>"
+                        "</div></div></body></html>"
+                    )
                 else:
                     iframe_port = int(self.server.server_port_other)  # type: ignore[attr-defined]
                     body = (
@@ -4003,6 +4040,27 @@ setInterval(() => {{}}, 1000);
             ev_after = self.rt.browser.evaluate_value("return window.__events;", mode="headless")
             card_vals = [x.get("val") for x in (ev_after or []) if isinstance(x, dict) and x.get("field") == "card"]
             self.assertEqual(card_vals[-1], "")
+
+            # Multi-sibling identical-origin/identical-src OOPIFs (no name attr) inside a wide horizontally-scrolled drawer
+            vgs_url = f"http://127.0.0.1:{s1.server_port}/vgs-siblings"
+            vgs_fill_out = self.rt.execute(
+                {
+                    "code": (
+                        f'const vtab = await cua.createBrowserTab("headless", "{vgs_url}");\n'
+                        f'await vtab.fill("card-number", "{new_card}").fill("card-expiry", "09/31").fill("card-cvv", "7342").fill("card-zip", "94107");\n'
+                        "return vtab.tab_id;"
+                    )
+                }
+            )
+            self.assertNotIn("! errors:", vgs_fill_out)
+            vgs_tid = vgs_fill_out.splitlines()[-1].strip()
+            vgs_ev = self.rt.browser.evaluate_value("return window.__vgsEvents;", mode="headless", session=vgs_tid)
+            by_vgs = {str(x["field"]): x for x in (vgs_ev or []) if isinstance(x, dict) and x.get("field")}
+            self.assertEqual(by_vgs.get("vgs-0", {}).get("val"), new_card)
+            self.assertEqual(by_vgs.get("vgs-1", {}).get("val"), "09/31")
+            self.assertEqual(by_vgs.get("vgs-2", {}).get("val"), "7342")
+            self.assertEqual(by_vgs.get("vgs-3", {}).get("val"), "94107")
+            self.assertTrue(all(by_vgs[k].get("trusted") for k in ("vgs-0", "vgs-1", "vgs-2", "vgs-3")))
         finally:
             s1.shutdown()
             s2.shutdown()
@@ -4195,6 +4253,202 @@ setInterval(() => {{}}, 1000);
         self.assertIn("cvv=<redacted>", kv_sanitized)
         self.assertIn("password=<redacted>", kv_sanitized)
         self.assertIn("<redacted-card>", kv_sanitized)
+
+        # 4. MV3 identical-origin sibling OOPIF disambiguation + viewport scroll/re-measure + discarded tab fast-fail
+        self.rt.execute({"reset": True})
+        port2 = self.rt.browser.bridge_port
+        bg_js_src2 = (ROOT / "extension" / "background.js").read_text(encoding="utf-8").replace(
+            "ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{port2}/ext"
+        )
+        mv3_sibling_harness = f"""
+const siblingCalls = [];
+const mousePoints = [];
+const frameValues = {{ 10: "", 11: "", 12: "", 13: "" }};
+const tabsById = {{
+  910: {{ id: 910, windowId: 900, groupId: -1, title: "BILL Add Card", url: "https://app-signup.us.bill.com/neo/settings", status: "complete", discarded: false, active: false }},
+  563980592: {{ id: 563980592, windowId: 900, groupId: -1, title: "Rakuten Trips", url: "https://www.rakuten.com/shopping-trips.htm", status: "unloaded", discarded: true, active: false }},
+  911: {{ id: 911, windowId: 900, groupId: -1, title: "Hung Tab", url: "https://example.com/hung", status: "complete", discarded: false, active: false }},
+}};
+globalThis.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
+  extension: {{ isAllowedFileSchemeAccess: async () => false }},
+  tabs: {{
+    query: async () => Object.values(tabsById),
+    get: async (id) => tabsById[id],
+    create: async () => tabsById[910],
+    update: async (id) => tabsById[id],
+    group: async () => 91,
+    onRemoved: {{ addListener: () => {{}} }},
+    onUpdated: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{ query: async () => [], update: async (gid, opts) => ({{ id: gid, ...opts }}) }},
+  windows: {{ getAll: async () => [{{ id: 900, focused: false, type: "normal" }}] }},
+  scripting: {{
+    executeScript: async (opts) => {{
+      const arg = (opts && opts.args && opts.args[0]) || {{}};
+      const fIds = opts && opts.target && Array.isArray(opts.target.frameIds) ? opts.target.frameIds : [10, 11, 12, 13];
+      siblingCalls.push({{ action: arg.action, frameIds: fIds }});
+      const idxByFrame = {{ 10: 0, 11: 1, 12: 2, 13: 3 }};
+      // Simulate 4 sibling js.verygoodvault.com frames all scoring 100, with ONLY frameId=12 clicked/focused (frameIndex=2).
+      // Frame 10 sits earlier in frameResults with curLen=0 (unfocused), matching the production actual_len=0 failure mode.
+      return fIds.map((fid) => {{
+        const isTarget = fid === 12;
+        if (arg.action === "probe") {{
+          return {{ frameId: fid, result: {{ supported: true, matched: true, score: 100, frameIndex: idxByFrame[fid], hasFocus: isTarget, activeIsEditable: isTarget, curLen: frameValues[fid].length }} }};
+        }}
+        if (arg.action === "focus_and_select") {{
+          return {{ frameId: fid, result: {{ supported: true, matched: true, score: 100, frameIndex: idxByFrame[fid], hasFocus: true, activeIsEditable: true, curLen: frameValues[fid].length }} }};
+        }}
+        const actual = frameValues[fid] || "";
+        const normActual = actual.replace(/[\\s\\-/]+/g, "");
+        return {{
+          frameId: fid,
+          result: {{
+            supported: true,
+            matched: true,
+            score: 100,
+            frameIndex: idxByFrame[fid],
+            hasFocus: isTarget,
+            activeIsEditable: isTarget,
+            curLen: actual.length,
+            actualNormLen: normActual.length,
+            verified: normActual.length === arg.expectedNormLen && (arg.expectedNormLen === 0 || actual === "7342")
+          }}
+        }};
+      }});
+    }}
+  }},
+  debugger: {{
+    attach: async () => {{}},
+    sendCommand: async (target, method, params) => {{
+      if (target && target.tabId === 911 && method === "Runtime.evaluate" && String((params && params.expression) || "") === "1") {{
+        return await new Promise(() => {{}});
+      }}
+      if (method === "Input.dispatchMouseEvent" && params && params.type === "mousePressed") {{
+        mousePoints.push({{ x: params.x, y: params.y }});
+        return {{}};
+      }}
+      if (method === "Input.insertText") {{
+        frameValues[12] = String((params && params.text) || "");
+        return {{}};
+      }}
+      if (method === "Runtime.evaluate") {{
+        const expr = String((params && params.expression) || "");
+        if (expr.includes("prepIframeTarget")) {{
+          // Simulate scrolling drawer from (3489, 168) into visible viewport (320, 168)
+          return {{ result: {{ value: {{ inViewport: true, x: 320, y: 168, frameIndex: 2, frameSrc: "https://js.verygoodvault.com/v2/vgs.html", frameName: "", uid: "@u184" }} }} }};
+        }}
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const payload = JSON.parse(expr.slice("window.__fmu.executeBatch(".length, -1));
+          const steps = payload.steps || [];
+          if (payload.cdpClick && steps.length > 0 && steps[0].op === "fill") {{
+            return {{
+              result: {{
+                value: {{
+                  cdpInput: {{
+                    kind: "fill",
+                    x: 3489,
+                    y: 168,
+                    value: String(steps[0].value || ""),
+                    clear: true,
+                    frameSrc: "https://js.verygoodvault.com/v2/vgs.html",
+                    frameName: "",
+                    frameIndex: 2,
+                    uid: "@u184",
+                    label: "Security code"
+                  }},
+                  nextStepIndex: 1,
+                  url: tabsById[910].url,
+                  title: tabsById[910].title,
+                  errors: [],
+                  evalOutputs: [],
+                  rawEvalValues: [],
+                  escalations: [],
+                  timings: {{ execMs: 1, settleMs: 0, snapMs: 0, totalInPageMs: 1 }},
+                  lines: []
+                }}
+              }}
+            }};
+          }}
+          return {{
+            result: {{
+              value: {{
+                url: tabsById[910].url,
+                title: tabsById[910].title,
+                crc: "55667788",
+                seq: 2,
+                count: 1,
+                useDiff: true,
+                errors: [],
+                evalOutputs: [JSON.stringify({{ siblingCalls, mousePoints, frameValues }})],
+                rawEvalValues: [1],
+                escalations: [],
+                timings: {{ execMs: 1, settleMs: 1, snapMs: 1, totalInPageMs: 3 }},
+                lines: ['= @u184 iframe "Security code"']
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+    onEvent: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }},
+}};
+{bg_js_src2}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc2 = subprocess.Popen(
+            ["node", "-e", mv3_sibling_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(self.rt.browser.ensure_bridge().wait_connected(timeout=3.0))
+            sib_out = self.rt.execute(
+                {
+                    "chromeTabId": 910,
+                    "steps": [
+                        {"op": "fill", "uid": "@u184", "value": "7342"},
+                        {"op": "eval", "code": "return 1;"},
+                    ],
+                }
+            )
+            self.assertNotIn("! errors:", sib_out)
+            self.assertIn('"mousePoints":[{"x":320,"y":168}]', sib_out)
+            self.assertIn('{"action":"focus_and_select","frameIds":[12]}', sib_out)
+            self.assertIn('{"action":"verify","frameIds":[12]}', sib_out)
+            self.assertNotIn('{"action":"focus_and_select","frameIds":[10,11,12,13]}', sib_out)
+
+            t_disc0 = time.perf_counter()
+            with self.assertRaises(RuntimeError) as disc_ctx:
+                self.rt.execute({"code": "const dtab = await cua.getTab(563980592); return await dtab.snapshot();"})
+            disc_elapsed = time.perf_counter() - t_disc0
+            self.assertLess(disc_elapsed, 2.0)
+            self.assertIn("discarded/unloaded", str(disc_ctx.exception))
+            self.assertIn("563980592", str(disc_ctx.exception))
+
+            t_hung0 = time.perf_counter()
+            with self.assertRaises(RuntimeError) as hung_ctx:
+                self.rt.execute({"code": "const htab = await cua.getTab(911); return await htab.snapshot();"})
+            hung_elapsed = time.perf_counter() - t_hung0
+            self.assertLess(hung_elapsed, 6.0)
+            self.assertIn("unresponsive", str(hung_ctx.exception))
+        finally:
+            node_proc2.terminate()
+            try:
+                node_proc2.wait(timeout=2.0)
+            except Exception:
+                node_proc2.kill()
+            if node_proc2.stdout:
+                node_proc2.stdout.close()
+            if node_proc2.stderr:
+                node_proc2.stderr.close()
 
 
 class TestTraceReplay(unittest.TestCase):
@@ -4531,9 +4785,25 @@ class TestReplTabErgonomics(unittest.TestCase):
             rt.cua.listTabs(sessionLabel="Billing Flow")
             self.assertEqual(rt.browser.list_tabs.call_args.kwargs["session_name"], "Billing Flow")
 
+            mock_sess = mock.Mock()
+            mock_sess.tab_id = "t9"
+            mock_sess.is_extension = True
+            mock_sess.group_name = "Billing Flow"
+            mock_sess._raw_page = mock.Mock(chrome_tab_id=509, window_id=88)
+            rt.browser.attach_existing_tab.return_value = mock_sess
             h3 = rt.cua.getTab(sessionLabel="Billing Flow")
             self.assertEqual(rt.browser.attach_existing_tab.call_args.kwargs["session_name"], "Billing Flow")
             self.assertEqual(h3.session_name, "Billing Flow")
+
+            # Attach-only getTab("accounts.bill.com"): must NOT pass window="accounts.bill.com" and must NOT spawn a new tab on miss
+            rt.browser.attach_existing_tab.return_value = None
+            rt.browser.attach_existing_tab.reset_mock()
+            with self.assertRaises(RuntimeError) as miss_ctx:
+                rt.cua.getTab("accounts.bill.com")
+            self.assertEqual(rt.browser.attach_existing_tab.call_args.kwargs["url_pattern"], "accounts.bill.com")
+            self.assertIsNone(rt.browser.attach_existing_tab.call_args.kwargs["window"])
+            self.assertIn("cua.listTabs()", str(miss_ctx.exception))
+            self.assertIn("cua.createBrowserTab(", str(miss_ctx.exception))
         finally:
             rt._pool.shutdown(wait=False)
 

@@ -9,6 +9,7 @@ const sessionGroups = new Map();
 const sessionTabs = new Map();
 const attachedDebuggers = new Set();
 const debuggerLastUsedAt = new Map();
+const verifiedRendererTabs = new Map();
 const IDLE_DEBUGGER_DETACH_MS = 5 * 60 * 1000;
 const initializedRuntimeTabs = new Map();
 const STRICT_CSP_HOSTS_KEY = "fmuStrictCspHosts";
@@ -124,6 +125,7 @@ async function rememberStrictCspHost(host) {
 
 chrome.tabs.onRemoved.addListener(tabId => {
   debuggerLastUsedAt.delete(tabId);
+  verifiedRendererTabs.delete(tabId);
   attachedDebuggers.delete(tabId);
   initializedRuntimeTabs.delete(tabId);
   return releaseTabClaims([tabId]);
@@ -176,6 +178,7 @@ async function detachIdleDebuggers(now = Date.now(), maxIdleMs = IDLE_DEBUGGER_D
     if (now - lastUsed < maxIdleMs) continue;
     attachedDebuggers.delete(tabId);
     debuggerLastUsedAt.delete(tabId);
+    verifiedRendererTabs.delete(tabId);
     try {
       await chrome.debugger.detach({ tabId });
       detached += 1;
@@ -386,6 +389,7 @@ if (chrome.debugger && chrome.debugger.onDetach) {
     if (source.tabId) {
       attachedDebuggers.delete(source.tabId);
       debuggerLastUsedAt.delete(source.tabId);
+      verifiedRendererTabs.delete(source.tabId);
       initializedRuntimeTabs.delete(source.tabId);
       if (activeScreencastTabId === source.tabId) {
         activeScreencastTabId = null;
@@ -842,19 +846,29 @@ async function probeAndPrepIframeInTab(tabId, opts) {
   }
   const value = String((opts && opts.value) || "");
   const expNorm = normalizeFieldValueForCheck(value);
+  const explicitFrameId = (opts && opts.frameId !== undefined && opts.frameId !== null)
+    ? Number(opts.frameId)
+    : null;
+  const wantFrameIndex = (opts && typeof opts.frameIndex === "number" && opts.frameIndex >= 0)
+    ? opts.frameIndex
+    : -1;
   const probeArg = {
     action: String((opts && opts.action) || "verify"),
     frameSrc: String((opts && opts.frameSrc) || "").trim(),
     frameName: String((opts && opts.frameName) || "").trim(),
+    frameIndex: wantFrameIndex,
     expectedHash: fnv1a32(value),
     expectedLen: value.length,
     expectedNormHash: fnv1a32(expNorm),
     expectedNormLen: expNorm.length
   };
+  const target = (explicitFrameId !== null && !Number.isNaN(explicitFrameId))
+    ? { tabId, frameIds: [explicitFrameId] }
+    : { tabId, allFrames: true };
   let frameResults = [];
   try {
     frameResults = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target,
       args: [probeArg],
       func: (arg) => {
         if (window === window.top) return null;
@@ -862,7 +876,7 @@ async function probeAndPrepIframeInTab(tabId, opts) {
         let score = 0;
         if (arg.frameSrc) {
           if (curHref === arg.frameSrc) {
-            score = 100;
+            score = 100 + (arg.frameName && window.name === arg.frameName ? 10 : 0);
           } else {
             try {
               const u1 = new URL(curHref);
@@ -878,9 +892,20 @@ async function probeAndPrepIframeInTab(tabId, opts) {
               return null;
             }
           }
+          if (arg.frameName && window.name && window.name !== arg.frameName) {
+            score -= 20;
+          }
         } else {
           score = (arg.frameName && window.name === arg.frameName) ? 60 : 10;
         }
+        let frameIndex = -1;
+        try {
+          if (window.parent === window.top) {
+            for (let k = 0; k < window.top.length; k++) {
+              if (window.top[k] === window) { frameIndex = k; break; }
+            }
+          }
+        } catch (_) {}
         const isEditable = (el) => {
           if (!el || el.disabled) return false;
           const tag = (el.tagName || "").toLowerCase();
@@ -921,23 +946,36 @@ async function probeAndPrepIframeInTab(tabId, opts) {
         };
         let a = document.activeElement;
         while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
-        const target = isEditable(a) ? a : findFirstEditableDeep(document);
-        if (!target) {
-          return { supported: true, matched: false, score, hasFocus: Boolean(document.hasFocus && document.hasFocus()) };
+        const hasFocus = Boolean(document.hasFocus && document.hasFocus());
+        const activeIsEditable = isEditable(a);
+        const targetEl = activeIsEditable ? a : findFirstEditableDeep(document);
+        if (!targetEl) {
+          return { supported: true, matched: false, score, frameIndex, hasFocus, activeIsEditable };
         }
         const readVal = () => (
-          "value" in target && target.value !== undefined && typeof target.value === "string"
-            ? target.value
-            : String(target.innerText || target.textContent || "")
+          "value" in targetEl && targetEl.value !== undefined && typeof targetEl.value === "string"
+            ? targetEl.value
+            : String(targetEl.innerText || targetEl.textContent || "")
         );
+        if (arg.action === "probe") {
+          return {
+            supported: true,
+            matched: true,
+            score,
+            frameIndex,
+            hasFocus,
+            activeIsEditable,
+            curLen: readVal().length
+          };
+        }
         if (arg.action === "focus_and_select") {
-          try { target.focus({ preventScroll: true }); } catch (_) { try { target.focus(); } catch (_) {} }
+          try { targetEl.focus({ preventScroll: true }); } catch (_) { try { targetEl.focus(); } catch (_) {} }
           try {
-            if (typeof target.select === "function") {
-              target.select();
+            if (typeof targetEl.select === "function") {
+              targetEl.select();
             } else if (window.getSelection && document.createRange) {
               const range = document.createRange();
-              range.selectNodeContents(target);
+              range.selectNodeContents(targetEl);
               const selObj = window.getSelection();
               if (selObj) { selObj.removeAllRanges(); selObj.addRange(range); }
             }
@@ -946,30 +984,34 @@ async function probeAndPrepIframeInTab(tabId, opts) {
             supported: true,
             matched: true,
             score,
+            frameIndex,
             hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+            activeIsEditable: isEditable(targetEl),
             curLen: readVal().length
           };
         }
         if (arg.action === "force_clear") {
-          try { target.focus({ preventScroll: true }); } catch (_) {}
-          const tag = (target.tagName || "").toLowerCase();
+          try { targetEl.focus({ preventScroll: true }); } catch (_) {}
+          const tag = (targetEl.tagName || "").toLowerCase();
           if (tag === "input" || tag === "textarea") {
             const proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
             const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
             try {
-              if (desc && desc.set) desc.set.call(target, "");
-              else target.value = "";
-            } catch (_) { target.value = ""; }
+              if (desc && desc.set) desc.set.call(targetEl, "");
+              else targetEl.value = "";
+            } catch (_) { targetEl.value = ""; }
           } else {
-            target.textContent = "";
+            targetEl.textContent = "";
           }
-          target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
-          target.dispatchEvent(new Event("change", { bubbles: true }));
+          targetEl.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+          targetEl.dispatchEvent(new Event("change", { bubbles: true }));
           return {
             supported: true,
             matched: true,
             score,
+            frameIndex,
             hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+            activeIsEditable: isEditable(targetEl),
             curLen: readVal().length
           };
         }
@@ -990,7 +1032,9 @@ async function probeAndPrepIframeInTab(tabId, opts) {
           supported: true,
           matched: true,
           score,
-          hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+          frameIndex,
+          hasFocus,
+          activeIsEditable,
           curLen: actual.length,
           actualNormLen: normActual.length,
           verified: Boolean(exactMatch || normMatch || bulletMasked)
@@ -1000,15 +1044,69 @@ async function probeAndPrepIframeInTab(tabId, opts) {
   } catch (_) {
     return { supported: false, matched: false };
   }
+  const rankOf = (r) => [
+    (wantFrameIndex >= 0 && r.frameIndex === wantFrameIndex) ? 1 : 0,
+    (r.hasFocus && r.activeIsEditable) ? 1 : 0,
+    r.hasFocus ? 1 : 0,
+    Number(r.score || 0)
+  ];
+  const isBetterRank = (a, b) => {
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return a[i] > b[i];
+    }
+    return false;
+  };
   let best = null;
+  let bestRank = [-1, -1, -1, -1];
   for (const fr of frameResults || []) {
     const r = fr && fr.result;
     if (!r || !r.matched) continue;
-    if (!best || (r.score || 0) > (best.score || 0) || ((r.score || 0) === (best.score || 0) && r.hasFocus && !best.hasFocus)) {
-      best = r;
+    const candRank = rankOf(r);
+    if (!best || isBetterRank(candRank, bestRank)) {
+      best = { ...r, frameId: fr.frameId };
+      bestRank = candRank;
     }
   }
   return best || { supported: true, matched: false };
+}
+
+async function prepCdpIframeInTab(tabId, spec) {
+  if (!spec || (!spec.uid && !spec.frameSrc && !spec.frameName && !spec.frameTitle && spec.frameIndex === undefined)) {
+    return spec;
+  }
+  const uid = String(spec.uid || spec.label || "iframe");
+  const querySpec = {
+    uid: spec.uid || null,
+    frameSrc: spec.frameSrc || "",
+    frameName: spec.frameName || "",
+    frameTitle: spec.frameTitle || "",
+    frameIndex: typeof spec.frameIndex === "number" ? spec.frameIndex : -1
+  };
+  let prep = null;
+  try {
+    prep = await evalInTab(
+      tabId,
+      `(window.__fmu && typeof window.__fmu.prepIframeTarget === "function") ? window.__fmu.prepIframeTarget(${JSON.stringify(querySpec)}) : null`,
+      false
+    );
+  } catch (_) {
+    prep = null;
+  }
+  if (prep && typeof prep === "object") {
+    if (prep.inViewport === false) {
+      throw new Error(`cross-origin iframe ${uid} is outside visible viewport`);
+    }
+    const nextSpec = { ...spec };
+    if (typeof prep.x === "number" && Number.isFinite(prep.x) && typeof prep.y === "number" && Number.isFinite(prep.y)) {
+      nextSpec.x = prep.x;
+      nextSpec.y = prep.y;
+    }
+    if (typeof prep.frameIndex === "number" && prep.frameIndex >= 0) {
+      nextSpec.frameIndex = prep.frameIndex;
+    }
+    return nextSpec;
+  }
+  return spec;
 }
 
 async function clearCdpFocusedInput(tabId, spec) {
@@ -1018,12 +1116,12 @@ async function clearCdpFocusedInput(tabId, spec) {
   await new Promise(r => setTimeout(r, 20));
   const st = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value: "" });
   if (st.matched && Number(st.curLen || 0) > 0) {
-    await probeAndPrepIframeInTab(tabId, { ...spec, action: "focus_and_select" });
+    await probeAndPrepIframeInTab(tabId, { ...spec, action: "focus_and_select", value: "" });
     await dispatchCdpKey(tabId, "Backspace");
     await new Promise(r => setTimeout(r, 15));
     const st2 = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value: "" });
     if (st2.matched && Number(st2.curLen || 0) > 0) {
-      await probeAndPrepIframeInTab(tabId, { ...spec, action: "force_clear" });
+      await probeAndPrepIframeInTab(tabId, { ...spec, action: "force_clear", value: "" });
     }
   }
 }
@@ -1038,32 +1136,37 @@ async function dispatchCdpInput(tabId, spec) {
     await dispatchCdpTextKeys(tabId, String((spec && spec.value) || ""));
     return;
   }
-  const x = Number(spec.x);
-  const y = Number(spec.y);
-  const value = String(spec.value || "");
-  const clear = spec.clear !== false;
-  const uid = String(spec.uid || spec.label || "iframe");
+  const preppedSpec = await prepCdpIframeInTab(tabId, spec);
+  const x = Number(preppedSpec.x);
+  const y = Number(preppedSpec.y);
+  const value = String(preppedSpec.value || "");
+  const clear = preppedSpec.clear !== false;
+  const uid = String(preppedSpec.uid || preppedSpec.label || "iframe");
   await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
   await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
   await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
   await new Promise(r => setTimeout(r, 30));
-  await probeAndPrepIframeInTab(tabId, { ...spec, action: "focus_and_select" });
+  const probeRes = await probeAndPrepIframeInTab(tabId, { ...preppedSpec, action: "probe", value: "" });
+  const pinnedSpec = (probeRes && probeRes.matched && probeRes.frameId !== undefined && probeRes.frameId !== null)
+    ? { ...preppedSpec, frameId: probeRes.frameId }
+    : preppedSpec;
+  await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "focus_and_select", value: "" });
   if (clear) {
-    await clearCdpFocusedInput(tabId, spec);
+    await clearCdpFocusedInput(tabId, pinnedSpec);
   }
   if (value) {
     await sendDebuggerCommand(tabId, "Input.insertText", { text: value });
     await new Promise(r => setTimeout(r, 25));
   }
-  let verifyRes = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value });
+  let verifyRes = await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "verify", value });
   if (verifyRes.matched && !verifyRes.verified) {
-    await probeAndPrepIframeInTab(tabId, { ...spec, action: "focus_and_select" });
-    await clearCdpFocusedInput(tabId, spec);
+    await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "focus_and_select", value: "" });
+    await clearCdpFocusedInput(tabId, pinnedSpec);
     if (value) {
       await dispatchCdpTextKeys(tabId, value);
       await new Promise(r => setTimeout(r, 25));
     }
-    verifyRes = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value });
+    verifyRes = await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "verify", value });
     if (verifyRes.matched && !verifyRes.verified) {
       const expLen = normalizeFieldValueForCheck(value).length;
       const actLen = Number(verifyRes.actualNormLen || 0);
@@ -1256,12 +1359,95 @@ function buildEvalCandidates(rawCode) {
   return out;
 }
 
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(message));
+      }
+    }, ms);
+    if (timer && typeof timer.unref === "function") timer.unref();
+    Promise.resolve(promise).then(
+      (val) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(val);
+        }
+      },
+      (err) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        }
+      }
+    );
+  });
+}
+
+async function getLiveTabOrThrow(tabId) {
+  if (!chrome.tabs || typeof chrome.tabs.get !== "function") {
+    return null;
+  }
+  let curTab = null;
+  try {
+    curTab = await chrome.tabs.get(tabId);
+  } catch (_) {
+    curTab = null;
+  }
+  if (!curTab) {
+    attachedDebuggers.delete(tabId);
+    debuggerLastUsedAt.delete(tabId);
+    verifiedRendererTabs.delete(tabId);
+    initializedRuntimeTabs.delete(tabId);
+    throw new Error(`Tab ${tabId} was closed or does not exist; call cua.listTabs() to see active tabs`);
+  }
+  const curUrl = String(curTab.url || curTab.pendingUrl || "");
+  if (curTab.discarded === true || curTab.status === "unloaded") {
+    attachedDebuggers.delete(tabId);
+    debuggerLastUsedAt.delete(tabId);
+    verifiedRendererTabs.delete(tabId);
+    initializedRuntimeTabs.delete(tabId);
+    throw new Error(
+      `Tab ${tabId} (${curUrl || "about:blank"}) is discarded/unloaded by Chrome; reload it via tab.goto(${JSON.stringify(curUrl || "about:blank")}) or open a new tab`
+    );
+  }
+  return curTab;
+}
+
+async function ensureResponsiveTabDebugger(tabId, curTabUrl = "", timeoutMs = 3000) {
+  const lastVerified = verifiedRendererTabs.get(tabId) || 0;
+  if (attachedDebuggers.has(tabId) && (Date.now() - lastVerified) < 5000) return;
+  try {
+    await withTimeout(
+      (async () => {
+        await ensureDebuggerAndFocusEmulation(tabId);
+        await evalInTab(tabId, "1", false);
+      })(),
+      timeoutMs,
+      `Tab ${tabId} (${curTabUrl || "about:blank"}) is unresponsive (debugger/renderer timed out after ${timeoutMs}ms); reload or reopen the tab`
+    );
+    verifiedRendererTabs.set(tabId, Date.now());
+  } catch (err) {
+    if (isNavigationError(err)) return;
+    attachedDebuggers.delete(tabId);
+    debuggerLastUsedAt.delete(tabId);
+    verifiedRendererTabs.delete(tabId);
+    initializedRuntimeTabs.delete(tabId);
+    throw err;
+  }
+}
+
 async function evalInTab(tabId, expression, awaitPromise = true) {
   const res = await sendDebuggerCommand(tabId, "Runtime.evaluate", {
     expression,
     awaitPromise,
     returnByValue: true
   });
+  verifiedRendererTabs.set(tabId, Date.now());
   if (res && res.exceptionDetails) {
     const exc = res.exceptionDetails.exception;
     const desc = (res.result && res.result.description) || (exc && exc.description) || res.exceptionDetails.text || "Runtime.evaluate error";
@@ -1841,6 +2027,7 @@ async function handleRpc(msg) {
           groupId: t.groupId !== undefined ? t.groupId : -1,
           groupTitle: gTitle,
           active: Boolean(t.active),
+          discarded: Boolean(t.discarded),
           status: String(t.status || ""),
           url: u,
           title
@@ -1891,7 +2078,11 @@ async function handleRpc(msg) {
                 const u = String(t.url || t.pendingUrl || "");
                 return u && u !== "about:blank" && !u.startsWith("chrome://newtab");
               });
-          if (filtered.length > 0) match = filtered[filtered.length - 1];
+          if (filtered.length > 0) {
+            const liveFiltered = filtered.filter(t => !t.discarded && t.status !== "unloaded");
+            const pool = liveFiltered.length > 0 ? liveFiltered : filtered;
+            match = pool[pool.length - 1];
+          }
         }
       }
       if (!match) {
@@ -1906,7 +2097,9 @@ async function handleRpc(msg) {
           return u.toLowerCase().includes(pat) || String(t.title || "").toLowerCase().includes(pat);
         });
         if (candidates.length > 0) {
-          match = candidates.find(t => t.active) || candidates[candidates.length - 1];
+          const liveCandidates = candidates.filter(t => !t.discarded && t.status !== "unloaded");
+          const pool = liveCandidates.length > 0 ? liveCandidates : candidates;
+          match = pool.find(t => t.active) || pool[pool.length - 1];
         }
       }
       if (!match) {
@@ -1917,8 +2110,15 @@ async function handleRpc(msg) {
       if (params.assignGroup === true && sessionName) {
         try { await ensureAgentGroup(match.id, sessionName, params.color || "blue", match.windowId); } catch (_) {}
       }
-      if (params.focusEmulation !== false) {
-        try { await ensureDebuggerAndFocusEmulation(match.id); } catch (_) {}
+      const isDiscardedMatch = Boolean(match.discarded) || match.status === "unloaded";
+      if (params.focusEmulation !== false && !isDiscardedMatch) {
+        try {
+          await withTimeout(
+            ensureDebuggerAndFocusEmulation(match.id),
+            3000,
+            `Tab ${match.id} debugger attach timed out`
+          );
+        } catch (_) {}
       }
       return {
         id,
@@ -1928,6 +2128,7 @@ async function handleRpc(msg) {
           tabId: match.id,
           windowId: match.windowId,
           groupId: match.groupId,
+          discarded: isDiscardedMatch,
           url: match.url || match.pendingUrl || "",
           title: match.title || ""
         }
@@ -1940,6 +2141,9 @@ async function handleRpc(msg) {
     }
     if (method === "evaluate") {
       const { tabId, expression, arg, runtimeInit, awaitPromise = true } = params;
+      const curTab = await getLiveTabOrThrow(tabId);
+      const curTabUrl = curTab ? String(curTab.url || curTab.pendingUrl || "") : "";
+      await ensureResponsiveTabDebugger(tabId, curTabUrl, 3000);
       const wrappedExpr = runtimeInit
         ? expression
         : `((__fn, __arg) => (typeof __fn === "function" ? __fn(__arg) : __fn))((${expression}), ${JSON.stringify(arg === undefined ? null : arg)})`;
@@ -1970,27 +2174,31 @@ async function handleRpc(msg) {
 
       let navWaitMs = 0;
       let curTabUrl = "";
-      if (chrome.tabs && typeof chrome.tabs.get === "function") {
-        try {
-          const curTab = await chrome.tabs.get(tabId);
-          if (curTab) {
-            curTabUrl = String(curTab.url || curTab.pendingUrl || "");
-            if (curTab.status === "loading" || curTab.pendingUrl) {
-              initializedRuntimeTabs.delete(tabId);
-              const tNav0 = Date.now();
-              await waitForTabLoad(tabId, 6000);
-              navWaitMs += (Date.now() - tNav0);
-              try { await ensureDebuggerAndFocusEmulation(tabId); } catch (_) {}
-            }
+      const curTab = await getLiveTabOrThrow(tabId);
+      if (curTab) {
+        curTabUrl = String(curTab.url || curTab.pendingUrl || "");
+        if (curTab.status === "loading" || curTab.pendingUrl) {
+          initializedRuntimeTabs.delete(tabId);
+          const tNav0 = Date.now();
+          await waitForTabLoad(tabId, 6000);
+          navWaitMs += (Date.now() - tNav0);
+          const postLoadTab = await getLiveTabOrThrow(tabId);
+          if (postLoadTab) {
+            curTabUrl = String(postLoadTab.url || postLoadTab.pendingUrl || curTabUrl);
           }
-        } catch (_) {}
+        }
       }
+      await ensureResponsiveTabDebugger(tabId, curTabUrl, 3000);
 
       const injectAndRunBatch = async (payloadObj, forceReinit = false) => {
         const needsInit = forceReinit || initializedRuntimeTabs.get(tabId) !== effectiveRuntimeVer;
         if (needsInit && effectiveRuntimeJs) {
           try {
-            await evalInTab(tabId, effectiveRuntimeJs, false);
+            await withTimeout(
+              evalInTab(tabId, effectiveRuntimeJs, false),
+              4000,
+              `Tab ${tabId} (${curTabUrl || "about:blank"}) timed out during runtime injection after 4000ms; reload or reopen the tab`
+            );
             initializedRuntimeTabs.set(tabId, effectiveRuntimeVer);
           } catch (rtErr) {
             if (!isNavigationError(rtErr)) throw rtErr;
@@ -1998,7 +2206,11 @@ async function handleRpc(msg) {
             const navSt = await waitForNavigationSettlement(tabId, "", 8000);
             navWaitMs += (Date.now() - tNav0);
             if (!navSt.alive) throw rtErr;
-            await evalInTab(tabId, effectiveRuntimeJs, false);
+            await withTimeout(
+              evalInTab(tabId, effectiveRuntimeJs, false),
+              4000,
+              `Tab ${tabId} (${curTabUrl || "about:blank"}) timed out during runtime injection after 4000ms; reload or reopen the tab`
+            );
             initializedRuntimeTabs.set(tabId, effectiveRuntimeVer);
           }
         }
@@ -2540,7 +2752,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.3" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.4" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

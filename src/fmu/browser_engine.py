@@ -324,15 +324,34 @@ _IFRAME_PROBE_JS = r"""(arg) => {
     }
     return fallback;
   };
-  const target = isEditable(a) ? a : findFirstEditableDeep(document);
+  let frameIndex = -1;
+  try {
+    if (window.parent === window.top) {
+      for (let k = 0; k < window.top.length; k++) {
+        if (window.top[k] === window) { frameIndex = k; break; }
+      }
+    }
+  } catch (_) {}
+  const hasFocus = Boolean(document.hasFocus && document.hasFocus());
+  const activeIsEditable = isEditable(a);
+  const target = activeIsEditable ? a : findFirstEditableDeep(document);
   if (!target) {
-    return { matched: false, hasFocus: Boolean(document.hasFocus && document.hasFocus()) };
+    return { matched: false, frameIndex, hasFocus, activeIsEditable };
   }
   const readVal = () => (
     "value" in target && target.value !== undefined && typeof target.value === "string"
       ? target.value
       : String(target.innerText || target.textContent || "")
   );
+  if (arg.action === "probe") {
+    return {
+      matched: true,
+      frameIndex,
+      hasFocus,
+      activeIsEditable,
+      curLen: readVal().length
+    };
+  }
   if (arg.action === "focus_and_select") {
     try { target.focus({ preventScroll: true }); } catch (_) { try { target.focus(); } catch (_) {} }
     try {
@@ -347,7 +366,9 @@ _IFRAME_PROBE_JS = r"""(arg) => {
     } catch (_) {}
     return {
       matched: true,
+      frameIndex,
       hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+      activeIsEditable: isEditable(target),
       curLen: readVal().length
     };
   }
@@ -368,7 +389,9 @@ _IFRAME_PROBE_JS = r"""(arg) => {
     target.dispatchEvent(new Event("change", { bubbles: true }));
     return {
       matched: true,
+      frameIndex,
       hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+      activeIsEditable: isEditable(target),
       curLen: readVal().length
     };
   }
@@ -387,7 +410,9 @@ _IFRAME_PROBE_JS = r"""(arg) => {
   const bulletMasked = normActual.length > 0 && /^[•*]+$/.test(normActual) && arg.expectedNormLen >= 8 && normActual.length === arg.expectedNormLen;
   return {
     matched: true,
-    hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+    frameIndex,
+    hasFocus,
+    activeIsEditable,
     curLen: actual.length,
     actualNormLen: normActual.length,
     verified: Boolean(exactMatch || normMatch || bulletMasked)
@@ -703,11 +728,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.5.3"
+_FMU_RUNTIME_VERSION = "0.5.4"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.5.3";
+  const FMU_RUNTIME_VERSION = "0.5.4";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -2781,55 +2806,6 @@ IN_PAGE_RUNTIME_JS = r"""
       lines: []
     });
 
-    function deepElementFromPoint(x, y) {
-      let hit = document.elementFromPoint(x, y);
-      while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === "function") {
-        const inner = hit.shadowRoot.elementFromPoint(x, y);
-        if (!inner || inner === hit) break;
-        hit = inner;
-      }
-      return hit;
-    }
-
-    function isTrustedClickHit(el, hit) {
-      if (!hit) return false;
-      if (hit === el || (el.contains && el.contains(hit))) return true;
-      if (tagOf(hit) === "label" && (hit.control === el || (el.id && hit.htmlFor === el.id))) return true;
-      if (tagOf(el) === "label" && el.control && (hit === el.control || (el.control.contains && el.control.contains(hit)))) return true;
-      return false;
-    }
-
-    function resolveTrustedClickPoint(el) {
-      if (!el || el.ownerDocument !== document || el.disabled) return null;
-      const vw = window.innerWidth || document.documentElement.clientWidth || 0;
-      const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-      if (vw <= 0 || vh <= 0) return null;
-      const rects = [];
-      const eff = getEffectiveRect(el);
-      if (eff.width >= 1 && eff.height >= 1) rects.push(eff);
-      if (el.getClientRects) {
-        for (const cr of el.getClientRects()) {
-          if (cr.width >= 1 && cr.height >= 1) rects.push(cr);
-        }
-      }
-      const ratios = [[0.5, 0.5], [0.5, 0.25], [0.5, 0.75], [0.25, 0.5], [0.75, 0.5]];
-      for (const r of rects) {
-        const clL = Math.max(0, r.left);
-        const clT = Math.max(0, r.top);
-        const clR = Math.min(vw - 1, r.right);
-        const clB = Math.min(vh - 1, r.bottom);
-        if (clR <= clL || clB <= clT) continue;
-        for (const [rx, ry] of ratios) {
-          const px = clL + (clR - clL) * rx;
-          const py = clT + (clB - clT) * ry;
-          if (isTrustedClickHit(el, deepElementFromPoint(px, py))) {
-            return { x: px, y: py };
-          }
-        }
-      }
-      return null;
-    }
-
     if (store.navigating) return makeNavigatedEarlyReturn(0);
 
     const SHORTHAND_VERBS = [
@@ -3135,34 +3111,23 @@ IN_PAGE_RUNTIME_JS = r"""
                 continue;
               }
             }
-            let pt = resolveTrustedClickPoint(el);
-            if (!pt) {
-              const eff = getEffectiveRect(el);
-              const vw = window.innerWidth || document.documentElement.clientWidth || 0;
-              const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-              if (eff.width >= 1 && eff.height >= 1 && vw > 0 && vh > 0) {
-                const clL = Math.max(0, eff.left);
-                const clT = Math.max(0, eff.top);
-                const clR = Math.min(vw - 1, eff.right);
-                const clB = Math.min(vh - 1, eff.bottom);
-                if (clR > clL && clB > clT) {
-                  pt = { x: clL + (clR - clL) * 0.5, y: clT + (clB - clT) * 0.5 };
-                }
-              }
-            }
-            if (req.cdpClick && pt) {
+            const measured = measureIframeCdpTarget(el);
+            const eff = getEffectiveRect(el);
+            if (req.cdpClick && (measured.inViewport || (eff.width >= 1 && eff.height >= 1))) {
               store.mutationSeq++;
               return makeCdpInputReturn(i + 1, {
                 kind: "fill",
-                x: Math.round(pt.x * 100) / 100,
-                y: Math.round(pt.y * 100) / 100,
+                x: measured.inViewport ? measured.x : Math.round((eff.left + eff.width * 0.5) * 100) / 100,
+                y: measured.inViewport ? measured.y : Math.round((eff.top + eff.height * 0.5) * 100) / 100,
+                needsScroll: !measured.inViewport,
                 value: String(stepValue ?? ""),
                 clear: !Boolean(s.append),
-                frameSrc: String(el.getAttribute("src") || el.src || ""),
-                frameName: String(el.getAttribute("name") || ""),
-                frameTitle: String(el.getAttribute("title") || el.getAttribute("aria-label") || ""),
-                uid: getUid(el),
-                label: getLabel(el)
+                frameSrc: measured.frameSrc,
+                frameName: measured.frameName,
+                frameTitle: measured.frameTitle,
+                frameIndex: measured.frameIndex,
+                uid: measured.uid,
+                label: measured.label
               });
             }
             if (!s.optional) {
@@ -3330,11 +3295,163 @@ IN_PAGE_RUNTIME_JS = r"""
     };
   }
 
+  function deepElementFromPoint(x, y) {
+    let hit = document.elementFromPoint(x, y);
+    while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === "function") {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    return hit;
+  }
+
+  function isTrustedClickHit(el, hit) {
+    if (!hit) return false;
+    if (hit === el || (el.contains && el.contains(hit))) return true;
+    if (tagOf(hit) === "label" && (hit.control === el || (el.id && hit.htmlFor === el.id))) return true;
+    if (tagOf(hit) === "label" && el.control && (hit === el.control || (el.control.contains && el.control.contains(hit)))) return true;
+    return false;
+  }
+
+  function resolveTrustedClickPoint(el) {
+    if (!el || el.ownerDocument !== document || el.disabled) return null;
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    if (vw <= 0 || vh <= 0) return null;
+    const rects = [];
+    const eff = getEffectiveRect(el);
+    if (eff.width >= 1 && eff.height >= 1) rects.push(eff);
+    if (el.getClientRects) {
+      for (const cr of el.getClientRects()) {
+        if (cr.width >= 1 && cr.height >= 1) rects.push(cr);
+      }
+    }
+    const ratios = [[0.5, 0.5], [0.5, 0.25], [0.5, 0.75], [0.25, 0.5], [0.75, 0.5]];
+    for (const r of rects) {
+      const clL = Math.max(0, r.left);
+      const clT = Math.max(0, r.top);
+      const clR = Math.min(vw - 1, r.right);
+      const clB = Math.min(vh - 1, r.bottom);
+      if (clR <= clL || clB <= clT) continue;
+      for (const [rx, ry] of ratios) {
+        const px = clL + (clR - clL) * rx;
+        const py = clT + (clB - clT) * ry;
+        if (isTrustedClickHit(el, deepElementFromPoint(px, py))) {
+          return { x: px, y: py };
+        }
+      }
+    }
+    return null;
+  }
+
+  function scrollElIntoViewport(el) {
+    if (!el) return;
+    const scrollEl = (window.getComputedStyle(el).display === "contents" && el.firstElementChild) ? el.firstElementChild : el;
+    try {
+      scrollEl.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    } catch (_) {}
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    let r = getEffectiveRect(el);
+    if (vw > 0 && vh > 0 && (r.left < 0 || r.right > vw || r.top < 0 || r.bottom > vh)) {
+      let anc = el.parentElement;
+      while (anc && anc !== document.documentElement && anc !== document.body) {
+        const st = window.getComputedStyle(anc);
+        if (anc.scrollWidth > anc.clientWidth && (st.overflowX === "auto" || st.overflowX === "scroll" || st.overflowX === "overlay")) {
+          const ar = anc.getBoundingClientRect();
+          const er = getEffectiveRect(el);
+          if (er.left < ar.left || er.right > ar.right) {
+            anc.scrollLeft += (er.left + er.width * 0.5) - (ar.left + ar.width * 0.5);
+          }
+        }
+        if (anc.scrollHeight > anc.clientHeight && (st.overflowY === "auto" || st.overflowY === "scroll" || st.overflowY === "overlay")) {
+          const ar = anc.getBoundingClientRect();
+          const er = getEffectiveRect(el);
+          if (er.top < ar.top || er.bottom > ar.bottom) {
+            anc.scrollTop += (er.top + er.height * 0.5) - (ar.top + ar.height * 0.5);
+          }
+        }
+        anc = anc.parentElement;
+      }
+      r = getEffectiveRect(el);
+      if (r.left < 0 || r.right > vw || r.top < 0 || r.bottom > vh) {
+        const dx = (r.right <= 0 || r.left >= vw) ? ((r.left + r.width * 0.5) - vw * 0.5) : 0;
+        const dy = (r.bottom <= 0 || r.top >= vh) ? ((r.top + r.height * 0.5) - vh * 0.5) : 0;
+        if (dx || dy) {
+          try { window.scrollBy({ left: dx, top: dy, behavior: "instant" }); } catch (_) {}
+        }
+      }
+    }
+  }
+
+  function getIframeWindowIndex(el) {
+    try {
+      if (el && el.contentWindow) {
+        for (let k = 0; k < window.length; k++) {
+          if (window[k] === el.contentWindow) return k;
+        }
+      }
+    } catch (_) {}
+    return -1;
+  }
+
+  function measureIframeCdpTarget(el) {
+    scrollElIntoViewport(el);
+    const eff = getEffectiveRect(el);
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    let pt = resolveTrustedClickPoint(el);
+    if (!pt && eff.width >= 1 && eff.height >= 1 && vw > 0 && vh > 0) {
+      const clL = Math.max(0, eff.left);
+      const clT = Math.max(0, eff.top);
+      const clR = Math.min(vw - 1, eff.right);
+      const clB = Math.min(vh - 1, eff.bottom);
+      if (clR > clL && clB > clT) {
+        pt = { x: clL + (clR - clL) * 0.5, y: clT + (clB - clT) * 0.5 };
+      }
+    }
+    return {
+      inViewport: Boolean(pt),
+      x: pt ? Math.round(pt.x * 100) / 100 : null,
+      y: pt ? Math.round(pt.y * 100) / 100 : null,
+      frameIndex: getIframeWindowIndex(el),
+      frameSrc: String(el.getAttribute("src") || el.src || ""),
+      frameName: String(el.getAttribute("name") || ""),
+      frameTitle: String(el.getAttribute("title") || el.getAttribute("aria-label") || ""),
+      uid: getUid(el),
+      label: getLabel(el)
+    };
+  }
+
+  function prepIframeTarget(spec) {
+    let el = spec && spec.uid ? resolveEl(spec.uid) : null;
+    if (!el || tagOf(el) !== "iframe") {
+      const frames = queryAllDeep("iframe", document);
+      const idx = spec && typeof spec.frameIndex === "number" ? spec.frameIndex : -1;
+      if (idx >= 0) {
+        for (const cand of frames) {
+          if (getIframeWindowIndex(cand) === idx) { el = cand; break; }
+        }
+      }
+      if (!el && spec) {
+        const fSrc = String(spec.frameSrc || "").trim();
+        const fName = String(spec.frameName || "").trim();
+        const fTitle = String(spec.frameTitle || "").trim();
+        el = frames.find(f => (fName && f.getAttribute("name") === fName) || (fTitle && (f.getAttribute("title") === fTitle || f.getAttribute("aria-label") === fTitle)))
+          || (fSrc ? frames.find(f => String(f.getAttribute("src") || f.src || "").trim() === fSrc) : null)
+          || null;
+      }
+    }
+    if (!el || tagOf(el) !== "iframe") return null;
+    return measureIframeCdpTarget(el);
+  }
+
   window.__fmu = {
     version: FMU_RUNTIME_VERSION,
     executeBatch,
     collectSnapshot,
     resolveEl,
+    prepIframeTarget,
     invokeWebMcp,
     registerVirtualTools,
     registerOcrTargets,
@@ -5769,15 +5886,45 @@ class BrowserEngine:
                 sess._raw_cdp.send("Input.insertText", {"text": ch})
             time.sleep(0.005)
 
+    def _prep_cdp_iframe_target(self, sess: BrowserTabSession, spec: dict[str, Any]) -> dict[str, Any]:
+        uid = str(spec.get("uid") or spec.get("label") or "iframe")
+        try:
+            prep = sess._raw_page.evaluate(
+                "s => (window.__fmu && typeof window.__fmu.prepIframeTarget === 'function' ? window.__fmu.prepIframeTarget(s) : null)",
+                {
+                    "uid": spec.get("uid"),
+                    "frameSrc": spec.get("frameSrc"),
+                    "frameName": spec.get("frameName"),
+                    "frameTitle": spec.get("frameTitle"),
+                    "frameIndex": spec.get("frameIndex"),
+                },
+            )
+        except _BROWSER_OPS_ERRORS:
+            prep = None
+        if isinstance(prep, dict):
+            if prep.get("inViewport") is False:
+                raise RuntimeError(f"cross-origin iframe {uid} is outside visible viewport")
+            out = dict(spec)
+            if prep.get("x") is not None and prep.get("y") is not None:
+                out["x"] = float(prep["x"])
+                out["y"] = float(prep["y"])
+            if isinstance(prep.get("frameIndex"), int) and prep["frameIndex"] >= 0:
+                out["frameIndex"] = prep["frameIndex"]
+            return out
+        return spec
+
     def _probe_playwright_iframe(
         self,
         sess: BrowserTabSession,
         spec: dict[str, Any],
         action: str,
         value: str = "",
-    ) -> dict[str, Any]:
+        *,
+        target_frame: Any = None,
+    ) -> tuple[dict[str, Any], Any]:
         frame_src = str(spec.get("frameSrc") or "").strip()
         frame_name = str(spec.get("frameName") or "").strip()
+        want_frame_idx = spec.get("frameIndex")
         exp_norm = _normalize_field_value(value)
         arg = {
             "action": action,
@@ -5786,10 +5933,18 @@ class BrowserEngine:
             "expectedNormHash": _fnv1a32(exp_norm),
             "expectedNormLen": len(exp_norm),
         }
+        if target_frame is not None:
+            try:
+                out = target_frame.evaluate(_IFRAME_PROBE_JS, arg)
+                if isinstance(out, dict):
+                    return out, target_frame
+            except _BROWSER_OPS_ERRORS:
+                pass
+            return {"matched": False}, target_frame
         try:
             frames = [f for f in sess._raw_page.frames if f != sess._raw_page.main_frame]
         except _BROWSER_OPS_ERRORS:
-            return {"matched": False}
+            return {"matched": False}, None
         ranked: list[tuple[int, Any]] = []
         for f in frames:
             try:
@@ -5800,44 +5955,61 @@ class BrowserEngine:
             score = 0
             if frame_src:
                 if f_url == frame_src:
-                    score = 100
+                    score = 100 + (10 if (frame_name and f_name == frame_name) else 0)
                 elif _same_origin_and_path(f_url, frame_src):
-                    score = 80
-                    if frame_name and f_name == frame_name:
-                        score += 10
+                    score = 80 + (10 if (frame_name and f_name == frame_name) else 0)
                 else:
                     continue
+                if frame_name and f_name and f_name != frame_name:
+                    score -= 20
             else:
                 score = 60 if (frame_name and f_name == frame_name) else 10
             ranked.append((score, f))
         ranked.sort(key=lambda item: item[0], reverse=True)
-        fallback_res: dict[str, Any] = {"matched": False}
-        for _score, f in ranked:
+        best_res: dict[str, Any] = {"matched": False}
+        best_rank: tuple[int, int, int, int] = (-1, -1, -1, -1)
+        best_frame: Any = None
+        for score, f in ranked:
             try:
                 out = f.evaluate(_IFRAME_PROBE_JS, arg)
             except _BROWSER_OPS_ERRORS:
                 continue
-            if isinstance(out, dict) and out.get("matched"):
-                if out.get("hasFocus"):
-                    return out
-                if not fallback_res.get("matched"):
-                    fallback_res = out
-        return fallback_res
+            if not isinstance(out, dict) or not out.get("matched"):
+                continue
+            exact_idx = (
+                1
+                if (isinstance(want_frame_idx, int) and want_frame_idx >= 0 and out.get("frameIndex") == want_frame_idx)
+                else 0
+            )
+            focused_edit = 1 if (out.get("hasFocus") and out.get("activeIsEditable")) else 0
+            focused = 1 if out.get("hasFocus") else 0
+            cand_rank = (exact_idx, focused_edit, focused, score)
+            if not best_res.get("matched") or cand_rank > best_rank:
+                best_res = out
+                best_rank = cand_rank
+                best_frame = f
+        return best_res, best_frame
 
-    def _clear_cdp_focused_input(self, sess: BrowserTabSession, spec: dict[str, Any]) -> None:
+    def _clear_cdp_focused_input(
+        self,
+        sess: BrowserTabSession,
+        spec: dict[str, Any],
+        *,
+        target_frame: Any = None,
+    ) -> None:
         select_all_key = "Meta+a" if sys.platform == "darwin" else "Control+a"
         self._dispatch_cdp_key(sess, select_all_key)
         self._dispatch_cdp_key(sess, "Backspace")
         self._dispatch_cdp_key(sess, "Delete")
         time.sleep(0.02)
-        st = self._probe_playwright_iframe(sess, spec, "verify", "")
+        st, _ = self._probe_playwright_iframe(sess, spec, "verify", "", target_frame=target_frame)
         if st.get("matched") and int(st.get("curLen") or 0) > 0:
-            self._probe_playwright_iframe(sess, spec, "focus_and_select")
+            self._probe_playwright_iframe(sess, spec, "focus_and_select", target_frame=target_frame)
             self._dispatch_cdp_key(sess, "Backspace")
             time.sleep(0.015)
-            st2 = self._probe_playwright_iframe(sess, spec, "verify", "")
+            st2, _ = self._probe_playwright_iframe(sess, spec, "verify", "", target_frame=target_frame)
             if st2.get("matched") and int(st2.get("curLen") or 0) > 0:
-                self._probe_playwright_iframe(sess, spec, "force_clear")
+                self._probe_playwright_iframe(sess, spec, "force_clear", target_frame=target_frame)
 
     def _dispatch_cdp_input(self, sess: BrowserTabSession, spec: dict[str, Any]) -> None:
         kind = str(spec.get("kind") or "fill")
@@ -5848,6 +6020,7 @@ class BrowserEngine:
             self._dispatch_cdp_text_keys(sess, str(spec.get("value") or ""))
             return
 
+        spec = self._prep_cdp_iframe_target(sess, spec)
         x = float(spec["x"])
         y = float(spec["y"])
         value = str(spec.get("value") or "")
@@ -5855,20 +6028,21 @@ class BrowserEngine:
         uid = str(spec.get("uid") or spec.get("label") or "iframe")
         self._dispatch_cdp_mouse_click(sess, x, y)
         time.sleep(0.03)
-        self._probe_playwright_iframe(sess, spec, "focus_and_select")
+        _probe_res, pinned_frame = self._probe_playwright_iframe(sess, spec, "probe")
+        self._probe_playwright_iframe(sess, spec, "focus_and_select", target_frame=pinned_frame)
         if clear:
-            self._clear_cdp_focused_input(sess, spec)
+            self._clear_cdp_focused_input(sess, spec, target_frame=pinned_frame)
         if value:
             sess._raw_cdp.send("Input.insertText", {"text": value})
             time.sleep(0.025)
-        verify_res = self._probe_playwright_iframe(sess, spec, "verify", value)
+        verify_res, _ = self._probe_playwright_iframe(sess, spec, "verify", value, target_frame=pinned_frame)
         if verify_res.get("matched") and not verify_res.get("verified"):
-            self._probe_playwright_iframe(sess, spec, "focus_and_select")
-            self._clear_cdp_focused_input(sess, spec)
+            self._probe_playwright_iframe(sess, spec, "focus_and_select", target_frame=pinned_frame)
+            self._clear_cdp_focused_input(sess, spec, target_frame=pinned_frame)
             if value:
                 self._dispatch_cdp_text_keys(sess, value)
                 time.sleep(0.025)
-            verify_res = self._probe_playwright_iframe(sess, spec, "verify", value)
+            verify_res, _ = self._probe_playwright_iframe(sess, spec, "verify", value, target_frame=pinned_frame)
             if verify_res.get("matched") and not verify_res.get("verified"):
                 exp_len = len(_normalize_field_value(value))
                 act_len = int(verify_res.get("actualNormLen") or 0)

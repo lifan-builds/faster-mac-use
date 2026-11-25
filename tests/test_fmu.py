@@ -4365,6 +4365,179 @@ class TestTraceBoundsLive(unittest.TestCase):
         self.assertEqual(self.rt.bounds_agents, set())
 
 
+class TestReplTabErgonomics(unittest.TestCase):
+    def _make_mock_runtime(self) -> FasterMacUseRuntime:
+        rt = FasterMacUseRuntime.__new__(FasterMacUseRuntime)
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        rt._is_mcp_stdio = False
+        rt._threading = threading
+        rt._global_lock = threading.RLock()
+        rt._pool = ThreadPoolExecutor(max_workers=2)
+        rt.bounds_agents = set()
+        rt._agents = {}
+        rt.mac = mock.Mock()
+        rt.browser = mock.Mock()
+        rt.browser._tabs = {}
+        rt.browser._tab_last_urls = {}
+        rt.browser._tab_last_titles = {}
+        rt.browser.extension_connected = False
+        rt.browser.attach_existing_tab.return_value = None
+        rt.browser.group_title.return_value = "Agent"
+        rt.browser.clients.lookup.return_value = (None, None)
+        rt.browser._get_agent_color.return_value = "blue"
+        rt.browser.in_scope.return_value = True
+        rt.browser._is_session_alive.return_value = True
+        rt.browser.execute_batch.return_value = '# web tab=t1 url="https://example.com"'
+        rt.browser.list_tabs.return_value = (
+            '# tabs count=2 bridge="mv3"\n'
+            '@tab id=501 session=t1 window=88 group="Agent" [active] "Hertz" https://www.hertz.com/\n'
+            '@tab id=502 window=88 "Example" https://example.com/'
+        )
+        default_sess = rt._get_agent_session("default")
+        rt.cua = default_sess.cua
+        rt.context_tracker = default_sess.context_tracker
+        rt._repl_env = default_sess.repl_env
+        return rt
+
+    def test_multiline_python_control_flow_and_trailing_expr(self) -> None:
+        rt = self._make_mock_runtime()
+        try:
+            out = rt.execute({
+                "code": """
+                # don't choke on apostrophes in comments
+                items = []
+                try:
+                    for i in range(3):
+                        if i % 2 == 0:
+                            items.append(i * 10)
+                        else:
+                            items.append(i)
+                    missing = 1 / 0
+                except Exception as e:
+                    err_msg = f"caught:{type(e).__name__}"
+                finally:
+                    items.append(99)
+                {"items": items, "err": err_msg}
+                """
+            })
+            parsed = json.loads(out)
+            self.assertEqual(parsed, {"items": [0, 1, 20, 99], "err": "caught:ZeroDivisionError"})
+
+            # def + generator + dict comprehension + top-level return inside if/try
+            out2 = rt.execute({
+                "code": """
+                prefix = "tab:"
+                def tag(x):
+                    return prefix + str(x)
+                mapped = {k: k + 1 for k in range(2)}
+                if mapped[1] == 2:
+                    const { a } = { a: tag("ok") }
+                    return a
+                """
+            })
+            self.assertEqual(out2, "tab:ok")
+        finally:
+            rt._pool.shutdown(wait=False)
+
+    def test_js_try_catch_not_mangled_and_js_block_syntax_hint(self) -> None:
+        rt = self._make_mock_runtime()
+        try:
+            # _rewrite_braces must not turn JS control-flow blocks into dict literals
+            from fmu.cua_runtime import _rewrite_braces
+
+            js_try_raw = 'try { console.log("a"); } catch (e) { console.log(e); }'
+            self.assertEqual(_rewrite_braces(js_try_raw), js_try_raw)
+            js_if_raw = 'if (x > 0) { console.log(x); }'
+            self.assertEqual(_rewrite_braces(js_if_raw), js_if_raw)
+
+            # JS try/catch/finally executes cleanly in REPL
+            out = rt.execute({
+                "code": """
+                try {
+                    const ok = true;
+                    console.log("step1", ok);
+                    const bad = 1 / 0;
+                } catch (e) {
+                    console.log("caught", e);
+                } finally {
+                    console.log("done");
+                }
+                """
+            })
+            self.assertIn("step1 True", out)
+            self.assertIn("caught division by zero", out)
+            self.assertIn("done", out)
+
+            # Unsupported JS brace blocks raise a clear SyntaxError hint instead of opaque line 1 error
+            with self.assertRaises(SyntaxError) as ctx:
+                rt.execute({"code": "if (1 === 1) { console.log(1); }"})
+            self.assertIn("Python control flow", str(ctx.exception))
+        finally:
+            rt._pool.shutdown(wait=False)
+
+    def test_tab_handle_id_property(self) -> None:
+        rt = self._make_mock_runtime()
+        try:
+            h1 = rt.cua.createBrowserTab("headless", "https://example.com")
+            self.assertEqual(h1.id, "t1")
+
+            h_custom = rt.cua.createBrowserTab({"tabId": "custom-tab", "url": "https://example.com"})
+            self.assertEqual(h_custom.id, "custom-tab")
+
+            h_chrome = rt.cua.createBrowserTab({"chromeTabId": 501})
+            self.assertEqual(h_chrome.id, 501)
+
+            # Live extension session with _raw_page.chrome_tab_id populated after init
+            ext_sess = mock.Mock()
+            ext_sess.is_extension = True
+            ext_sess._raw_page = mock.Mock(chrome_tab_id=777)
+            rt.browser._tabs["ext-live"] = ext_sess
+            h_ext = rt.cua.createBrowserTab({"tabId": "ext-live", "mode": "extension", "url": "https://example.com"})
+            self.assertEqual(h_ext.id, 777)
+        finally:
+            rt._pool.shutdown(wait=False)
+
+    def test_list_tabs_line_iterable_and_str_compat(self) -> None:
+        rt = self._make_mock_runtime()
+        try:
+            tabs = rt.cua.listTabs()
+            self.assertIsInstance(tabs, str)
+            self.assertIn("@tab id=501", tabs)
+            rows = list(tabs)
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(rows[0].startswith("# tabs count=2"))
+            self.assertIn("hertz.com", rows[1])
+
+            out = rt.execute({"code": '[t for t in cua.listTabs() if "hertz" in t]'})
+            matched = json.loads(out)
+            self.assertEqual(len(matched), 1)
+            self.assertIn("id=501", matched[0])
+        finally:
+            rt._pool.shutdown(wait=False)
+
+    def test_create_browser_tab_accepts_session_label(self) -> None:
+        rt = self._make_mock_runtime()
+        try:
+            h1 = rt.cua.createBrowserTab("headless", "https://example.com", sessionLabel="Billing Flow")
+            self.assertEqual(h1.session_name, "Billing Flow")
+            self.assertEqual(rt.browser.execute_batch.call_args[0][0]["sessionName"], "Billing Flow")
+
+            h2 = rt.cua.createBrowserTab({"url": "https://example.org", "session_label": "Snake Group"})
+            self.assertEqual(h2.session_name, "Snake Group")
+            self.assertEqual(rt.browser.execute_batch.call_args[0][0]["sessionName"], "Snake Group")
+
+            rt.cua.listTabs(sessionLabel="Billing Flow")
+            self.assertEqual(rt.browser.list_tabs.call_args.kwargs["session_name"], "Billing Flow")
+
+            h3 = rt.cua.getTab(sessionLabel="Billing Flow")
+            self.assertEqual(rt.browser.attach_existing_tab.call_args.kwargs["session_name"], "Billing Flow")
+            self.assertEqual(h3.session_name, "Billing Flow")
+        finally:
+            rt._pool.shutdown(wait=False)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

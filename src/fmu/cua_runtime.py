@@ -3,12 +3,14 @@
 """Unified Faster Mac Use Runtime: Codex-style stateful cua_repl + 1-Trip JSON Batch + Context Window Compactor + Warm Unix Daemon."""
 
 from __future__ import annotations
+import ast
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
 import socket
 import sys
+import textwrap
 import time
 from typing import Any
 
@@ -312,6 +314,11 @@ class _CallableStr(str):
         return str(self)
 
 
+class _TabListStr(str):
+    def __iter__(self):
+        return iter(self.splitlines())
+
+
 class TabHandle:
     def __init__(
         self,
@@ -362,6 +369,17 @@ class TabHandle:
 
     def has_pending(self) -> bool:
         return bool(self._pending_steps or self._pending_macros or self._force_ocr)
+
+    @property
+    def id(self) -> int | str:
+        if self.chrome_tab_id is not None:
+            return self.chrome_tab_id
+        sess = self.runtime.browser._tabs.get(self.tab_id)
+        if sess is not None and sess.is_extension:
+            ctid = getattr(sess._raw_page, "chrome_tab_id", None)
+            if ctid is not None:
+                return int(ctid)
+        return self.tab_id
 
     @property
     def url(self) -> str:
@@ -966,6 +984,8 @@ class CuaNamespace:
         session_name = str(
             opts.get("sessionName")
             or opts.get("session_name")
+            or opts.get("sessionLabel")
+            or opts.get("session_label")
             or opts.get("group")
             or default_group
         )
@@ -1050,13 +1070,23 @@ class CuaNamespace:
             if not q_str and (opts.get("query") or opts.get("url")):
                 q_str = str(opts.get("query") or opts.get("url") or "")
         raw_win_id = opts.get("windowId") if opts.get("windowId") is not None else opts.get("window_id")
-        return self.runtime.browser.list_tabs(
-            query=q_str,
-            window=str(opts["window"]) if opts.get("window") else None,
-            window_id=int(raw_win_id) if raw_win_id is not None else None,
-            session_name=str(opts.get("sessionName") or opts.get("session_name") or opts.get("group") or "") or None,
-            include_internal=bool(opts.get("includeInternal") or opts.get("include_internal")),
-            mode=str(opts.get("mode") or "chrome"),
+        return _TabListStr(
+            self.runtime.browser.list_tabs(
+                query=q_str,
+                window=str(opts["window"]) if opts.get("window") else None,
+                window_id=int(raw_win_id) if raw_win_id is not None else None,
+                session_name=str(
+                    opts.get("sessionName")
+                    or opts.get("session_name")
+                    or opts.get("sessionLabel")
+                    or opts.get("session_label")
+                    or opts.get("group")
+                    or ""
+                )
+                or None,
+                include_internal=bool(opts.get("includeInternal") or opts.get("include_internal")),
+                mode=str(opts.get("mode") or "chrome"),
+            )
         )
 
     list_tabs = listTabs
@@ -1192,12 +1222,16 @@ class CuaNamespace:
                 "browser",
                 "sessionName",
                 "session_name",
+                "sessionLabel",
+                "session_label",
                 "group",
             )
             if any(k in criteria for k in filter_keys):
                 want_session = (
                     criteria.get("sessionName")
                     or criteria.get("session_name")
+                    or criteria.get("sessionLabel")
+                    or criteria.get("session_label")
                     or criteria.get("group")
                 )
                 want_url = criteria.get("url")
@@ -1483,7 +1517,42 @@ def _fmu_join(recv: Any, sep: Any = ",") -> str:
     return str(sep).join(str(x) for x in recv)
 
 
+def _fmu_destr(val: Any, *keys: str) -> tuple[Any, ...]:
+    return tuple(val.get(k) if isinstance(val, dict) else getattr(val, k, None) for k in keys)
+
+
+class _FmuReplReturn(BaseException):
+    def __init__(self, value: Any = None) -> None:
+        super().__init__()
+        self.value = value
+
+
+class _TopLevelReturnRewriter(ast.NodeTransformer):
+    """Rewrite module-level `return` inside control-flow blocks into `_FmuReplReturn` raises."""
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        return node
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        val_node = node.value if node.value is not None else ast.Constant(value=None)
+        exc_call = ast.Call(
+            func=ast.Name(id="_FmuReplReturn", ctx=ast.Load()),
+            args=[val_node],
+            keywords=[],
+        )
+        return ast.copy_location(ast.Raise(exc=exc_call, cause=None), node)
+
+
 _REPL_SAFE_BUILTINS: dict[str, Any] = {
+    "__build_class__": __build_class__,
+    "_FmuReplReturn": _FmuReplReturn,
+    "_fmu_destr": _fmu_destr,
     "len": len,
     "_fmu_len": _fmu_len,
     "_fmu_includes": _fmu_includes,
@@ -1502,6 +1571,8 @@ _REPL_SAFE_BUILTINS: dict[str, Any] = {
     "dict": dict,
     "tuple": tuple,
     "set": set,
+    "frozenset": frozenset,
+    "slice": slice,
     "min": min,
     "max": max,
     "sum": sum,
@@ -1515,11 +1586,27 @@ _REPL_SAFE_BUILTINS: dict[str, Any] = {
     "filter": filter,
     "reversed": reversed,
     "next": next,
+    "iter": iter,
     "repr": repr,
     "enumerate": enumerate,
     "range": range,
     "isinstance": isinstance,
+    "issubclass": issubclass,
+    "hasattr": hasattr,
+    "getattr": getattr,
+    "callable": callable,
     "type": type,
+    "BaseException": BaseException,
+    "Exception": Exception,
+    "ValueError": ValueError,
+    "TypeError": TypeError,
+    "KeyError": KeyError,
+    "IndexError": IndexError,
+    "AttributeError": AttributeError,
+    "RuntimeError": RuntimeError,
+    "LookupError": LookupError,
+    "StopIteration": StopIteration,
+    "AssertionError": AssertionError,
 }
 
 _TAB_CHAIN_METHODS: frozenset[str] = frozenset(
@@ -1607,6 +1694,30 @@ def _find_top_level_colon(entry: str) -> int:
     return -1
 
 
+def _is_block_brace(prefix: str) -> bool:
+    s = prefix.rstrip()
+    if not s:
+        return False
+    if re.search(r"(?:^|[\s;{}()])(?:try|else|finally|do|catch)$", s):
+        return True
+    if s.endswith(")"):
+        depth = 0
+        i = len(s) - 1
+        while i >= 0:
+            if s[i] == ")":
+                depth += 1
+            elif s[i] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            i -= 1
+        if depth == 0:
+            before = s[:i].rstrip()
+            if re.search(r"(?:^|[\s;{}()])(?:if|for|while|catch|switch)$", before):
+                return True
+    return False
+
+
 def _rewrite_braces(expr: str) -> str:
     """Recursively transpile JS object literals, shorthand `{ fields, iframes }`, and `...spread` into Python dicts."""
     out: list[str] = []
@@ -1629,6 +1740,10 @@ def _rewrite_braces(expr: str) -> str:
             out.append(expr[i:])
             break
         inner = expr[i + 1 : j - 1]
+        if _is_block_brace("".join(out)):
+            out.append("{" + _rewrite_braces(inner) + "}")
+            i = j
+            continue
         if not inner.strip():
             out.append("{}")
             i = j
@@ -1648,10 +1763,16 @@ def _rewrite_braces(expr: str) -> str:
             colon_idx = _find_top_level_colon(p)
             if colon_idx >= 0:
                 k = p[:colon_idx].strip()
-                v = _rewrite_braces(p[colon_idx + 1 :].strip())
-                if re.fullmatch(r"[a-zA-Z_$][a-zA-Z0-9_$]*", k) and not re.fullmatch(r"__STR_\d+__", k):
-                    if k not in ("True", "False", "None"):
-                        k = f'"{k}"'
+                raw_v = p[colon_idx + 1 :].strip()
+                v = _rewrite_braces(raw_v)
+                is_dict_comp = bool(re.search(r"\bfor\b.+\bin\b", raw_v))
+                if (
+                    not is_dict_comp
+                    and re.fullmatch(r"[a-zA-Z_$][a-zA-Z0-9_$]*", k)
+                    and not re.fullmatch(r"__STR_\d+__", k)
+                    and k not in ("True", "False", "None")
+                ):
+                    k = f'"{k}"'
                 elif k.startswith("[") and k.endswith("]"):
                     k = f"({_rewrite_braces(k[1:-1].strip())})"
                 new_parts.append(f"{k}: {v}")
@@ -2035,6 +2156,156 @@ def _quote_raw_eval_callbacks(code: str) -> str:
     return "".join(out)
 
 
+_PY_BLOCK_KW_RE = re.compile(
+    r"^(?:@(?!\w+\s*=)|(?:async\s+)?(?:if|elif|else|for|while|try|except|finally|with|def|class)\b|(?:match|case)\b)"
+)
+_PY_CONT_KW_RE = re.compile(r"^(?:elif|else|except|finally|case)\b")
+
+
+def _scan_balanced_block(src: str, open_idx: int, open_ch: str = "{", close_ch: str = "}") -> int:
+    """Return index of matching `close_ch` for `src[open_idx] == open_ch`, respecting strings & comments, or -1."""
+    n = len(src)
+    if open_idx < 0 or open_idx >= n or src[open_idx] != open_ch:
+        return -1
+    depth = 1
+    i = open_idx + 1
+    in_str: str | None = None
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            if len(in_str) == 3 and src[i : i + 3] == in_str:
+                in_str = None
+                i += 3
+                continue
+            if len(in_str) == 1 and ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if (ch == "/" and nxt == "/") or ch == "#":
+            in_line_comment = True
+            i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if src[i : i + 3] in ('"""', "'''"):
+            in_str = src[i : i + 3]
+            i += 3
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _find_top_level_suite_colon(text: str) -> int:
+    """Find first `:` at bracket depth 0 outside strings/comments, or 0 for decorators, or -1."""
+    s = text.lstrip()
+    if s.startswith("@"):
+        return 0
+    n = len(text)
+    i = 0
+    depth = 0
+    in_str: str | None = None
+    escape = False
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            if len(in_str) == 3 and text[i : i + 3] == in_str:
+                in_str = None
+                i += 3
+                continue
+            if len(in_str) == 1 and ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if (ch == "/" and nxt == "/") or ch == "#":
+            nl = text.find("\n", i)
+            if nl < 0:
+                break
+            i = nl + 1
+            continue
+        if ch == "/" and nxt == "*":
+            end = text.find("*/", i + 2)
+            if end < 0:
+                break
+            i = end + 2
+            continue
+        if text[i : i + 3] in ('"""', "'''"):
+            in_str = text[i : i + 3]
+            i += 3
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif ch == ":" and depth == 0:
+            return i
+        i += 1
+    return -1
+
+
+def _format_repl_syntax_error(exc: SyntaxError, normalized_src: str, raw_src: str) -> SyntaxError:
+    line_no = exc.lineno or 1
+    src_lines = normalized_src.splitlines()
+    bad_line = src_lines[line_no - 1].strip() if 1 <= line_no <= len(src_lines) else normalized_src.strip()
+    msg = exc.msg or "invalid syntax"
+    if re.search(r"\b(?:try|catch|finally|if|else|for|while|switch)\b[^{;\n]*\{", raw_src):
+        hint = (
+            f"{msg} (line {line_no}: {bad_line!r}) — cua_repl executes Python control flow "
+            "(`try:/except:`, `if:/else:`, `for:`) with indentation rather than JS `{ ... }` blocks"
+        )
+    else:
+        hint = f"{msg} (line {line_no}: {bad_line!r})"
+    return SyntaxError(hint, (exc.filename or "<repl>", line_no, exc.offset, exc.text))
+
+
 class FasterMacUseRuntime:
     def __init__(self) -> None:
         from concurrent.futures import ThreadPoolExecutor
@@ -2088,8 +2359,9 @@ class FasterMacUseRuntime:
         out_lines.extend(mac_lines)
         return f"# cursors count={len(out_lines)}\n" + "\n".join(out_lines)
 
-    def _split_statements(self, code: str) -> list[str]:
-        stmts: list[str] = []
+    def _split_depth0_lines(self, code: str) -> list[tuple[str, str]]:
+        """Split code on newlines at bracket depth 0 outside strings & comments, preserving leading indentation."""
+        lines: list[tuple[str, str]] = []
         buf: list[str] = []
         in_str: str | None = None
         in_line_comment = False
@@ -2098,6 +2370,16 @@ class FasterMacUseRuntime:
         depth = 0
         i = 0
         n = len(code)
+
+        def _flush_buf() -> None:
+            raw = "".join(buf)
+            buf.clear()
+            lstripped = raw.lstrip(" \t")
+            stripped = lstripped.strip()
+            if stripped:
+                indent = raw[: len(raw) - len(lstripped)]
+                lines.append((indent, stripped))
+
         while i < n:
             ch = code[i]
             nxt = code[i + 1] if i + 1 < n else ""
@@ -2105,17 +2387,15 @@ class FasterMacUseRuntime:
                 if ch == "\n":
                     in_line_comment = False
                     if depth == 0:
-                        s = "".join(buf).strip()
-                        if s:
-                            stmts.append(s)
-                        buf = []
+                        _flush_buf()
                     else:
-                        buf.append(ch)
+                        buf.append("\n")
                 i += 1
                 continue
             if in_block_comment:
                 if ch == "*" and nxt == "/":
                     in_block_comment = False
+                    buf.append(" ")
                     i += 2
                 else:
                     i += 1
@@ -2125,24 +2405,34 @@ class FasterMacUseRuntime:
                 escape = False
                 i += 1
                 continue
-            if in_str:
+            if in_str is not None:
                 if ch == "\\":
                     buf.append(ch)
                     escape = True
                     i += 1
                     continue
-                if ch == in_str:
+                if len(in_str) == 3 and code[i : i + 3] == in_str:
+                    buf.append(in_str)
+                    in_str = None
+                    i += 3
+                    continue
+                if len(in_str) == 1 and ch == in_str:
                     in_str = None
                 buf.append(ch)
                 i += 1
                 continue
-            if ch == "/" and nxt == "/":
+            if (ch == "/" and nxt == "/") or ch == "#":
                 in_line_comment = True
-                i += 2
+                i += 2 if ch == "/" else 1
                 continue
             if ch == "/" and nxt == "*":
                 in_block_comment = True
                 i += 2
+                continue
+            if code[i : i + 3] in ('"""', "'''"):
+                in_str = code[i : i + 3]
+                buf.append(in_str)
+                i += 3
                 continue
             if ch in ('"', "'", "`"):
                 in_str = ch
@@ -2153,18 +2443,283 @@ class FasterMacUseRuntime:
                 depth += 1
             elif ch in (")", "}", "]"):
                 depth = max(0, depth - 1)
-            if (ch == ";" or ch == "\n") and depth == 0:
+            if ch == "\n" and depth == 0:
+                _flush_buf()
+            else:
+                buf.append(ch)
+            i += 1
+        _flush_buf()
+        return lines
+
+    def _split_semicolons(self, text: str) -> list[str]:
+        """Split a single logical line on `;` at bracket depth 0 outside strings & comments."""
+        parts: list[str] = []
+        buf: list[str] = []
+        in_str: str | None = None
+        escape = False
+        depth = 0
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            nxt = text[i + 1] if i + 1 < n else ""
+            if escape:
+                buf.append(ch)
+                escape = False
+                i += 1
+                continue
+            if in_str is not None:
+                if ch == "\\":
+                    buf.append(ch)
+                    escape = True
+                    i += 1
+                    continue
+                if len(in_str) == 3 and text[i : i + 3] == in_str:
+                    buf.append(in_str)
+                    in_str = None
+                    i += 3
+                    continue
+                if len(in_str) == 1 and ch == in_str:
+                    in_str = None
+                buf.append(ch)
+                i += 1
+                continue
+            if (ch == "/" and nxt == "/") or ch == "#":
+                break
+            if ch == "/" and nxt == "*":
+                end = text.find("*/", i + 2)
+                if end < 0:
+                    break
+                buf.append(" ")
+                i = end + 2
+                continue
+            if text[i : i + 3] in ('"""', "'''"):
+                in_str = text[i : i + 3]
+                buf.append(in_str)
+                i += 3
+                continue
+            if ch in ('"', "'", "`"):
+                in_str = ch
+                buf.append(ch)
+                i += 1
+                continue
+            if ch in ("(", "{", "["):
+                depth += 1
+            elif ch in (")", "}", "]"):
+                depth = max(0, depth - 1)
+            if ch == ";" and depth == 0:
                 s = "".join(buf).strip()
                 if s:
-                    stmts.append(s)
+                    parts.append(s)
                 buf = []
             else:
                 buf.append(ch)
             i += 1
         tail = "".join(buf).strip()
         if tail:
-            stmts.append(tail)
+            parts.append(tail)
+        return parts
+
+    def _split_statements(self, code: str) -> list[str]:
+        stmts: list[str] = []
+        for _indent, line_text in self._split_depth0_lines(code):
+            stmts.extend(self._split_semicolons(line_text))
         return stmts
+
+    @staticmethod
+    def _is_py_block_header(text: str) -> bool:
+        return bool(_PY_BLOCK_KW_RE.match(text) and _find_top_level_suite_colon(text) >= 0)
+
+    @staticmethod
+    def _is_py_continuation(text: str) -> bool:
+        return bool(_PY_CONT_KW_RE.match(text) and _find_top_level_suite_colon(text) >= 0)
+
+    def _group_repl_chunks(self, code: str) -> list[tuple[str, Any]]:
+        """Group REPL code into flat `stmt` items, indented `py_block` suites, and `js_try` blocks."""
+        raw_lines = self._split_depth0_lines(code)
+        chunks: list[tuple[str, Any]] = []
+        i = 0
+        n = len(raw_lines)
+        while i < n:
+            indent_str, text = raw_lines[i]
+            if re.match(r"^try\s*\{", text):
+                combined = [text]
+                base_ind = len(indent_str.expandtabs(4))
+                i += 1
+                while i < n:
+                    n_ind_str, n_text = raw_lines[i]
+                    if len(n_ind_str.expandtabs(4)) == base_ind and re.match(r"^(?:catch|finally)\b", n_text):
+                        combined.append(n_text)
+                        i += 1
+                    else:
+                        break
+                chunks.append(("js_try", "\n".join(combined)))
+                continue
+            if self._is_py_block_header(text):
+                base_ind = len(indent_str.expandtabs(4))
+                block_lines: list[tuple[str, str]] = [(indent_str, text)]
+                expect_block = text.lstrip().startswith("@")
+                i += 1
+                while i < n:
+                    n_ind_str, n_text = raw_lines[i]
+                    n_ind = len(n_ind_str.expandtabs(4))
+                    if n_ind > base_ind:
+                        block_lines.append((n_ind_str, n_text))
+                        expect_block = expect_block and n_text.lstrip().startswith("@")
+                        i += 1
+                    elif n_ind == base_ind and (
+                        self._is_py_continuation(n_text)
+                        or (expect_block and self._is_py_block_header(n_text))
+                    ):
+                        block_lines.append((n_ind_str, n_text))
+                        expect_block = n_text.lstrip().startswith("@")
+                        i += 1
+                    else:
+                        break
+                chunks.append(("py_block", block_lines))
+                continue
+            for sub in self._split_semicolons(text):
+                chunks.append(("stmt", sub))
+            i += 1
+        return chunks
+
+    def _normalize_inline_py_stmt(self, text: str) -> str:
+        """Normalize one non-header statement inside a Python suite, desugaring JS destructuring if needed."""
+        subs = self._split_semicolons(text)
+        out_subs: list[str] = []
+        for sub in subs:
+            norm = self._normalize_js_stmt(sub)
+            if not norm:
+                continue
+            destr_m = re.match(r"^__OBJ_DESTR__([a-zA-Z0-9_,]+)__\s*=\s*(.+)$", norm, re.DOTALL)
+            if destr_m:
+                keys = [k for k in destr_m.group(1).split(",") if k]
+                rhs = destr_m.group(2).strip()
+                keys_args = ", ".join(json.dumps(k) for k in keys)
+                lhs = f"{keys[0]}," if len(keys) == 1 else ", ".join(keys)
+                norm = f"{lhs} = _fmu_destr({rhs}, {keys_args})"
+            out_subs.append(norm)
+        return "; ".join(out_subs)
+
+    def _normalize_py_block(self, block_lines: list[tuple[str, str]]) -> str:
+        """Normalize each line inside an indented Python compound block while preserving indentation."""
+        out_lines: list[str] = []
+        for indent_str, text in block_lines:
+            if text.startswith("@"):
+                norm = self._normalize_js_stmt(text)
+                if norm:
+                    out_lines.append(f"{indent_str}{norm}")
+                continue
+            if _PY_BLOCK_KW_RE.match(text):
+                colon_idx = _find_top_level_suite_colon(text)
+                if colon_idx >= 0:
+                    head = text[: colon_idx + 1]
+                    tail = text[colon_idx + 1 :].strip()
+                    norm_head = self._normalize_js_stmt(head)
+                    if tail:
+                        norm_tail = self._normalize_inline_py_stmt(tail)
+                        out_lines.append(f"{indent_str}{norm_head} {norm_tail}".rstrip())
+                    else:
+                        out_lines.append(f"{indent_str}{norm_head}")
+                    continue
+            norm_line = self._normalize_inline_py_stmt(text)
+            if norm_line:
+                out_lines.append(f"{indent_str}{norm_line}")
+        return "\n".join(out_lines)
+
+    def _chunks_to_py_lines(self, code: str) -> list[str]:
+        """Convert arbitrary JS/Python REPL code into valid Python lines for embedding in a suite."""
+        py_lines: list[str] = []
+        for kind, payload in self._group_repl_chunks(code):
+            if kind == "js_try":
+                transpiled = self._transpile_js_try_block(payload)
+                if transpiled is None:
+                    py_lines.append(self._normalize_js_stmt(payload))
+                else:
+                    py_lines.extend(transpiled.splitlines())
+            elif kind == "py_block":
+                norm_block = self._normalize_py_block(payload)
+                if norm_block:
+                    py_lines.extend(norm_block.splitlines())
+            else:
+                norm_stmt = self._normalize_inline_py_stmt(payload)
+                if norm_stmt:
+                    py_lines.append(norm_stmt)
+        return py_lines
+
+    def _transpile_js_try_block(self, text: str) -> str | None:
+        """Transpile JS `try { ... } catch (e) { ... } [finally { ... }]` into Python `try:/except:/finally:`."""
+        m = re.match(r"^try\s*\{", text)
+        if not m:
+            return None
+        try_open = m.end() - 1
+        try_close = _scan_balanced_block(text, try_open, "{", "}")
+        if try_close < 0:
+            return None
+        try_body = text[try_open + 1 : try_close]
+        pos = try_close + 1
+        n = len(text)
+        while pos < n and text[pos].isspace():
+            pos += 1
+
+        catch_clause: tuple[str | None, str] | None = None
+        if re.match(r"catch\b", text[pos:]):
+            pos += 5
+            while pos < n and text[pos].isspace():
+                pos += 1
+            err_name: str | None = None
+            if pos < n and text[pos] == "(":
+                p_close = _scan_balanced_block(text, pos, "(", ")")
+                if p_close < 0:
+                    return None
+                raw_err = text[pos + 1 : p_close].strip()
+                if raw_err:
+                    if not re.fullmatch(r"[a-zA-Z_]\w*", raw_err):
+                        return None
+                    err_name = raw_err
+                pos = p_close + 1
+                while pos < n and text[pos].isspace():
+                    pos += 1
+            if pos >= n or text[pos] != "{":
+                return None
+            c_close = _scan_balanced_block(text, pos, "{", "}")
+            if c_close < 0:
+                return None
+            catch_clause = (err_name, text[pos + 1 : c_close])
+            pos = c_close + 1
+            while pos < n and text[pos].isspace():
+                pos += 1
+
+        finally_body: str | None = None
+        if re.match(r"finally\b", text[pos:]):
+            pos += 7
+            while pos < n and text[pos].isspace():
+                pos += 1
+            if pos >= n or text[pos] != "{":
+                return None
+            f_close = _scan_balanced_block(text, pos, "{", "}")
+            if f_close < 0:
+                return None
+            finally_body = text[pos + 1 : f_close]
+            pos = f_close + 1
+
+        if (catch_clause is None and finally_body is None) or text[pos:].strip().rstrip(";"):
+            return None
+
+        def _render_suite(body_src: str) -> list[str]:
+            lines = self._chunks_to_py_lines(textwrap.dedent(body_src))
+            return [f"    {ln}" for ln in lines] if lines else ["    pass"]
+
+        out = ["try:"]
+        out.extend(_render_suite(try_body))
+        if catch_clause is not None:
+            err_var, catch_src = catch_clause
+            out.append(f"except Exception as {err_var}:" if err_var else "except Exception:")
+            out.extend(_render_suite(catch_src))
+        if finally_body is not None:
+            out.append("finally:")
+            out.extend(_render_suite(finally_body))
+        return "\n".join(out)
 
     def _transpile_template_literal(self, raw_bt: str) -> str:
         content = raw_bt[1:-1]
@@ -2232,8 +2787,12 @@ class FasterMacUseRuntime:
     def _normalize_js_stmt(self, stmt: str) -> str:
         strings: list[str] = []
 
-        def _save_str(m: re.Match[str]) -> str:
+        def _save_str_or_strip_comment(m: re.Match[str]) -> str:
             raw_s = m.group(0)
+            if raw_s.startswith("/*"):
+                return " "
+            if raw_s.startswith(("//", "#")):
+                return ""
             if raw_s.startswith("`") and raw_s.endswith("`"):
                 raw_s = self._transpile_template_literal(raw_s)
             elif not raw_s.startswith(('"""', "'''")) and ("\n" in raw_s or "\r" in raw_s):
@@ -2243,12 +2802,10 @@ class FasterMacUseRuntime:
             return f"__STR_{len(strings) - 1}__"
 
         masked = re.sub(
-            r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:\\[\s\S]|[^"\\])*"|\'(?:\\[\s\S]|[^\'\\])*\'|`(?:\\[\s\S]|[^`\\])*`',
-            _save_str,
+            r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:\\[\s\S]|[^"\\])*"|\'(?:\\[\s\S]|[^\'\\])*\'|`(?:\\[\s\S]|[^`\\])*`|/\*[\s\S]*?\*/|//[^\n]*|#[^\n]*',
+            _save_str_or_strip_comment,
             stmt,
-        )
-        masked = re.sub(r"/\*[\s\S]*?\*/", " ", masked)
-        masked = re.sub(r"//.*$", "", masked, flags=re.MULTILINE).strip()
+        ).strip()
         if not masked:
             return ""
         masked = re.sub(r"\s+", " ", masked).strip()
@@ -2287,28 +2844,96 @@ class FasterMacUseRuntime:
             outer_bid = getattr(_telemetry_ctx, "batch_id", None)
             bid = outer_bid or f"repl-{int(time.time() * 1000) % 1_000_000_000:x}"
             prev_ctx = set_telemetry_context(entrypoint=outer_ep or "repl", batch_id=bid)
-            raw_stmts = self._split_statements(_quote_raw_eval_callbacks(code))
-            lines = [
-                norm
-                for s in raw_stmts
-                if s.strip() and not s.strip().startswith("//")
-                and (norm := self._normalize_js_stmt(s))
-            ]
+            prepared_code = _quote_raw_eval_callbacks(textwrap.dedent(code))
+            raw_chunks = self._group_repl_chunks(prepared_code)
+            exec_items: list[tuple[str, str, str]] = []
+            for kind, payload in raw_chunks:
+                if kind == "js_try":
+                    transpiled = self._transpile_js_try_block(payload)
+                    if transpiled is not None:
+                        exec_items.append(("block", transpiled, payload))
+                    else:
+                        norm = self._normalize_js_stmt(payload)
+                        if norm:
+                            exec_items.append(("stmt", norm, payload))
+                elif kind == "py_block":
+                    norm_block = self._normalize_py_block(payload)
+                    if norm_block:
+                        raw_block = "\n".join(f"{ind}{txt}" for ind, txt in payload)
+                        exec_items.append(("block", norm_block, raw_block))
+                else:
+                    norm = self._normalize_js_stmt(payload)
+                    if norm:
+                        exec_items.append(("stmt", norm, payload))
 
             outputs: list[str] = []
             last_handle: AppHandle | TabHandle | None = None
             console = _ConsoleProxy(outputs)
+            sess.repl_env["__builtins__"] = _REPL_SAFE_BUILTINS
             sess.repl_env["print"] = console.log
             sess.repl_env["console"] = console
             sess.repl_env["JSON"] = _JSON_PROXY
             sess.active_outputs = outputs
-            eval_globals = {"__builtins__": _REPL_SAFE_BUILTINS}
+            fresh_before = {
+                id(h)
+                for h in sess.cua.handles.values()
+                if isinstance(h, (AppHandle, TabHandle))
+            }
+
+            def _emit_expr_val(val: Any) -> None:
+                nonlocal last_handle
+                if isinstance(val, (AppHandle, TabHandle)):
+                    if last_handle is not None and last_handle is not val and last_handle.has_pending():
+                        outputs.append(last_handle.flush())
+                    last_handle = val
+                elif isinstance(val, str):
+                    outputs.append(val)
+                elif val is not None:
+                    try:
+                        outputs.append(json.dumps(val, ensure_ascii=False))
+                    except Exception:
+                        outputs.append(str(val))
 
             try:
-                for stmt in lines:
-                    stmt_allows_stopped = "cua.resume" in stmt or "cua.getStatus" in stmt or "cua.stop" in stmt
+                for kind, item_src, raw_src in exec_items:
+                    stmt_allows_stopped = (
+                        "cua.resume" in item_src or "cua.getStatus" in item_src or "cua.stop" in item_src
+                    )
                     if not stmt_allows_stopped and is_user_stopped():
                         return USER_STOPPED_ERROR
+
+                    if kind == "block":
+                        try:
+                            tree = ast.parse(item_src, mode="exec")
+                            tree = _TopLevelReturnRewriter().visit(tree)
+                            ast.fix_missing_locations(tree)
+                            tail_expr: ast.Expression | None = None
+                            if tree.body and isinstance(tree.body[-1], ast.Expr):
+                                tail_expr = ast.Expression(body=tree.body[-1].value)
+                                ast.fix_missing_locations(tail_expr)
+                                tree = ast.Module(body=tree.body[:-1], type_ignores=[])
+                            exec_code = compile(tree, "<repl>", "exec")
+                            tail_code = compile(tail_expr, "<repl>", "eval") if tail_expr is not None else None
+                        except SyntaxError as exc:
+                            raise _format_repl_syntax_error(exc, item_src, raw_src) from exc
+                        try:
+                            if tree.body:
+                                exec(exec_code, sess.repl_env)
+                            if tail_code is not None:
+                                _emit_expr_val(eval(tail_code, sess.repl_env))
+                        except _FmuReplReturn as ret:
+                            val = ret.value
+                            if isinstance(val, (AppHandle, TabHandle)):
+                                outputs.append(val.flush())
+                                last_handle = None
+                            elif val is not None:
+                                outputs.append(str(val))
+                            break
+                        if not stmt_allows_stopped and is_user_stopped():
+                            return USER_STOPPED_ERROR
+                        continue
+
+                    stmt = item_src
                     obj_destr_exec = re.match(r"^__OBJ_DESTR__([a-zA-Z0-9_,]+)__\s*=\s*(.+)$", stmt, re.DOTALL)
                     tuple_assign_m = (
                         None
@@ -2324,66 +2949,58 @@ class FasterMacUseRuntime:
                         if (obj_destr_exec or tuple_assign_m)
                         else re.match(r"^([a-zA-Z_]\w*)\s*=\s*(?!=)(.+)$", stmt, re.DOTALL)
                     )
-                    if obj_destr_exec:
-                        keys = [k for k in obj_destr_exec.group(1).split(",") if k]
-                        rhs = obj_destr_exec.group(2).strip()
-                        if last_handle is not None and last_handle.has_pending():
-                            outputs.append(last_handle.flush())
-                            if is_user_stopped():
-                                return USER_STOPPED_ERROR
-                        val = eval(rhs, eval_globals, sess.repl_env)
-                        for k in keys:
-                            sess.repl_env[k] = val.get(k) if isinstance(val, dict) else getattr(val, k, None)
-                    elif tuple_assign_m and not stmt.startswith(("if ", "assert ", "return ")):
-                        raw_lhs = tuple_assign_m.group(1).strip().lstrip("[(").rstrip("])")
-                        names = [n.strip() for n in raw_lhs.split(",") if n.strip()]
-                        rhs = tuple_assign_m.group(2).strip()
-                        if last_handle is not None and last_handle.has_pending():
-                            outputs.append(last_handle.flush())
-                            if is_user_stopped():
-                                return USER_STOPPED_ERROR
-                        val = list(eval(rhs, eval_globals, sess.repl_env))
-                        for idx_n, nm in enumerate(names):
-                            sess.repl_env[nm] = val[idx_n] if idx_n < len(val) else None
-                    elif assign_m and not stmt.startswith(("if ", "assert ", "return ")):
-                        var_name = assign_m.group(1).strip()
-                        rhs = assign_m.group(2).strip()
-                        if last_handle is not None and last_handle.has_pending():
-                            outputs.append(last_handle.flush())
-                            if is_user_stopped():
-                                return USER_STOPPED_ERROR
-                        val = eval(rhs, eval_globals, sess.repl_env)
-                        sess.repl_env[var_name] = val
-                        if isinstance(val, (AppHandle, TabHandle)):
-                            last_handle = val
-                            if len(lines) == 1:
-                                val._fresh = False
-                                outputs.append(val.initial_state)
-                    elif stmt.startswith("return "):
-                        if last_handle is not None and last_handle.has_pending():
-                            outputs.append(last_handle.flush())
-                            if is_user_stopped():
-                                return USER_STOPPED_ERROR
-                        val = eval(stmt[7:].strip(), eval_globals, sess.repl_env)
-                        if isinstance(val, (AppHandle, TabHandle)):
-                            outputs.append(val.flush())
-                            last_handle = None
-                        elif val is not None:
-                            outputs.append(str(val))
-                        break
-                    else:
-                        val = eval(stmt, eval_globals, sess.repl_env)
-                        if isinstance(val, (AppHandle, TabHandle)):
-                            if last_handle is not None and last_handle is not val and last_handle.has_pending():
+                    try:
+                        if obj_destr_exec:
+                            keys = [k for k in obj_destr_exec.group(1).split(",") if k]
+                            rhs = obj_destr_exec.group(2).strip()
+                            if last_handle is not None and last_handle.has_pending():
                                 outputs.append(last_handle.flush())
-                            last_handle = val
-                        elif isinstance(val, str):
-                            outputs.append(val)
-                        elif val is not None:
-                            try:
-                                outputs.append(json.dumps(val, ensure_ascii=False))
-                            except Exception:
+                                if is_user_stopped():
+                                    return USER_STOPPED_ERROR
+                            val = eval(rhs, sess.repl_env)
+                            for k in keys:
+                                sess.repl_env[k] = val.get(k) if isinstance(val, dict) else getattr(val, k, None)
+                        elif tuple_assign_m and not stmt.startswith(("if ", "assert ", "return ")):
+                            raw_lhs = tuple_assign_m.group(1).strip().lstrip("[(").rstrip("])")
+                            names = [n.strip() for n in raw_lhs.split(",") if n.strip()]
+                            rhs = tuple_assign_m.group(2).strip()
+                            if last_handle is not None and last_handle.has_pending():
+                                outputs.append(last_handle.flush())
+                                if is_user_stopped():
+                                    return USER_STOPPED_ERROR
+                            val = list(eval(rhs, sess.repl_env))
+                            for idx_n, nm in enumerate(names):
+                                sess.repl_env[nm] = val[idx_n] if idx_n < len(val) else None
+                        elif assign_m and not stmt.startswith(("if ", "assert ", "return ")):
+                            var_name = assign_m.group(1).strip()
+                            rhs = assign_m.group(2).strip()
+                            if last_handle is not None and last_handle.has_pending():
+                                outputs.append(last_handle.flush())
+                                if is_user_stopped():
+                                    return USER_STOPPED_ERROR
+                            val = eval(rhs, sess.repl_env)
+                            sess.repl_env[var_name] = val
+                            if isinstance(val, (AppHandle, TabHandle)):
+                                last_handle = val
+                                if len(exec_items) == 1:
+                                    val._fresh = False
+                                    outputs.append(val.initial_state)
+                        elif stmt.startswith("return "):
+                            if last_handle is not None and last_handle.has_pending():
+                                outputs.append(last_handle.flush())
+                                if is_user_stopped():
+                                    return USER_STOPPED_ERROR
+                            val = eval(stmt[7:].strip(), sess.repl_env)
+                            if isinstance(val, (AppHandle, TabHandle)):
+                                outputs.append(val.flush())
+                                last_handle = None
+                            elif val is not None:
                                 outputs.append(str(val))
+                            break
+                        else:
+                            _emit_expr_val(eval(stmt, sess.repl_env))
+                    except SyntaxError as exc:
+                        raise _format_repl_syntax_error(exc, stmt, raw_src) from exc
                     if not stmt_allows_stopped and is_user_stopped():
                         return USER_STOPPED_ERROR
 
@@ -2399,6 +3016,11 @@ class FasterMacUseRuntime:
                 if last_handle is not None and not outputs and last_handle._fresh:
                     last_handle._fresh = False
                     outputs.append(last_handle.initial_state)
+                elif not outputs:
+                    for h in list(sess.cua.handles.values()):
+                        if isinstance(h, (AppHandle, TabHandle)) and id(h) not in fresh_before and h._fresh:
+                            h._fresh = False
+                            outputs.append(h.initial_state)
             finally:
                 sess.active_outputs = None
                 reset_telemetry_context(prev_ctx)

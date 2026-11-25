@@ -4,7 +4,7 @@ class FasterMacUse < Formula
   desc "Background-first, multi-cursor browser & macOS Accessibility engine for AI agents"
   homepage "https://clifan.com/faster-mac-use/"
   url "https://github.com/lifan-builds/faster-mac-use/archive/refs/heads/main.tar.gz"
-  version "0.5.4"
+  version "0.5.5"
   license "AGPL-3.0-only"
   head "https://github.com/lifan-builds/faster-mac-use.git", branch: "main"
 

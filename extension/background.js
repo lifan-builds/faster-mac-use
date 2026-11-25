@@ -1388,6 +1388,20 @@ function withTimeout(promise, ms, message) {
   });
 }
 
+function isDiscardedTab(t) {
+  return !t || t.discarded === true || t.status === "unloaded";
+}
+
+function formatExtensionInfo(ext) {
+  return {
+    id: String((ext && ext.id) || ""),
+    name: String((ext && ext.name) || ""),
+    enabled: Boolean(ext && ext.enabled),
+    type: String((ext && ext.type) || ""),
+    version: String((ext && ext.version) || "")
+  };
+}
+
 async function getLiveTabOrThrow(tabId) {
   if (!chrome.tabs || typeof chrome.tabs.get !== "function") {
     return null;
@@ -1406,7 +1420,7 @@ async function getLiveTabOrThrow(tabId) {
     throw new Error(`Tab ${tabId} was closed or does not exist; call cua.listTabs() to see active tabs`);
   }
   const curUrl = String(curTab.url || curTab.pendingUrl || "");
-  if (curTab.discarded === true || curTab.status === "unloaded") {
+  if (isDiscardedTab(curTab)) {
     attachedDebuggers.delete(tabId);
     debuggerLastUsedAt.delete(tabId);
     verifiedRendererTabs.delete(tabId);
@@ -1680,15 +1694,20 @@ async function handleRpc(msg) {
         let reattachedTab = null;
         if (sessionTabs.has(sessionId)) {
           const savedId = sessionTabs.get(sessionId);
-          reattachedTab = allTabs.find(t => t.id === savedId) || null;
-          if (!reattachedTab && chrome.tabs && typeof chrome.tabs.get === "function") {
-            try { reattachedTab = await chrome.tabs.get(savedId); } catch (_) {}
+          const cand = allTabs.find(t => t.id === savedId) || null;
+          if (cand && !isDiscardedTab(cand)) {
+            reattachedTab = cand;
+          } else if (!cand && chrome.tabs && typeof chrome.tabs.get === "function") {
+            try {
+              const fetched = await chrome.tabs.get(savedId);
+              if (fetched && !isDiscardedTab(fetched)) reattachedTab = fetched;
+            } catch (_) {}
           }
         }
         if (!reattachedTab || String(reattachedTab.url || "") === "about:blank") {
           const { groupId: existingGid } = await findGroupWindowId(sessionName, explicitWindowId);
           if (existingGid !== undefined) {
-            const groupTabs = allTabs.filter(t => t.groupId === existingGid);
+            const groupTabs = allTabs.filter(t => t.groupId === existingGid && !isDiscardedTab(t));
             const nonBlank = groupTabs.filter(t => {
               const u = String(t.url || t.pendingUrl || "");
               return u && u !== "about:blank" && !u.startsWith("chrome://newtab");
@@ -1736,15 +1755,16 @@ async function handleRpc(msg) {
         if (wfTabs.length > 0) {
           filterMatchedWindowId = wfTabs[0].windowId;
           if (reuseExisting) {
+            const liveWfTabs = wfTabs.filter(t => !isDiscardedTab(t));
             const urlStr = String(url || "").trim();
             const urlLower = urlStr.toLowerCase();
             const exactUrlMatch = (urlStr && urlStr !== "about:blank")
-              ? wfTabs.find(t => {
+              ? liveWfTabs.find(t => {
                   const tu = String(t.url || t.pendingUrl || "");
                   return tu.startsWith(urlStr) || tu.toLowerCase().includes(urlLower);
                 })
               : null;
-            const match = exactUrlMatch || wfTabs[0];
+            const match = exactUrlMatch || liveWfTabs[0];
             if (match && match.id !== undefined) {
               const prevGroupId = match.groupId;
               const groupId = await ensureAgentGroup(match.id, sessionName, color, match.windowId);
@@ -1800,6 +1820,7 @@ async function handleRpc(msg) {
         const urlLower = String(url).toLowerCase();
         const wantHost = getHostname(url);
         const match = allTabs.find(t => {
+          if (isDiscardedTab(t)) return false;
           if (explicitWindowId !== undefined && t.windowId !== explicitWindowId) return false;
           const tUrl = String(t.url || t.pendingUrl || "");
           if (tUrl.startsWith(url) || tUrl.toLowerCase().includes(urlLower)) return true;
@@ -1832,7 +1853,7 @@ async function handleRpc(msg) {
       } else if (reuseExisting && (!url || url === "about:blank")) {
         const { groupId: existingGid } = await findGroupWindowId(sessionName, explicitWindowId);
         if (existingGid !== undefined) {
-          const groupTabs = allTabs.filter(t => t.groupId === existingGid);
+          const groupTabs = allTabs.filter(t => t.groupId === existingGid && !isDiscardedTab(t));
           const nonBlank = groupTabs.filter(t => {
             const u = String(t.url || t.pendingUrl || "");
             return u && u !== "about:blank" && !u.startsWith("chrome://newtab");
@@ -2079,7 +2100,7 @@ async function handleRpc(msg) {
                 return u && u !== "about:blank" && !u.startsWith("chrome://newtab");
               });
           if (filtered.length > 0) {
-            const liveFiltered = filtered.filter(t => !t.discarded && t.status !== "unloaded");
+            const liveFiltered = filtered.filter(t => !isDiscardedTab(t));
             const pool = liveFiltered.length > 0 ? liveFiltered : filtered;
             match = pool[pool.length - 1];
           }
@@ -2097,7 +2118,7 @@ async function handleRpc(msg) {
           return u.toLowerCase().includes(pat) || String(t.title || "").toLowerCase().includes(pat);
         });
         if (candidates.length > 0) {
-          const liveCandidates = candidates.filter(t => !t.discarded && t.status !== "unloaded");
+          const liveCandidates = candidates.filter(t => !isDiscardedTab(t));
           const pool = liveCandidates.length > 0 ? liveCandidates : candidates;
           match = pool.find(t => t.active) || pool[pool.length - 1];
         }
@@ -2110,7 +2131,7 @@ async function handleRpc(msg) {
       if (params.assignGroup === true && sessionName) {
         try { await ensureAgentGroup(match.id, sessionName, params.color || "blue", match.windowId); } catch (_) {}
       }
-      const isDiscardedMatch = Boolean(match.discarded) || match.status === "unloaded";
+      const isDiscardedMatch = isDiscardedTab(match);
       if (params.focusEmulation !== false && !isDiscardedMatch) {
         try {
           await withTimeout(
@@ -2729,6 +2750,55 @@ async function handleRpc(msg) {
       sessionGroups.delete(sessionName);
       return { id, result: { closedCount } };
     }
+    if (method === "listExtensions") {
+      if (!chrome.management || typeof chrome.management.getAll !== "function") {
+        throw new Error('chrome.management API unavailable; reload the MV3 extension to grant the "management" permission');
+      }
+      const items = (await chrome.management.getAll()) || [];
+      const selfId = (chrome.runtime && chrome.runtime.id) ? String(chrome.runtime.id) : "";
+      return {
+        id,
+        result: {
+          extensions: items.filter(Boolean).map(formatExtensionInfo),
+          selfId
+        }
+      };
+    }
+    if (method === "setExtensionEnabled") {
+      if (!chrome.management || typeof chrome.management.setEnabled !== "function") {
+        throw new Error('chrome.management API unavailable; reload the MV3 extension to grant the "management" permission');
+      }
+      const targetId = String(params.id || params.extensionId || "").trim();
+      if (!targetId) {
+        throw new Error("setExtensionEnabled requires extension 'id'");
+      }
+      if (typeof params.enabled !== "boolean") {
+        throw new Error("setExtensionEnabled requires boolean 'enabled'");
+      }
+      const selfId = (chrome.runtime && chrome.runtime.id) ? String(chrome.runtime.id) : "";
+      if (!params.enabled && selfId && targetId === selfId) {
+        throw new Error(`Refusing to disable the active Faster Mac Use bridge extension (${selfId})`);
+      }
+      await chrome.management.setEnabled(targetId, params.enabled);
+      let updated = null;
+      if (typeof chrome.management.get === "function") {
+        try {
+          updated = await chrome.management.get(targetId);
+        } catch (_) {}
+      }
+      if (!updated && typeof chrome.management.getAll === "function") {
+        try {
+          const all = (await chrome.management.getAll()) || [];
+          updated = all.find(e => e && e.id === targetId) || null;
+        } catch (_) {}
+      }
+      return {
+        id,
+        result: updated
+          ? formatExtensionInfo(updated)
+          : { id: targetId, name: String(params.name || ""), enabled: params.enabled, type: "", version: "" }
+      };
+    }
     if (method === "cdp") {
       const { tabId } = params;
       const cdpMethod = params.cdpMethod || params.method;
@@ -2752,7 +2822,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.4" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.5" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

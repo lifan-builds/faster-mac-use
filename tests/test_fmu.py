@@ -563,7 +563,7 @@ class TestFasterMacUse(unittest.TestCase):
 
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
-        self.assertIn("faster-mac-use 0.5.4", ver_proc.stdout)
+        self.assertIn("faster-mac-use 0.5.5", ver_proc.stdout)
         self.assertIn("Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
@@ -2664,7 +2664,7 @@ setInterval(() => {{}}, 1000);
         try:
             self.assertTrue(bridge.wait_connected(timeout=3.0))
             bridge_st = self.rt.execute({"bridgeStatus": True})
-            self.assertIn('version="0.5.4"', bridge_st)
+            self.assertIn('version="0.5.5"', bridge_st)
 
             tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
             self.assertIn('@tab id=501', tabs_list)
@@ -4449,6 +4449,240 @@ setInterval(() => {{}}, 1000);
                 node_proc2.stdout.close()
             if node_proc2.stderr:
                 node_proc2.stderr.close()
+
+    def test_mv3_management_extensions_and_reuse_existing_skips_discarded_tabs(self) -> None:
+        manifest = json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("management", manifest.get("permissions", []))
+
+        self.rt.execute({"reset": True})
+        bridge = self.rt.browser.ensure_bridge()
+        bg_js = (ROOT / "extension" / "background.js").read_text(encoding="utf-8").replace(
+            "ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{bridge.port}/ext"
+        )
+        self_ext_id = "fmuextensionbridge00000000000001"
+        mv3_mgmt_harness = f"""
+const state = {{
+  tabs: [
+    {{ id: 601, windowId: 77, groupId: -1, active: false, title: "Rakuten Sleeping", url: "https://www.rakuten.com/shopping-trips.htm", status: "unloaded", discarded: true }},
+    {{ id: 602, windowId: 77, groupId: -1, active: false, title: "TopCashback Sleeping", url: "https://www.topcashback.com/account", status: "unloaded", discarded: true }},
+    {{ id: 603, windowId: 77, groupId: -1, active: true, title: "TopCashback Live", url: "https://www.topcashback.com/home", status: "complete", discarded: false }},
+  ],
+  groups: [{{ id: 70, windowId: 77, title: "Agent" }}],
+  nextTabId: 604,
+  createdUrls: [],
+  setEnabledCalls: [],
+  extensions: [
+    {{ id: "{self_ext_id}", name: "Faster Mac Use — Agent Bridge", enabled: true, type: "extension", version: "0.5.5" }},
+    {{ id: "chhjbkfssaaaaaaaaaaaaaaaaaaaaaaa", name: "Rakuten: Get Cash Back For Shopping", enabled: false, type: "extension", version: "5.38.0" }},
+    {{ id: "topcashbackbbbbbbbbbbbbbbbbbbbbb", name: "TopCashback: Get Cashback & Coupons", enabled: true, type: "extension", version: "2.1.0" }},
+    {{ id: "shopbackcccccccccccccccccccccccc", name: "ShopBack: Cashback & Coupons", enabled: false, type: "extension", version: "3.0.4" }},
+    {{ id: "offerloveeeeeeeeeeeeeeeeeeeeeeee", name: "Offer.love", enabled: true, type: "extension", version: "1.4.2" }},
+  ],
+}};
+globalThis.chrome = {{
+  storage: {{ local: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
+  tabs: {{
+    query: async () => state.tabs,
+    get: async (id) => state.tabs.find(t => t.id === id),
+    create: async (opts) => {{
+      state.createdUrls.push(opts.url);
+      const nt = {{ id: state.nextTabId++, windowId: opts.windowId || 77, groupId: -1, active: false, title: "Live Created", url: opts.url, status: "complete", discarded: false }};
+      state.tabs.push(nt);
+      return nt;
+    }},
+    update: async (id, opts) => {{
+      const f = state.tabs.find(t => t.id === id);
+      if (f && opts && opts.url) f.url = opts.url;
+      return f;
+    }},
+    group: async () => 70,
+    onRemoved: {{ addListener: () => {{}} }},
+    onUpdated: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{
+    get: async (gid) => state.groups.find(g => g.id === gid),
+    query: async () => state.groups,
+    update: async (gid, opts) => ({{ id: gid, ...opts }}),
+  }},
+  windows: {{ getAll: async () => [{{ id: 77, focused: false, type: "normal" }}] }},
+  debugger: {{
+    attach: async () => {{}},
+    sendCommand: async (target, method, params) => {{
+      if (method === "Runtime.evaluate") {{
+        const expr = String((params && params.expression) || "");
+        if (expr.includes("FMU_RUNTIME_VERSION")) return {{ result: {{ value: true }} }};
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const payload = JSON.parse(expr.slice("window.__fmu.executeBatch(".length, -1));
+          const steps = payload.steps || [];
+          if (steps.some(s => String(s && s.code || "").includes("__drop_management__"))) {{
+            delete globalThis.chrome.management;
+          }}
+          const tab = state.tabs.find(t => t.id === target.tabId);
+          return {{
+            result: {{
+              value: {{
+                url: tab ? tab.url : "about:blank",
+                title: tab ? tab.title : "",
+                crc: "12345678",
+                seq: 1,
+                count: 1,
+                errors: [],
+                evalOutputs: [JSON.stringify(state)],
+                rawEvalValues: [JSON.stringify(state)],
+                escalations: [],
+                timings: {{ execMs: 1, settleMs: 0, snapMs: 1, totalInPageMs: 2 }},
+                lines: ['@u1 text "Ready"'],
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+    onEvent: {{ addListener: () => {{}} }},
+  }},
+  management: {{
+    getAll: async () => state.extensions.map(e => ({{ ...e }})),
+    get: async (id) => {{
+      const found = state.extensions.find(e => e.id === id);
+      if (!found) throw new Error("Failed to find item with id " + id);
+      return {{ ...found }};
+    }},
+    setEnabled: async (id, enabled) => {{
+      state.setEnabledCalls.push({{ id, enabled }});
+      const found = state.extensions.find(e => e.id === id);
+      if (!found) throw new Error("Failed to find item with id " + id);
+      found.enabled = Boolean(enabled);
+    }},
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ id: "{self_ext_id}", onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }},
+}};
+{bg_js}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(
+            ["node", "-e", mv3_mgmt_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(bridge.wait_connected(timeout=3.0))
+
+            # 1. Handoff #28: createBrowserTab(reuseExisting=true) skips discarded tab 602 and picks live 603,
+            #    and when only discarded tab 601 exists for rakuten.com, opens a fresh live tab 604 instead of failing.
+            reuse_out = self.rt.execute(
+                {
+                    "code": (
+                        'const tcb = await cua.createBrowserTab({mode: "chrome", url: "https://www.topcashback.com/home", reuseExisting: true});\n'
+                        'const rak = await cua.createBrowserTab({mode: "chrome", url: "https://www.rakuten.com/shopping-trips.htm", reuseExisting: true});\n'
+                        'const rakWf = await cua.createBrowserTab({mode: "chrome", window: "Rakuten Sleeping", url: "https://www.rakuten.com/new", reuseExisting: true});\n'
+                        'return JSON.stringify({tcbId: tcb.id, rakId: rak.id, rakWfId: rakWf.id, rakSnap: await rak.snapshot()});'
+                    )
+                }
+            )
+            reuse_data = json.loads(reuse_out)
+            self.assertEqual(reuse_data["tcbId"], 603)
+            self.assertEqual(reuse_data["rakId"], 604)
+            self.assertEqual(reuse_data["rakWfId"], 605)
+            self.assertNotIn("discarded/unloaded", reuse_data["rakSnap"])
+            self.assertIn("Ready", reuse_data["rakSnap"])
+
+            # 2. Extension listing via CuaNamespace, BrowserEngine, line iteration, filters, and JSON format
+            listed = self.rt.execute({"code": "return await cua.listExtensions();"})
+            self.assertIn('# extensions count=5 bridge="mv3"', listed)
+            self.assertIn(f"@ext id={self_ext_id} enabled=true type=extension version=\"0.5.5\" [self]", listed)
+            self.assertIn('@ext id=chhjbkfssaaaaaaaaaaaaaaaaaaaaaaa enabled=false type=extension version="5.38.0" "Rakuten: Get Cash Back For Shopping"', listed)
+
+            iter_rows = json.loads(self.rt.execute({"code": '[e for e in cua.listExtensions() if "Offer.love" in e]'}))
+            self.assertEqual(len(iter_rows), 1)
+            self.assertIn("offerloveeeeeeeeeeeeeeeeeeeeeeee", iter_rows[0])
+
+            filtered_disabled = self.rt.execute({"code": 'return await cua.listExtensions({enabled: false, query: "rakuten"});'})
+            self.assertIn("# extensions count=1", filtered_disabled)
+            self.assertIn("Rakuten", filtered_disabled)
+
+            raw_items = self.rt.browser.list_extensions(query="cashback")
+            self.assertEqual([i["name"] for i in raw_items], ["ShopBack: Cashback & Coupons", "TopCashback: Get Cashback & Coupons"])
+            self.assertEqual(set(raw_items[0].keys()), {"id", "name", "enabled", "type", "version"})
+
+            # 3. Safe unique name and exact ID toggling + top-level JSON request support
+            en_res = self.rt.execute({"code": 'return await cua.setExtensionEnabled("Rakuten", true);'})
+            self.assertIn("# extension id=chhjbkfssaaaaaaaaaaaaaaaaaaaaaaa enabled=true", en_res)
+            self.assertIn("Rakuten: Get Cash Back For Shopping", en_res)
+
+            dis_res = self.rt.execute({"setExtensionEnabled": {"id": "chhjbkfssaaaaaaaaaaaaaaaaaaaaaaa", "enabled": False, "format": "json"}})
+            self.assertEqual(json.loads(dis_res)["enabled"], False)
+
+            self.assertEqual(
+                self.rt.execute({"listExtensions": {"query": "Offer.love"}}).count("@ext "),
+                1,
+            )
+
+            # 4. Ambiguity, unknown extension, non-boolean enabled, and self-disable protection (Python + MV3 JS)
+            with self.assertRaises(RuntimeError) as amb_ctx:
+                self.rt.execute({"code": 'await cua.setExtensionEnabled("Cashback", false);'})
+            self.assertIn("Multiple Chrome extensions match", str(amb_ctx.exception))
+            self.assertIn("TopCashback", str(amb_ctx.exception))
+            self.assertIn("ShopBack", str(amb_ctx.exception))
+
+            with self.assertRaises(RuntimeError) as miss_ext_ctx:
+                self.rt.execute({"code": 'await cua.setExtensionEnabled("Honey", true);'})
+            self.assertIn("No Chrome extension found", str(miss_ext_ctx.exception))
+
+            with self.assertRaises(ValueError):
+                self.rt.execute({"code": 'await cua.setExtensionEnabled("Offer.love", "false");'})
+
+            for bad_self_code in (
+                'await cua.setExtensionEnabled("Faster Mac Use", false);',
+                f'await cua.setExtensionEnabled("{self_ext_id}", false);',
+            ):
+                with self.assertRaises(RuntimeError) as self_ctx:
+                    self.rt.execute({"code": bad_self_code})
+                self.assertIn("Refusing to disable", str(self_ctx.exception))
+
+            # Even direct RPC bypassing Python lookup must be refused by extension/background.js
+            with self.assertRaises(RuntimeError) as rpc_self_ctx:
+                self.rt.browser._ext_bridge.call_rpc(
+                    "setExtensionEnabled",
+                    {"id": self_ext_id, "enabled": False},
+                    timeout=3.0,
+                )
+            self.assertIn("Refusing to disable", str(rpc_self_ctx.exception))
+
+            final_state = json.loads(
+                self.rt.execute({"code": 'const t = await cua.getTab(603); return await t.evalValue("state");'})
+            )
+            self.assertFalse(
+                any(c["id"] == self_ext_id and c["enabled"] is False for c in final_state["setEnabledCalls"])
+            )
+
+            # 5. User-stop latch allows listExtensions (read-only) but blocks setExtensionEnabled
+            with mock.patch("fmu.cua_runtime.is_user_stopped", return_value=True), \
+                 mock.patch("fmu.browser_engine.is_user_stopped", return_value=True):
+                self.assertIn("# extensions count=5", self.rt.execute({"listExtensions": True}))
+                self.assertIn("USER_STOPPED", self.rt.execute({"setExtensionEnabled": {"name": "Offer.love", "enabled": False}}))
+
+            # 6. Actionable error if MV3 extension lacks management permission (not reloaded yet)
+            self.rt.execute(
+                {"code": 'const t = await cua.getTab(603); return await t.evalValue("__drop_management__");'}
+            )
+            with self.assertRaises(RuntimeError) as no_mgmt_ctx:
+                self.rt.execute({"code": "await cua.listExtensions();"})
+            self.assertIn("management", str(no_mgmt_ctx.exception))
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
 
 
 class TestTraceReplay(unittest.TestCase):

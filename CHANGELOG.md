@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.5 (2026-11-25)
+
+### Added
+- **Chrome extension listing & toggling (`management` permission)**: Added `"management"` permission in `extension/manifest.json`, `listExtensions` / `setExtensionEnabled` RPCs in `extension/background.js` (refusing to disable `chrome.runtime.id` itself so the MV3 bridge can never self-disconnect), `BrowserEngine.list_extensions()` / `BrowserEngine.set_extension_enabled()`, and `cua.listExtensions()` / `cua.setExtensionEnabled(id_or_name, enabled)` with safe unique name/ID lookup and top-level JSON/MCP request support (`{"listExtensions": ...}`, `{"setExtensionEnabled": ...}`).
+- **REPL & telemetry ergonomics**: Support coordinate/dict arguments in `TabHandle.click()` / `moveCursor()`, normalize seconds timeouts (`timeout` / `timeout_s` / `timeoutSeconds`) in `waitFor()` and raw JSON steps, and seed `strictCsp` from `_strict_csp_hosts` on `executeBatch` while tagging cached `eval_csp` telemetry as `eval_csp_cached`.
+
+### Fixed
+- **Skip Chrome-discarded tabs when reusing in `createBrowserTab`**: `createBrowserTab` (`reuseExisting=true` and `reattach`) now skips `discarded: true` / `status: "unloaded"` Chrome tabs instead of attaching to sleeping tabs that immediately fail in `ensure_runtime()` / `executeBatch()` with `discarded/unloaded by Chrome`.
+
 ## 0.5.4 (2026-11-24)
 
 ### Fixed

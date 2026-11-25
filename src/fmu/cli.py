@@ -87,6 +87,7 @@ def execute_via_daemon(
             "perfReport",
             "bridgeStatus",
             "listTabs",
+            "listExtensions",
             "closeAgentTabs",
             "agentSessions",
         )

@@ -1141,6 +1141,62 @@ class CuaNamespace:
 
     list_tabs = listTabs
 
+    def listExtensions(self, query: str | dict[str, Any] = "", **kwargs: Any) -> str:
+        opts: dict[str, Any] = {}
+        q_str = ""
+        if isinstance(query, dict):
+            opts.update(query)
+            q_str = str(opts.get("query") or opts.get("name") or "")
+        elif query is not None:
+            q_str = str(query)
+        if kwargs:
+            opts.update(kwargs)
+            if not q_str and (opts.get("query") or opts.get("name")):
+                q_str = str(opts.get("query") or opts.get("name") or "")
+        payload: dict[str, Any] = {"query": q_str}
+        if isinstance(opts.get("enabled"), bool):
+            payload["enabled"] = opts["enabled"]
+        ext_type = opts.get("type") or opts.get("ext_type") or opts.get("extType")
+        if ext_type:
+            payload["type"] = str(ext_type)
+        if opts.get("format"):
+            payload["format"] = str(opts["format"])
+        return _TabListStr(self.runtime.browser.execute_batch({"listExtensions": payload}))
+
+    list_extensions = listExtensions
+
+    def setExtensionEnabled(
+        self,
+        id_or_name: str | dict[str, Any] = "",
+        enabled: bool | None = None,
+        **kwargs: Any,
+    ) -> str:
+        opts: dict[str, Any] = {}
+        target = ""
+        if isinstance(id_or_name, dict):
+            opts.update(id_or_name)
+        elif id_or_name is not None:
+            target = str(id_or_name)
+        if kwargs:
+            opts.update(kwargs)
+        if not target:
+            target = str(
+                opts.get("id")
+                or opts.get("extensionId")
+                or opts.get("idOrName")
+                or opts.get("id_or_name")
+                or opts.get("name")
+                or opts.get("extension")
+                or ""
+            )
+        eff_enabled = opts["enabled"] if "enabled" in opts else enabled
+        payload: dict[str, Any] = {"id": target, "enabled": eff_enabled}
+        if opts.get("format"):
+            payload["format"] = str(opts["format"])
+        return self.runtime.browser.execute_batch({"setExtensionEnabled": payload})
+
+    set_extension_enabled = setExtensionEnabled
+
     def getTab(self, criteria: dict[str, Any] | str | int | None = None, **kwargs: Any) -> TabHandle:
         # Direct Chrome integer tabId (`cua.getTab(501)`)
         if isinstance(criteria, int) and not isinstance(criteria, bool) and not kwargs:
@@ -3278,7 +3334,10 @@ class FasterMacUseRuntime:
                             a_sess.cua.handles.pop(hid, None)
             return out
 
-        if req.get("listTabs"):
+        if req.get("listTabs") or isinstance(req.get("listTabs"), dict):
+            return self.browser.execute_batch(req)
+
+        if req.get("listExtensions") or isinstance(req.get("listExtensions"), dict):
             return self.browser.execute_batch(req)
 
         if "perfReport" in req and req["perfReport"]:
@@ -3307,6 +3366,9 @@ class FasterMacUseRuntime:
 
         if req.get("reloadExtension"):
             return self.browser.execute_batch({"reloadExtension": True})
+
+        if "setExtensionEnabled" in req and req["setExtensionEnabled"] is not None:
+            return self.browser.execute_batch({"setExtensionEnabled": req["setExtensionEnabled"]})
 
         if "parallel" in req and isinstance(req["parallel"], list):
             return self.execute_parallel(req["parallel"])
@@ -3476,6 +3538,8 @@ MCP_TOOL_SCHEMA = {
             "requireExtension": {"type": "boolean"},
             "reuseExisting": {"type": "boolean"},
             "listTabs": {"type": ["boolean", "string", "object"]},
+            "listExtensions": {"type": ["boolean", "string", "object"]},
+            "setExtensionEnabled": {"type": "object"},
             "bridgeStatus": {"type": "boolean"},
             "reloadExtension": {"type": "boolean"},
             "perfReport": {"type": ["boolean", "object"]},

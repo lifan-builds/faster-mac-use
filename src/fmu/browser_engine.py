@@ -760,11 +760,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.5.4"
+_FMU_RUNTIME_VERSION = "0.5.5"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.5.4";
+  const FMU_RUNTIME_VERSION = "0.5.5";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -3769,7 +3769,14 @@ class ExtensionWebSocketBridge:
             except OSError:
                 pass
 
-    def call_rpc(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> Any:
+    def call_rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float = 10.0,
+        *,
+        check_stopped: bool = True,
+    ) -> Any:
         with self._client_lock:
             sock = self._client_sock
         if sock is None:
@@ -3789,7 +3796,7 @@ class ExtensionWebSocketBridge:
             raise ConnectionError(f"Failed sending to extension bridge: {exc}") from exc
         deadline = time.monotonic() + timeout
         while True:
-            if is_user_stopped():
+            if check_stopped and is_user_stopped():
                 with self._pending_lock:
                     self._pending.pop(req_id, None)
                 raise RuntimeError(USER_STOPPED_ERROR)
@@ -4408,6 +4415,7 @@ class BrowserEngine:
         self._strict_csp_hosts: set[str] = set()
         self._state_lock = threading.RLock()
         self._ext_bridge_inst: ExtensionWebSocketBridge | None = None
+        self._ext_self_id: str = ""
         self._bridge_lock = threading.Lock()
         self._init_mono: float = time.monotonic()
         self._preview_lock = threading.Lock()
@@ -5548,7 +5556,7 @@ class BrowserEngine:
                 if session_name:
                     rpc_p["sessionName"] = str(session_name)
                 try:
-                    ext_res = self._ext_bridge.call_rpc("listTabs", rpc_p, timeout=4.0)
+                    ext_res = self._ext_bridge.call_rpc("listTabs", rpc_p, timeout=4.0, check_stopped=False)
                     if isinstance(ext_res, dict) and isinstance(ext_res.get("tabs"), list):
                         ext_used = True
                         for t in ext_res["tabs"]:
@@ -5588,6 +5596,158 @@ class BrowserEngine:
         bridge_label = "mv3" if ext_used else ("playwright" if lines else ("mv3" if self._ext_bridge.is_connected() else "none"))
         header = f'# tabs count={len(lines)} bridge="{bridge_label}"'
         return "\n".join([header] + lines)
+
+    def _require_ext_bridge(self) -> ExtensionWebSocketBridge:
+        if os.environ.get("FMU_USE_EXTENSION", "1") == "0":
+            raise RuntimeError("MV3 extension bridge disabled (FMU_USE_EXTENSION=0)")
+        bridge = self._ext_bridge
+        if not bridge.is_connected():
+            cold_preferred = (
+                bridge.port == bridge.preferred_port
+                and (time.monotonic() - self._init_mono) < 5.0
+            )
+            bridge.wait_connected(timeout=1.8 if cold_preferred else 0.35)
+        if not bridge.is_connected():
+            raise RuntimeError(self._extension_diagnostic_error())
+        return bridge
+
+    def _list_extensions_raw(
+        self,
+        query: str = "",
+        *,
+        enabled: bool | None = None,
+        ext_type: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        bridge = self._require_ext_bridge()
+        ext_res = bridge.call_rpc("listExtensions", {}, timeout=4.0, check_stopped=False)
+        raw_items = ext_res.get("extensions") if isinstance(ext_res, dict) else None
+        if not isinstance(raw_items, list):
+            raise RuntimeError(f"Unexpected listExtensions response from MV3 bridge: {ext_res!r}")
+        self_id = str(ext_res.get("selfId") or "")
+        if self_id:
+            self._ext_self_id = self_id
+        q_low = str(query or "").strip().lower()
+        type_low = str(ext_type or "").strip().lower()
+        items: list[dict[str, Any]] = []
+        for ext in raw_items:
+            if not isinstance(ext, dict):
+                continue
+            item = {
+                "id": str(ext.get("id") or ""),
+                "name": str(ext.get("name") or ""),
+                "enabled": bool(ext.get("enabled")),
+                "type": str(ext.get("type") or ""),
+                "version": str(ext.get("version") or ""),
+            }
+            if enabled is not None and item["enabled"] is not bool(enabled):
+                continue
+            if type_low and item["type"].lower() != type_low:
+                continue
+            if q_low and (
+                q_low not in item["id"].lower()
+                and q_low not in item["name"].lower()
+                and q_low not in item["type"].lower()
+                and q_low not in item["version"].lower()
+            ):
+                continue
+            items.append(item)
+        items.sort(key=lambda item: (item["name"].lower(), item["id"]))
+        return items, self_id
+
+    def list_extensions(
+        self,
+        query: str = "",
+        *,
+        enabled: bool | None = None,
+        ext_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List installed Chrome extensions via the MV3 bridge's management permission."""
+        items, _self_id = self._list_extensions_raw(query=query, enabled=enabled, ext_type=ext_type)
+        return items
+
+    @staticmethod
+    def _resolve_extension_target(items: list[dict[str, Any]], needle: str) -> dict[str, Any]:
+        low = needle.lower()
+        for match_fn in (
+            lambda e: e["id"] == needle,
+            lambda e: e["id"].lower() == low,
+            lambda e: e["name"] == needle,
+            lambda e: e["name"].lower() == low,
+            lambda e: low in e["name"].lower(),
+        ):
+            hits = [e for e in items if match_fn(e)]
+            if len(hits) == 1:
+                return hits[0]
+            if len(hits) > 1:
+                choices = ", ".join(
+                    f'{json.dumps(e["name"], ensure_ascii=False)} (id={e["id"]})' for e in hits[:8]
+                )
+                raise RuntimeError(
+                    f"Multiple Chrome extensions match {needle!r}: {choices}; pass the exact extension ID instead"
+                )
+        raise RuntimeError(
+            f"No Chrome extension found matching {needle!r}; call cua.listExtensions() to see installed extensions"
+        )
+
+    def set_extension_enabled(self, id_or_name: str, enabled: bool) -> dict[str, Any]:
+        """Enable or disable a Chrome extension by unique name or ID, refusing to disable the bridge itself."""
+        if not isinstance(enabled, bool):
+            raise ValueError("setExtensionEnabled requires a boolean 'enabled' argument")
+        needle = str(id_or_name or "").strip()
+        if not needle:
+            raise ValueError("setExtensionEnabled requires a non-empty extension id or name")
+
+        items, self_id = self._list_extensions_raw()
+        target = self._resolve_extension_target(items, needle)
+        if not enabled and self_id and target["id"] == self_id:
+            raise RuntimeError(
+                f"Refusing to disable the active Faster Mac Use bridge extension ({target['name'] or self_id}, id={self_id})"
+            )
+
+        bridge = self._require_ext_bridge()
+        res = bridge.call_rpc(
+            "setExtensionEnabled",
+            {"id": target["id"], "name": target["name"], "enabled": enabled},
+            timeout=5.0,
+        )
+        if not isinstance(res, dict):
+            raise RuntimeError(f"Unexpected setExtensionEnabled response from MV3 bridge: {res!r}")
+        return {
+            "id": str(res.get("id") or target["id"]),
+            "name": str(res.get("name") or target["name"]),
+            "enabled": bool(res.get("enabled")) if "enabled" in res else enabled,
+            "type": str(res.get("type") or target["type"]),
+            "version": str(res.get("version") or target["version"]),
+        }
+
+    @staticmethod
+    def _format_extensions_text(items: list[dict[str, Any]], *, self_id: str = "") -> str:
+        lines = [f'# extensions count={len(items)} bridge="mv3"']
+        for ext in items:
+            parts = [
+                f'@ext id={ext["id"]}',
+                f'enabled={"true" if ext["enabled"] else "false"}',
+                f'type={ext["type"] or "extension"}',
+                f'version={json.dumps(ext["version"], ensure_ascii=False)}',
+            ]
+            if self_id and ext["id"] == self_id:
+                parts.append("[self]")
+            parts.append(json.dumps(ext["name"], ensure_ascii=False))
+            lines.append(" ".join(parts))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_extension_state_text(ext: dict[str, Any], *, self_id: str = "") -> str:
+        parts = [
+            f'# extension id={ext["id"]}',
+            f'enabled={"true" if ext["enabled"] else "false"}',
+            f'type={ext["type"] or "extension"}',
+            f'version={json.dumps(ext["version"], ensure_ascii=False)}',
+        ]
+        if self_id and ext["id"] == self_id:
+            parts.append("[self]")
+        parts.append(json.dumps(ext["name"], ensure_ascii=False))
+        return " ".join(parts)
 
     def get_tab(self, tab_id: str | None = None) -> BrowserTabSession:
         return self._run_sync(lambda: self._get_tab_inner(tab_id))
@@ -6717,8 +6877,15 @@ class BrowserEngine:
     def execute_batch(self, req: dict[str, Any]) -> str:
         if req.get("agent") in self.bounds_agents:
             req = {**req, "bounds": True}
-        if not any(req.get(k) for k in ("reset", "bridgeStatus", "reloadExtension", "listTabs")) and is_user_stopped():
+        is_list_ext = bool(req.get("listExtensions")) or isinstance(req.get("listExtensions"), dict)
+        is_set_ext = bool(req.get("setExtensionEnabled")) or isinstance(req.get("setExtensionEnabled"), dict)
+        if not any(
+            req.get(k) or isinstance(req.get(k), dict)
+            for k in ("reset", "bridgeStatus", "reloadExtension", "listTabs", "listExtensions")
+        ) and is_user_stopped():
             return USER_STOPPED_ERROR
+        if is_list_ext or is_set_ext:
+            return self._execute_batch_inner(req)
         if req.get("bridgeStatus") or req.get("reloadExtension"):
             return self._execute_batch_with_retry(req)
         if not req.get("reset") and not req.get("listTabs"):
@@ -6804,8 +6971,48 @@ class BrowserEngine:
             )
 
         if req.get("reloadExtension"):
-            self._ext_bridge.call_rpc("reloadExtension", {}, timeout=3.0)
+            self._ext_bridge.call_rpc("reloadExtension", {}, timeout=3.0, check_stopped=False)
             return "# fmu-web extension reloading"
+
+        if req.get("listExtensions") or isinstance(req.get("listExtensions"), dict):
+            le_spec = req["listExtensions"]
+            if isinstance(le_spec, dict):
+                q_val = str(le_spec.get("query") or req.get("query") or "")
+                en_raw = le_spec.get("enabled")
+                en_filter = bool(en_raw) if isinstance(en_raw, bool) else None
+                t_raw = le_spec.get("type") or le_spec.get("extType")
+                fmt = str(le_spec.get("format") or req.get("format") or "text").lower()
+            else:
+                q_val = le_spec if isinstance(le_spec, str) else str(req.get("query") or "")
+                en_filter = None
+                t_raw = None
+                fmt = str(req.get("format") or "text").lower()
+            items, self_id = self._list_extensions_raw(
+                query=q_val,
+                enabled=en_filter,
+                ext_type=str(t_raw) if t_raw else None,
+            )
+            if fmt == "json":
+                return json.dumps(items, ensure_ascii=False)
+            return self._format_extensions_text(items, self_id=self_id)
+
+        if req.get("setExtensionEnabled") or isinstance(req.get("setExtensionEnabled"), dict):
+            se_spec = req["setExtensionEnabled"]
+            if not isinstance(se_spec, dict):
+                raise ValueError("setExtensionEnabled payload must be an object with 'id'/'name' and boolean 'enabled'")
+            target_key = (
+                se_spec.get("id")
+                or se_spec.get("extensionId")
+                or se_spec.get("idOrName")
+                or se_spec.get("id_or_name")
+                or se_spec.get("name")
+                or se_spec.get("extension")
+                or ""
+            )
+            updated = self.set_extension_enabled(str(target_key), se_spec.get("enabled"))  # type: ignore[arg-type]
+            if str(se_spec.get("format") or req.get("format") or "text").lower() == "json":
+                return json.dumps(updated, ensure_ascii=False)
+            return self._format_extension_state_text(updated, self_id=getattr(self, "_ext_self_id", ""))
 
         if req.get("listTabs"):
             lt_spec = req["listTabs"]

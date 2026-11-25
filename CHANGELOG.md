@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.3 (2026-11-23)
+
+### Fixed
+- Cross-origin `<iframe>` (OOPIF) inputs in both headless/CDP `BrowserEngine` and the MV3 Chrome extension (`background.js`) now route `fill`/`set`/`type`/`press`/`key` through trusted CDP focus + `SelectAll`/`Backspace`/`Delete` clearing + `Input.insertText` with per-character `Input.dispatchKeyEvent` fallback and hash-only (`FNV-1a` + length) frame verification, instead of calling `setNativeValue` on the outer `<iframe>` or falling back to macOS `AX`.
+- Hardened `fmu_ax.swift` (`redactSensitivePreview` + formatted PAN digit verification) and `telemetry.sanitize_error()` (`cvv`/`password`/`pin`/`secret`/`token`/`otp` key-value pairs plus Luhn card numbers and bearer/API tokens) so unmasked payment card digits or secrets never leak into step errors or `~/.fmu/logs/perf-*.jsonl`.
+
 ## 0.5.2 (2026-11-23)
 
 ### Fixed

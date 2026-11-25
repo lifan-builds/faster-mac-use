@@ -37,6 +37,19 @@ _NON_NETWORK_SCHEMES = {
 }
 _SCHEME_PREFIX_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 _PATH_TOKEN_RE = re.compile(r"/(?:Users|private|var|tmp)/[^\s\"';)]+")
+_SENSITIVE_KV_RE = re.compile(
+    r"(?i)\b(cvv|cvc|password|passcode|pin|secret|token|otp)\b(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
+)
+_CARD_CANDIDATE_RE = re.compile(r"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)")
+_SECRET_TOKEN_RE = re.compile(
+    r"(?:\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    r"|\bgh[pousr]_[A-Za-z0-9_]{36,}\b"
+    r"|\bgithub_pat_[A-Za-z0-9_]{22,}\b"
+    r"|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+    r"|\bsk-(?:proj-|svcacct-|ant-)?[A-Za-z0-9_-]{20,}\b"
+    r"|\bxox[bpors]-[A-Za-z0-9-]{10,}\b)"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{20,}")
 
 _log_queue: queue.SimpleQueue[tuple[Path | None, str | threading.Event]] = queue.SimpleQueue()
 _writer_started = False
@@ -143,10 +156,36 @@ def sanitize_url_target(raw_url: str | None) -> str:
         return REDACTED_URL_TARGET
 
 
+def _is_luhn_payment_card(raw: str) -> bool:
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not (13 <= len(digits) <= 19) or len(set(digits)) <= 1:
+        return False
+    first = digits[0]
+    if first not in ("3", "4", "5", "6"):
+        if not (len(digits) == 16 and 2221 <= int(digits[:4]) <= 2720):
+            return False
+    total = 0
+    for idx, ch in enumerate(reversed(digits)):
+        n = ord(ch) - 48
+        if idx % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
 def sanitize_error(err: Any) -> str:
-    """Strip local filesystem paths and cap length so logs never leak sensitive values."""
+    """Strip local filesystem paths, payment cards, and secrets so logs never leak sensitive values."""
     msg = str(err or "").replace("\n", " ").strip()
     msg = _PATH_TOKEN_RE.sub("<path>", msg)
+    msg = _BEARER_TOKEN_RE.sub(r"\1<redacted-secret>", msg)
+    msg = _SECRET_TOKEN_RE.sub("<redacted-secret>", msg)
+    msg = _CARD_CANDIDATE_RE.sub(
+        lambda m: "<redacted-card>" if _is_luhn_payment_card(m.group(0)) else m.group(0),
+        msg,
+    )
+    msg = _SENSITIVE_KV_RE.sub(r"\1\2<redacted>", msg)
     return msg[:220]
 
 

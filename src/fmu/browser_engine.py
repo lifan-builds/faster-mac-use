@@ -13,6 +13,7 @@ import queue
 import re
 import socket
 import struct
+import sys
 import threading
 import time
 from urllib.parse import urlparse
@@ -122,6 +123,276 @@ def _same_origin_and_path(u1: str | None, u2: str | None) -> bool:
         )
     except Exception:
         return False
+
+
+def _fnv1a32(text: str) -> str:
+    """Compute unsigned 32-bit FNV-1a hex digest matching JS charCodeAt hashes."""
+    h = 0x811C9DC5
+    for ch in text:
+        h ^= ord(ch)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return f"{h:08x}"
+
+
+def _normalize_field_value(text: str) -> str:
+    """Strip spaces, dashes, and slashes for formatted PAN/expiry comparison."""
+    return re.sub(r"[\s\-/]+", "", str(text or ""))
+
+
+_CDP_SPECIAL_KEYS: dict[str, tuple[str, str, int, str | None]] = {
+    "backspace": ("Backspace", "Backspace", 8, None),
+    "tab": ("Tab", "Tab", 9, None),
+    "enter": ("Enter", "Enter", 13, "\r"),
+    "return": ("Enter", "Enter", 13, "\r"),
+    "escape": ("Escape", "Escape", 27, None),
+    "esc": ("Escape", "Escape", 27, None),
+    "space": (" ", "Space", 32, " "),
+    "end": ("End", "End", 35, None),
+    "home": ("Home", "Home", 36, None),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37, None),
+    "left": ("ArrowLeft", "ArrowLeft", 37, None),
+    "arrowup": ("ArrowUp", "ArrowUp", 38, None),
+    "up": ("ArrowUp", "ArrowUp", 38, None),
+    "arrowright": ("ArrowRight", "ArrowRight", 39, None),
+    "right": ("ArrowRight", "ArrowRight", 39, None),
+    "arrowdown": ("ArrowDown", "ArrowDown", 40, None),
+    "down": ("ArrowDown", "ArrowDown", 40, None),
+    "delete": ("Delete", "Delete", 46, None),
+    "del": ("Delete", "Delete", 46, None),
+}
+
+_CDP_CHAR_KEYS: dict[str, tuple[str, int, bool]] = {
+    " ": ("Space", 32, False),
+    "-": ("Minus", 189, False),
+    "_": ("Minus", 189, True),
+    "=": ("Equal", 187, False),
+    "+": ("Equal", 187, True),
+    "[": ("BracketLeft", 219, False),
+    "{": ("BracketLeft", 219, True),
+    "]": ("BracketRight", 221, False),
+    "}": ("BracketRight", 221, True),
+    "\\": ("Backslash", 220, False),
+    "|": ("Backslash", 220, True),
+    ";": ("Semicolon", 186, False),
+    ":": ("Semicolon", 186, True),
+    "'": ("Quote", 222, False),
+    '"': ("Quote", 222, True),
+    ",": ("Comma", 188, False),
+    "<": ("Comma", 188, True),
+    ".": ("Period", 190, False),
+    ">": ("Period", 190, True),
+    "/": ("Slash", 191, False),
+    "?": ("Slash", 191, True),
+    "`": ("Backquote", 192, False),
+    "~": ("Backquote", 192, True),
+    "!": ("Digit1", 49, True),
+    "@": ("Digit2", 50, True),
+    "#": ("Digit3", 51, True),
+    "$": ("Digit4", 52, True),
+    "%": ("Digit5", 53, True),
+    "^": ("Digit6", 54, True),
+    "&": ("Digit7", 55, True),
+    "*": ("Digit8", 56, True),
+    "(": ("Digit9", 57, True),
+    ")": ("Digit0", 48, True),
+}
+
+
+def _parse_cdp_key_spec(raw_key: str) -> dict[str, Any]:
+    """Translate a key or modifier chord into CDP Input.dispatchKeyEvent fields."""
+    key_str = str(raw_key or "Enter")
+    modifiers = 0
+    if len(key_str) > 1 and "+" in key_str:
+        parts = [p.strip() for p in key_str.split("+") if p.strip()]
+        if key_str.endswith("+") and parts:
+            parts.append("+")
+        main = parts[-1] if parts else key_str
+        for mod in parts[:-1]:
+            m = mod.lower()
+            if m in ("alt", "opt", "option"):
+                modifiers |= 1
+            elif m in ("ctrl", "control"):
+                modifiers |= 2
+            elif m in ("meta", "cmd", "command", "super"):
+                modifiers |= 4
+            elif m == "shift":
+                modifiers |= 8
+            elif m == "cmdorctrl":
+                modifiers |= 4 if sys.platform == "darwin" else 2
+    else:
+        main = key_str
+
+    low = main.lower()
+    commands: list[str] = []
+    if low in _CDP_SPECIAL_KEYS:
+        key_val, code, vk, txt = _CDP_SPECIAL_KEYS[low]
+        if modifiers == 0 and low == "backspace":
+            commands = ["deleteBackward"]
+        elif modifiers == 0 and low in ("delete", "del"):
+            commands = ["deleteForward"]
+        return {
+            "key": key_val,
+            "code": code,
+            "vk": vk,
+            "modifiers": modifiers,
+            "text": txt if (modifiers & 7) == 0 else None,
+            "unmodifiedText": txt if (modifiers & 7) == 0 else None,
+            "commands": commands,
+        }
+
+    if len(main) == 1:
+        ch = main
+        if "0" <= ch <= "9":
+            code = f"Digit{ch}"
+            vk = ord(ch)
+        elif "a" <= ch.lower() <= "z":
+            code = f"Key{ch.upper()}"
+            vk = ord(ch.upper())
+            if ch.isupper():
+                modifiers |= 8
+            if (modifiers & (4 | 2)) and not (modifiers & (1 | 8)) and ch.lower() == "a":
+                commands = ["selectAll"]
+        elif ch in _CDP_CHAR_KEYS:
+            code, vk, need_shift = _CDP_CHAR_KEYS[ch]
+            if need_shift:
+                modifiers |= 8
+        else:
+            code = ""
+            vk = ord(ch.upper()) if ord(ch) < 128 else 0
+        no_cmd = (modifiers & (1 | 2 | 4)) == 0
+        txt = ch if no_cmd and ord(ch) >= 32 else None
+        unmod = (ch.lower() if "A" <= ch <= "Z" else ch) if no_cmd and ord(ch) >= 32 else None
+        return {
+            "key": ch,
+            "code": code,
+            "vk": vk,
+            "modifiers": modifiers,
+            "text": txt,
+            "unmodifiedText": unmod,
+            "commands": commands,
+        }
+
+    return {
+        "key": main,
+        "code": main,
+        "vk": 0,
+        "modifiers": modifiers,
+        "text": None,
+        "unmodifiedText": None,
+        "commands": commands,
+    }
+
+
+_IFRAME_PROBE_JS = r"""(arg) => {
+  const isEditable = (el) => {
+    if (!el || el.disabled) return false;
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag === "textarea") return true;
+    if (tag === "input") {
+      const tp = String(el.type || "text").toLowerCase();
+      return !["hidden", "checkbox", "radio", "button", "submit", "reset", "file", "image"].includes(tp);
+    }
+    const ce = el.getAttribute && el.getAttribute("contenteditable");
+    return Boolean(el.isContentEditable || ce === "true" || ce === "" || ce === "plaintext-only");
+  };
+  const isVisibleEditable = (el) => {
+    if (!isEditable(el)) return false;
+    try {
+      const r = el.getBoundingClientRect();
+      const st = window.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden";
+    } catch (_) {
+      return true;
+    }
+  };
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  const findFirstEditableDeep = (root) => {
+    const sel = "input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='button']):not([type='submit']):not([type='reset']):not([type='file']):not([type='image']), textarea, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
+    const list = root.querySelectorAll ? Array.from(root.querySelectorAll(sel)) : [];
+    let fallback = null;
+    for (const cand of list) {
+      if (isVisibleEditable(cand)) return cand;
+      if (!fallback && isEditable(cand)) fallback = cand;
+    }
+    const all = root.querySelectorAll ? root.querySelectorAll("*") : [];
+    for (let i = 0; i < all.length; i++) {
+      if (all[i].shadowRoot) {
+        const inner = findFirstEditableDeep(all[i].shadowRoot);
+        if (inner) return inner;
+      }
+    }
+    return fallback;
+  };
+  const target = isEditable(a) ? a : findFirstEditableDeep(document);
+  if (!target) {
+    return { matched: false, hasFocus: Boolean(document.hasFocus && document.hasFocus()) };
+  }
+  const readVal = () => (
+    "value" in target && target.value !== undefined && typeof target.value === "string"
+      ? target.value
+      : String(target.innerText || target.textContent || "")
+  );
+  if (arg.action === "focus_and_select") {
+    try { target.focus({ preventScroll: true }); } catch (_) { try { target.focus(); } catch (_) {} }
+    try {
+      if (typeof target.select === "function") {
+        target.select();
+      } else if (window.getSelection && document.createRange) {
+        const range = document.createRange();
+        range.selectNodeContents(target);
+        const selObj = window.getSelection();
+        if (selObj) { selObj.removeAllRanges(); selObj.addRange(range); }
+      }
+    } catch (_) {}
+    return {
+      matched: true,
+      hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+      curLen: readVal().length
+    };
+  }
+  if (arg.action === "force_clear") {
+    try { target.focus({ preventScroll: true }); } catch (_) {}
+    const tag = (target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea") {
+      const proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+      const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+      try {
+        if (desc && desc.set) desc.set.call(target, "");
+        else target.value = "";
+      } catch (_) { target.value = ""; }
+    } else {
+      target.textContent = "";
+    }
+    target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    return {
+      matched: true,
+      hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+      curLen: readVal().length
+    };
+  }
+  const actual = readVal();
+  const normActual = actual.replace(/[\s\-/]+/g, "");
+  const fnv = (s) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  };
+  const exactMatch = fnv(actual) === arg.expectedHash && actual.length === arg.expectedLen;
+  const normMatch = fnv(normActual) === arg.expectedNormHash && normActual.length === arg.expectedNormLen;
+  const bulletMasked = normActual.length > 0 && /^[•*]+$/.test(normActual) && arg.expectedNormLen >= 8 && normActual.length === arg.expectedNormLen;
+  return {
+    matched: true,
+    hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+    curLen: actual.length,
+    actualNormLen: normActual.length,
+    verified: Boolean(exactMatch || normMatch || bulletMasked)
+  };
+}"""
 
 
 def _short_menubar_target(raw_url: str | None) -> str:
@@ -432,11 +703,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.5.2"
+_FMU_RUNTIME_VERSION = "0.5.3"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.5.2";
+  const FMU_RUNTIME_VERSION = "0.5.3";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -942,6 +1213,15 @@ IN_PAGE_RUNTIME_JS = r"""
       return cleanStr(el.getAttribute("title") || el.id || el.getAttribute("name") || "iframe", maxLen);
     }
     return cleanStr(el.innerText || el.textContent || "", maxLen);
+  }
+
+  function isCrossOriginIframeEl(el) {
+    if (!el || tagOf(el) !== "iframe") return false;
+    try {
+      return !(el.contentDocument && el.contentDocument.documentElement);
+    } catch (_) {
+      return true;
+    }
   }
 
   function getCrossOriginIframeInfo(el) {
@@ -2481,6 +2761,26 @@ IN_PAGE_RUNTIME_JS = r"""
       lines: []
     });
 
+    const makeCdpInputReturn = (nextIdx, inputSpec) => ({
+      cdpInput: inputSpec,
+      nextStepIndex: nextIdx,
+      url: location.href,
+      title: document.title,
+      errors,
+      evalOutputs,
+      rawEvalValues,
+      escalations,
+      cursor: st.cursor,
+      canvases: [],
+      timings: {
+        execMs: +(performance.now() - tExecStart).toFixed(2),
+        settleMs: 0,
+        snapMs: 0,
+        totalInPageMs: +(performance.now() - tBatchStart).toFixed(2)
+      },
+      lines: []
+    });
+
     function deepElementFromPoint(x, y) {
       let hit = document.elementFromPoint(x, y);
       while (hit && hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === "function") {
@@ -2665,8 +2965,12 @@ IN_PAGE_RUNTIME_JS = r"""
           continue;
         }
         if (op === "press" || op === "key") {
-          const key = s.key || s.name || stepValue || "Enter";
+          const key = String(s.key || s.name || stepValue || "Enter");
           const active = document.activeElement || document.body;
+          if (req.cdpClick && active && isCrossOriginIframeEl(active)) {
+            store.mutationSeq++;
+            return makeCdpInputReturn(i + 1, { kind: "key", key });
+          }
           active.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
           active.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
           if (key === "Enter" && active && active.form) {
@@ -2692,6 +2996,15 @@ IN_PAGE_RUNTIME_JS = r"""
             if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
           }
           continue;
+        }
+
+        if (op === "type" && !targetRef && stepValue !== undefined && req.cdpClick && document.activeElement && isCrossOriginIframeEl(document.activeElement)) {
+          store.mutationSeq++;
+          return makeCdpInputReturn(i + 1, {
+            kind: "type",
+            value: String(stepValue ?? ""),
+            clear: false
+          });
         }
 
         if (!targetRef) {
@@ -2806,6 +3119,57 @@ IN_PAGE_RUNTIME_JS = r"""
           if (!store.navigating) await new Promise(r => setTimeout(r, 0));
           if (store.navigating) return makeNavigatedEarlyReturn(i + 1);
         } else if (op === "fill" || op === "set" || op === "type") {
+          if (tagOf(el) === "iframe") {
+            let innerDoc = null;
+            try {
+              innerDoc = (el.contentDocument && el.contentDocument.documentElement) ? el.contentDocument : null;
+            } catch (_) {
+              innerDoc = null;
+            }
+            if (innerDoc) {
+              const innerSel = "input:not([type='hidden']):not([disabled]), textarea:not([disabled]), select:not([disabled]), [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
+              const innerTarget = innerDoc.querySelector(innerSel);
+              if (innerTarget) {
+                try { innerTarget.focus({ preventScroll: true }); } catch (_) {}
+                setNativeValue(innerTarget, stepValue ?? "", Boolean(s.append));
+                continue;
+              }
+            }
+            let pt = resolveTrustedClickPoint(el);
+            if (!pt) {
+              const eff = getEffectiveRect(el);
+              const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+              const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+              if (eff.width >= 1 && eff.height >= 1 && vw > 0 && vh > 0) {
+                const clL = Math.max(0, eff.left);
+                const clT = Math.max(0, eff.top);
+                const clR = Math.min(vw - 1, eff.right);
+                const clB = Math.min(vh - 1, eff.bottom);
+                if (clR > clL && clB > clT) {
+                  pt = { x: clL + (clR - clL) * 0.5, y: clT + (clB - clT) * 0.5 };
+                }
+              }
+            }
+            if (req.cdpClick && pt) {
+              store.mutationSeq++;
+              return makeCdpInputReturn(i + 1, {
+                kind: "fill",
+                x: Math.round(pt.x * 100) / 100,
+                y: Math.round(pt.y * 100) / 100,
+                value: String(stepValue ?? ""),
+                clear: !Boolean(s.append),
+                frameSrc: String(el.getAttribute("src") || el.src || ""),
+                frameName: String(el.getAttribute("name") || ""),
+                frameTitle: String(el.getAttribute("title") || el.getAttribute("aria-label") || ""),
+                uid: getUid(el),
+                label: getLabel(el)
+              });
+            }
+            if (!s.optional) {
+              errors.push(`step ${stepNum} (${op}): cannot fill cross-origin iframe ${getUid(el)} without CDP input support`);
+            }
+            continue;
+          }
           el.focus({ preventScroll: true });
           setNativeValue(el, stepValue ?? "", Boolean(s.append));
         } else if (op === "select") {
@@ -5349,6 +5713,169 @@ class BrowserEngine:
             {"type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1},
         )
 
+    def _dispatch_cdp_key(self, sess: BrowserTabSession, raw_key: str) -> None:
+        ks = _parse_cdp_key_spec(raw_key)
+        down_params: dict[str, Any] = {
+            "type": "keyDown",
+            "key": ks["key"],
+            "code": ks["code"],
+            "windowsVirtualKeyCode": ks["vk"],
+            "nativeVirtualKeyCode": ks["vk"],
+            "modifiers": ks["modifiers"],
+        }
+        if ks.get("text") is not None:
+            down_params["text"] = ks["text"]
+            down_params["unmodifiedText"] = ks["unmodifiedText"]
+        if ks.get("commands"):
+            down_params["commands"] = ks["commands"]
+        up_params: dict[str, Any] = {
+            "type": "keyUp",
+            "key": ks["key"],
+            "code": ks["code"],
+            "windowsVirtualKeyCode": ks["vk"],
+            "nativeVirtualKeyCode": ks["vk"],
+            "modifiers": ks["modifiers"],
+        }
+        sess._raw_cdp.send("Input.dispatchKeyEvent", down_params)
+        sess._raw_cdp.send("Input.dispatchKeyEvent", up_params)
+
+    def _dispatch_cdp_text_keys(self, sess: BrowserTabSession, text: str) -> None:
+        for ch in text:
+            if ch in ("\n", "\r"):
+                self._dispatch_cdp_key(sess, "Enter")
+            elif 32 <= ord(ch) <= 126:
+                ks = _parse_cdp_key_spec(ch)
+                down_params: dict[str, Any] = {
+                    "type": "keyDown",
+                    "key": ch,
+                    "code": ks["code"],
+                    "windowsVirtualKeyCode": ks["vk"],
+                    "nativeVirtualKeyCode": ks["vk"],
+                    "modifiers": ks["modifiers"],
+                    "text": ch,
+                    "unmodifiedText": ch.lower() if "A" <= ch <= "Z" else ch,
+                }
+                up_params: dict[str, Any] = {
+                    "type": "keyUp",
+                    "key": ch,
+                    "code": ks["code"],
+                    "windowsVirtualKeyCode": ks["vk"],
+                    "nativeVirtualKeyCode": ks["vk"],
+                    "modifiers": ks["modifiers"],
+                }
+                sess._raw_cdp.send("Input.dispatchKeyEvent", down_params)
+                sess._raw_cdp.send("Input.dispatchKeyEvent", up_params)
+            else:
+                sess._raw_cdp.send("Input.insertText", {"text": ch})
+            time.sleep(0.005)
+
+    def _probe_playwright_iframe(
+        self,
+        sess: BrowserTabSession,
+        spec: dict[str, Any],
+        action: str,
+        value: str = "",
+    ) -> dict[str, Any]:
+        frame_src = str(spec.get("frameSrc") or "").strip()
+        frame_name = str(spec.get("frameName") or "").strip()
+        exp_norm = _normalize_field_value(value)
+        arg = {
+            "action": action,
+            "expectedHash": _fnv1a32(value),
+            "expectedLen": len(value),
+            "expectedNormHash": _fnv1a32(exp_norm),
+            "expectedNormLen": len(exp_norm),
+        }
+        try:
+            frames = [f for f in sess._raw_page.frames if f != sess._raw_page.main_frame]
+        except _BROWSER_OPS_ERRORS:
+            return {"matched": False}
+        ranked: list[tuple[int, Any]] = []
+        for f in frames:
+            try:
+                f_url = str(f.url or "")
+                f_name = str(f.name or "")
+            except _BROWSER_OPS_ERRORS:
+                continue
+            score = 0
+            if frame_src:
+                if f_url == frame_src:
+                    score = 100
+                elif _same_origin_and_path(f_url, frame_src):
+                    score = 80
+                    if frame_name and f_name == frame_name:
+                        score += 10
+                else:
+                    continue
+            else:
+                score = 60 if (frame_name and f_name == frame_name) else 10
+            ranked.append((score, f))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        fallback_res: dict[str, Any] = {"matched": False}
+        for _score, f in ranked:
+            try:
+                out = f.evaluate(_IFRAME_PROBE_JS, arg)
+            except _BROWSER_OPS_ERRORS:
+                continue
+            if isinstance(out, dict) and out.get("matched"):
+                if out.get("hasFocus"):
+                    return out
+                if not fallback_res.get("matched"):
+                    fallback_res = out
+        return fallback_res
+
+    def _clear_cdp_focused_input(self, sess: BrowserTabSession, spec: dict[str, Any]) -> None:
+        select_all_key = "Meta+a" if sys.platform == "darwin" else "Control+a"
+        self._dispatch_cdp_key(sess, select_all_key)
+        self._dispatch_cdp_key(sess, "Backspace")
+        self._dispatch_cdp_key(sess, "Delete")
+        time.sleep(0.02)
+        st = self._probe_playwright_iframe(sess, spec, "verify", "")
+        if st.get("matched") and int(st.get("curLen") or 0) > 0:
+            self._probe_playwright_iframe(sess, spec, "focus_and_select")
+            self._dispatch_cdp_key(sess, "Backspace")
+            time.sleep(0.015)
+            st2 = self._probe_playwright_iframe(sess, spec, "verify", "")
+            if st2.get("matched") and int(st2.get("curLen") or 0) > 0:
+                self._probe_playwright_iframe(sess, spec, "force_clear")
+
+    def _dispatch_cdp_input(self, sess: BrowserTabSession, spec: dict[str, Any]) -> None:
+        kind = str(spec.get("kind") or "fill")
+        if kind == "key":
+            self._dispatch_cdp_key(sess, str(spec.get("key") or "Enter"))
+            return
+        if kind == "type":
+            self._dispatch_cdp_text_keys(sess, str(spec.get("value") or ""))
+            return
+
+        x = float(spec["x"])
+        y = float(spec["y"])
+        value = str(spec.get("value") or "")
+        clear = bool(spec.get("clear", True))
+        uid = str(spec.get("uid") or spec.get("label") or "iframe")
+        self._dispatch_cdp_mouse_click(sess, x, y)
+        time.sleep(0.03)
+        self._probe_playwright_iframe(sess, spec, "focus_and_select")
+        if clear:
+            self._clear_cdp_focused_input(sess, spec)
+        if value:
+            sess._raw_cdp.send("Input.insertText", {"text": value})
+            time.sleep(0.025)
+        verify_res = self._probe_playwright_iframe(sess, spec, "verify", value)
+        if verify_res.get("matched") and not verify_res.get("verified"):
+            self._probe_playwright_iframe(sess, spec, "focus_and_select")
+            self._clear_cdp_focused_input(sess, spec)
+            if value:
+                self._dispatch_cdp_text_keys(sess, value)
+                time.sleep(0.025)
+            verify_res = self._probe_playwright_iframe(sess, spec, "verify", value)
+            if verify_res.get("matched") and not verify_res.get("verified"):
+                exp_len = len(_normalize_field_value(value))
+                act_len = int(verify_res.get("actualNormLen") or 0)
+                raise RuntimeError(
+                    f"cross-origin iframe verification failed for {uid} (expected_len={exp_len}, actual_len={act_len})"
+                )
+
     def _eval_batch_handling_navigation(
         self,
         sess: BrowserTabSession,
@@ -5507,17 +6034,22 @@ class BrowserEngine:
                 last_cursor = res.get("cursor")
 
             cdp_click = res.get("cdpClick") if isinstance(res, dict) else None
-            if isinstance(cdp_click, dict) and can_cdp_click:
+            cdp_input = res.get("cdpInput") if isinstance(res, dict) else None
+            if (isinstance(cdp_click, dict) or isinstance(cdp_input, dict)) and can_cdp_click:
                 next_idx = int(res.get("nextStepIndex") if res.get("nextStepIndex") is not None else len(cur_steps))
                 click_url = str(res.get("url") or getattr(sess._raw_page, "url", "") or prev_url)
                 step_offset += next_idx
                 cur_steps = cur_steps[next_idx:] if next_idx < len(cur_steps) else []
                 had_pre_steps = True
+                action_label = "click" if isinstance(cdp_click, dict) else str((cdp_input or {}).get("kind") or "input")
                 try:
-                    self._dispatch_cdp_mouse_click(sess, float(cdp_click["x"]), float(cdp_click["y"]))
+                    if isinstance(cdp_click, dict):
+                        self._dispatch_cdp_mouse_click(sess, float(cdp_click["x"]), float(cdp_click["y"]))
+                    elif isinstance(cdp_input, dict):
+                        self._dispatch_cdp_input(sess, cdp_input)
                 except Exception as click_exc:
                     if not _is_navigation_error(click_exc):
-                        acc_errors.append(f"step {step_offset} (click): {click_exc}")
+                        acc_errors.append(f"step {step_offset} ({action_label}): {click_exc}")
                 try:
                     if not sess._raw_page.is_closed():
                         sess._raw_page.wait_for_timeout(15)

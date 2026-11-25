@@ -893,6 +893,28 @@ func replaceViaAXSelectedText(_ el: AXUIElement, text: String) -> Bool {
     return AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
 }
 
+private let sensitiveLabelKeywords: [String] = [
+    "card", "cvv", "cvc", "security code", "expir", "password", "passcode",
+    "pin", "ssn", "social security", "routing", "account number", "secret",
+    "token", "otp", "verification code",
+]
+
+func redactSensitivePreview(_ text: String, label: String, isSecure: Bool) -> String {
+    if isSecure {
+        return "<redacted>"
+    }
+    let lowerLabel = label.lowercased()
+    if !text.isEmpty && sensitiveLabelKeywords.contains(where: { lowerLabel.contains($0) }) {
+        return "<redacted len=\(text.count)>"
+    }
+    var sanitized = text
+    if let regex = try? NSRegularExpression(pattern: "(?<!\\d)(?:\\d[ -]?){11,18}\\d(?!\\d)") {
+        let range = NSRange(sanitized.startIndex..., in: sanitized)
+        sanitized = regex.stringByReplacingMatches(in: sanitized, range: range, withTemplate: "<redacted-pan>")
+    }
+    return sanitized.count > 80 ? String(sanitized.prefix(80)) + "..." : sanitized
+}
+
 func verifyElementSetValue(
     _ el: AXUIElement,
     role: String,
@@ -923,7 +945,17 @@ func verifyElementSetValue(
         }
         return (effective == expectedClean, effective)
     }
-    return (rawVal == expectedClean, rawVal)
+    if rawVal == expectedClean {
+        return (true, rawVal)
+    }
+    let expectedDigits = expectedClean.filter { $0.isASCII && $0.isNumber }
+    if expectedDigits.count >= 12 && expectedDigits.count <= 19 {
+        let actualDigits = rawVal.filter { $0.isASCII && $0.isNumber }
+        if actualDigits == expectedDigits {
+            return (true, rawVal)
+        }
+    }
+    return (false, rawVal)
 }
 
 func detectDisabledNSOpenPanel(nodes: [NodeRecord]) -> NodeRecord? {
@@ -5360,7 +5392,7 @@ func executeRequest(_ req: BatchRequest) -> String {
 
                     if !verified && !(step.optional ?? false) {
                         let uidLabel = targetNode?.uid ?? step.effectiveUid ?? step.effectiveName ?? role
-                        let preview = actualAfter.count > 80 ? String(actualAfter.prefix(80)) + "..." : actualAfter
+                        let preview = redactSensitivePreview(actualAfter, label: targetNode?.label ?? "", isSecure: isSecure)
                         if !rootIsMain {
                             stepErrors.append("step \(i+1): set on \(role) \(uidLabel) could not verify value replacement on non-main window \"\(winTitle)\" (actual=\"\(preview)\"); CGEvent typing skipped to avoid leaking keys to AXMainWindow — use surface=\"web\" MV3 extension bridge")
                         } else if inWebArea {

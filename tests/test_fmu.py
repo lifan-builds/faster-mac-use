@@ -563,7 +563,7 @@ class TestFasterMacUse(unittest.TestCase):
 
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
-        self.assertIn("faster-mac-use 0.5.2", ver_proc.stdout)
+        self.assertIn("faster-mac-use 0.5.3", ver_proc.stdout)
         self.assertIn("Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
@@ -1507,6 +1507,31 @@ setInterval(() => {{}}, 1000);
                     text=True,
                 )
                 self.assertIn("# fmu-perf window=7d", cli_out)
+
+                from fmu.telemetry import sanitize_error
+
+                # Synthetic Luhn-valid test PANs (standard Stripe/PCI test numbers, not real cards)
+                amex_sample = "3782" + " 822463 " + "10005"
+                visa_sample = "4242" + "-4242-" + "4242-4242"
+                mc_2series = "2223" + " 0000 " + "4840 0011"
+                sanitized_amex = sanitize_error(
+                    f'step 2: set on web textfield @a612 failed (actual="{amex_sample}")'
+                )
+                self.assertNotIn("3782", sanitized_amex)
+                self.assertIn('actual="<redacted-card>"', sanitized_amex)
+                sanitized_visa = sanitize_error(f"card={visa_sample} mc={mc_2series}")
+                self.assertNotIn("4242", sanitized_visa)
+                self.assertNotIn("2223", sanitized_visa)
+                self.assertEqual(sanitized_visa.count("<redacted-card>"), 2)
+                # Non-Luhn / epoch IDs must remain untouched
+                untouched = sanitize_error("ts=1763960000000 cid=11461357236156559500 tab=563980443")
+                self.assertIn("1763960000000", untouched)
+                self.assertIn("11461357236156559500", untouched)
+                self.assertNotIn("<redacted-card>", untouched)
+                # Bearer tokens and API keys must also be redacted
+                tok_out = sanitize_error("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123456789")
+                self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", tok_out)
+                self.assertIn("<redacted-secret>", tok_out)
             finally:
                 if prev_dir is None:
                     os.environ.pop("FMU_LOG_DIR", None)
@@ -2639,7 +2664,7 @@ setInterval(() => {{}}, 1000);
         try:
             self.assertTrue(bridge.wait_connected(timeout=3.0))
             bridge_st = self.rt.execute({"bridgeStatus": True})
-            self.assertIn('version="0.5.2"', bridge_st)
+            self.assertIn('version="0.5.3"', bridge_st)
 
             tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
             self.assertIn('@tab id=501', tabs_list)
@@ -3829,6 +3854,347 @@ setInterval(() => {{}}, 1000);
                 node_proc.stdout.close()
             if node_proc.stderr:
                 node_proc.stderr.close()
+
+    def test_35_cross_origin_iframe_cdp_fill_key_and_sensitive_redaction(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        from fmu.telemetry import sanitize_error
+
+        posted_state: dict[str, list[dict[str, object]]] = {"events": []}
+        clear_mod = "Meta+a" if sys.platform == "darwin" else "Control+a"
+
+        class DualOriginHandler(BaseHTTPRequestHandler):
+            def log_message(self, _fmt: str, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/card":
+                    body = (
+                        "<!doctype html><html><body style='margin:0'>"
+                        "<input id='cc' type='text' value='3712 345678 11003' style='width:300px;height:30px'>"
+                        "<script>"
+                        "const el = document.getElementById('cc');"
+                        "el.addEventListener('input', (e) => {"
+                        "  const d = el.value.replace(/\\D/g, '').slice(0, 15);"
+                        "  const f = d.length > 10 ? d.slice(0,4)+' '+d.slice(4,10)+' '+d.slice(10) : (d.length > 4 ? d.slice(0,4)+' '+d.slice(4) : d);"
+                        "  if (el.value !== f) el.value = f;"
+                        "  window.parent.postMessage({field:'card', val: el.value, trusted: Boolean(e.isTrusted)}, '*');"
+                        "});"
+                        "</script></body></html>"
+                    )
+                elif self.path == "/expiry":
+                    body = (
+                        "<!doctype html><html><body style='margin:0'>"
+                        "<input id='exp' type='text' style='width:140px;height:30px'>"
+                        "<script>"
+                        "const el = document.getElementById('exp');"
+                        "el.addEventListener('input', (e) => {"
+                        "  const d = el.value.replace(/\\D/g, '').slice(0, 4);"
+                        "  const f = d.length > 2 ? d.slice(0,2)+'/'+d.slice(2) : d;"
+                        "  if (el.value !== f) el.value = f;"
+                        "  window.parent.postMessage({field:'expiry', val: el.value, trusted: Boolean(e.isTrusted)}, '*');"
+                        "});"
+                        "</script></body></html>"
+                    )
+                elif self.path == "/cvv":
+                    body = (
+                        "<!doctype html><html><body style='margin:0'>"
+                        "<input id='cvv' type='text' style='width:140px;height:30px'>"
+                        "<script>"
+                        "const el = document.getElementById('cvv');"
+                        "el.addEventListener('beforeinput', (e) => e.preventDefault());"
+                        "el.addEventListener('keydown', (e) => {"
+                        "  if (!e.isTrusted) { window.parent.postMessage({field:'cvv_untrusted'}, '*'); return; }"
+                        "  if (e.key >= '0' && e.key <= '9') {"
+                        "    e.preventDefault();"
+                        "    el.value = (el.value + e.key).slice(0, 4);"
+                        "    window.parent.postMessage({field:'cvv', val: el.value, trusted: true}, '*');"
+                        "  } else if (e.key === 'Backspace') {"
+                        "    e.preventDefault();"
+                        "    el.value = el.value.slice(0, -1);"
+                        "    window.parent.postMessage({field:'cvv', val: el.value, trusted: true}, '*');"
+                        "  }"
+                        "});"
+                        "</script></body></html>"
+                    )
+                else:
+                    iframe_port = int(self.server.server_port_other)  # type: ignore[attr-defined]
+                    body = (
+                        "<!doctype html><html><body style='margin:24px'>"
+                        "<script>"
+                        "window.__events = [];"
+                        "window.addEventListener('message', (ev) => { window.__events.push(ev.data); });"
+                        "</script>"
+                        f"<iframe title='card-number input' src='http://127.0.0.1:{iframe_port}/card' width='320' height='36'></iframe><br>"
+                        f"<iframe title='expiry input' src='http://127.0.0.1:{iframe_port}/expiry' width='160' height='36'></iframe><br>"
+                        f"<iframe title='cvv input' src='http://127.0.0.1:{iframe_port}/cvv' width='160' height='36'></iframe>"
+                        "</body></html>"
+                    )
+                data = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        s1 = ThreadingHTTPServer(("127.0.0.1", 0), DualOriginHandler)
+        s2 = ThreadingHTTPServer(("127.0.0.1", 0), DualOriginHandler)
+        s1.server_port_other = s2.server_port  # type: ignore[attr-defined]
+        s2.server_port_other = s1.server_port  # type: ignore[attr-defined]
+        t1 = threading.Thread(target=s1.serve_forever, daemon=True)
+        t2 = threading.Thread(target=s2.serve_forever, daemon=True)
+        t1.start()
+        t2.start()
+        try:
+            self.rt.execute({"reset": True})
+            new_card = "378282246310005"
+            checkout_url = f"http://127.0.0.1:{s1.server_port}/checkout"
+            snap = self.rt.execute(
+                {
+                    "code": (
+                        f'const tab = await cua.createBrowserTab("headless", "{checkout_url}");\n'
+                        "return await tab.snapshot();"
+                    )
+                }
+            )
+            self.assertIn('iframe "card-number input"', snap)
+            self.assertIn('iframe "expiry input"', snap)
+            self.assertIn('iframe "cvv input"', snap)
+
+            fill_out = self.rt.execute(
+                {
+                    "code": (
+                        "const tab = await cua.getTab();\n"
+                        f'await tab.fill("card-number input", "{new_card}").fill("expiry input", "09/31").fill("cvv input", "7342");\n'
+                        "return await tab.eval('window.__events');"
+                    )
+                }
+            )
+            self.assertNotIn("! errors:", fill_out)
+            self.assertIn("3782 822463 10005", fill_out)
+            self.assertIn("09/31", fill_out)
+            self.assertIn("7342", fill_out)
+            self.assertNotIn("11003", fill_out)
+
+            ev_list = self.rt.browser.evaluate_value("return window.__events;", mode="headless")
+            posted_state["events"] = list(ev_list or [])
+            by_field: dict[str, dict[str, object]] = {}
+            for item in posted_state["events"]:
+                if isinstance(item, dict) and item.get("field"):
+                    by_field[str(item["field"])] = item
+            self.assertEqual(by_field.get("card", {}).get("val"), "3782 822463 10005")
+            self.assertTrue(by_field.get("card", {}).get("trusted"))
+            self.assertEqual(by_field.get("expiry", {}).get("val"), "09/31")
+            self.assertTrue(by_field.get("expiry", {}).get("trusted"))
+            self.assertEqual(by_field.get("cvv", {}).get("val"), "7342")
+            self.assertTrue(by_field.get("cvv", {}).get("trusted"))
+
+            # Trusted click + CDP chord clear (Meta+a / Control+a + Backspace) inside cross-origin iframe
+            clear_out = self.rt.execute(
+                {
+                    "code": (
+                        "const tab = await cua.getTab();\n"
+                        f'await tab.click("card-number input").press("{clear_mod}").press("Backspace");\n'
+                        "return await tab.eval('window.__events');"
+                    )
+                }
+            )
+            self.assertNotIn("! errors:", clear_out)
+            ev_after = self.rt.browser.evaluate_value("return window.__events;", mode="headless")
+            card_vals = [x.get("val") for x in (ev_after or []) if isinstance(x, dict) and x.get("field") == "card"]
+            self.assertEqual(card_vals[-1], "")
+        finally:
+            s1.shutdown()
+            s2.shutdown()
+            s1.server_close()
+            s2.server_close()
+
+        # 2. Mock MV3 extension background.js cdpInput + scripting probe + safe error redaction
+        self.rt.execute({"reset": True})
+        port = self.rt.browser.bridge_port
+        bg_js_src = (ROOT / "extension" / "background.js").read_text(encoding="utf-8").replace(
+            "ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{port}/ext"
+        )
+        secret_sample = "4242424242424242"
+        mv3_oopif_harness = f"""
+const cdpLog = [];
+let verifyStepCalls = 0;
+const tabObj = {{ id: 901, windowId: 900, groupId: -1, title: "PCI Checkout", url: "https://shop.example/pay", status: "complete", active: false }};
+globalThis.chrome = {{
+  storage: {{ session: {{ data: {{}}, async get(k) {{ return {{ [k]: this.data[k] }}; }}, async set(o) {{ Object.assign(this.data, o); }} }} }},
+  extension: {{ isAllowedFileSchemeAccess: async () => false }},
+  tabs: {{
+    query: async () => [tabObj],
+    get: async () => tabObj,
+    create: async () => tabObj,
+    update: async () => tabObj,
+    group: async () => 91,
+    onRemoved: {{ addListener: () => {{}} }},
+    onUpdated: {{ addListener: () => {{}} }},
+  }},
+  tabGroups: {{ query: async () => [], update: async (gid, opts) => ({{ id: gid, ...opts }}) }},
+  windows: {{ getAll: async () => [{{ id: 900, focused: false, type: "normal" }}] }},
+  scripting: {{
+    executeScript: async (opts) => {{
+      const arg = (opts && opts.args && opts.args[0]) || {{}};
+      if (arg.action === "focus_and_select") {{
+        return [{{ frameId: 2, result: {{ supported: true, matched: true, score: 100, hasFocus: true, curLen: 4 }} }}];
+      }}
+      if (arg.expectedLen === 0) {{
+        return [{{ frameId: 2, result: {{ supported: true, matched: true, score: 100, hasFocus: true, curLen: 0, actualNormLen: 0, verified: true }} }}];
+      }}
+      verifyStepCalls++;
+      // First verify fails (simulating keydown-only frame), triggering per-char dispatchCdpTextKeys fallback; then passes for first call, fails for second batch
+      const isSecondFail = arg.expectedLen === 4;
+      const verified = !isSecondFail && verifyStepCalls >= 2;
+      return [{{ frameId: 2, result: {{ supported: true, matched: true, score: 100, hasFocus: true, curLen: verified ? arg.expectedLen : 1, actualNormLen: verified ? arg.expectedNormLen : 1, verified }} }}];
+    }}
+  }},
+  debugger: {{
+    attach: async () => {{}},
+    sendCommand: async (_target, method, params) => {{
+      if (method.startsWith("Input.")) {{
+        cdpLog.push({{ method, params }});
+        return {{}};
+      }}
+      if (method === "Runtime.evaluate") {{
+        const expr = String(params.expression || "");
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const payload = JSON.parse(expr.slice("window.__fmu.executeBatch(".length, -1));
+          const steps = payload.steps || [];
+          if (payload.cdpClick && steps.length > 0 && steps[0].op === "fill") {{
+            return {{
+              result: {{
+                value: {{
+                  cdpInput: {{
+                    kind: "fill",
+                    x: 410,
+                    y: 520,
+                    value: String(steps[0].value || ""),
+                    clear: true,
+                    frameSrc: "https://pci.example/card",
+                    uid: "@u39",
+                    label: "card-number input"
+                  }},
+                  nextStepIndex: 1,
+                  url: tabObj.url,
+                  title: tabObj.title,
+                  errors: [],
+                  evalOutputs: [],
+                  rawEvalValues: [],
+                  escalations: [],
+                  cursor: {{ agent: "default", x: 410, y: 520, uid: "@u39", label: "card-number input", op: "fill" }},
+                  canvases: [],
+                  timings: {{ execMs: 1, settleMs: 0, snapMs: 0, totalInPageMs: 1 }},
+                  lines: []
+                }}
+              }}
+            }};
+          }}
+          if (payload.cdpClick && steps.length > 0 && (steps[0].op === "press" || steps[0].op === "type")) {{
+            return {{
+              result: {{
+                value: {{
+                  cdpInput: steps[0].op === "press"
+                    ? {{ kind: "key", key: String(steps[0].key || "Enter") }}
+                    : {{ kind: "type", value: String(steps[0].value || ""), clear: false }},
+                  nextStepIndex: 1,
+                  url: tabObj.url,
+                  title: tabObj.title,
+                  errors: [],
+                  evalOutputs: [],
+                  rawEvalValues: [],
+                  escalations: [],
+                  timings: {{ execMs: 1, settleMs: 0, snapMs: 0, totalInPageMs: 1 }},
+                  lines: []
+                }}
+              }}
+            }};
+          }}
+          return {{
+            result: {{
+              value: {{
+                url: tabObj.url,
+                title: tabObj.title,
+                crc: "11223344",
+                seq: 2,
+                count: 1,
+                useDiff: true,
+                errors: [],
+                evalOutputs: [JSON.stringify(cdpLog.map(e => e.method + ":" + (e.params.type || ("len=" + String(e.params.text || "").length))))],
+                rawEvalValues: [cdpLog.length],
+                escalations: [],
+                timings: {{ execMs: 1, settleMs: 1, snapMs: 1, totalInPageMs: 3 }},
+                lines: ['= @u39 iframe "card-number input"']
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+    onEvent: {{ addListener: () => {{}} }},
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }},
+}};
+{bg_js_src}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(
+            ["node", "-e", mv3_oopif_harness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(self.rt.browser.ensure_bridge().wait_connected(timeout=3.0))
+            ok_mv3 = self.rt.execute(
+                {
+                    "chromeTabId": 901,
+                    "steps": [
+                        {"op": "fill", "uid": "@u39", "value": secret_sample},
+                        {"op": "press", "key": "Tab"},
+                        {"op": "type", "value": "99"},
+                    ],
+                }
+            )
+            self.assertNotIn("! errors:", ok_mv3)
+            self.assertIn("Input.insertText", ok_mv3)
+            self.assertIn("Input.dispatchKeyEvent:keyDown", ok_mv3)
+
+            err_mv3 = self.rt.execute(
+                {
+                    "chromeTabId": 901,
+                    "steps": [
+                        {"op": "fill", "uid": "@u41", "value": "9988"},
+                    ],
+                }
+            )
+            self.assertIn("cross-origin iframe verification failed for @u39", err_mv3)
+            self.assertIn("expected_len=4, actual_len=1", err_mv3)
+            self.assertNotIn("9988", err_mv3)
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
+
+        # 3. Telemetry sanitize_error redaction for kv secrets and Luhn cards
+        kv_sanitized = sanitize_error("step failed cvv=7342 password='my-secret' card=378282246310005")
+        self.assertNotIn("7342", kv_sanitized)
+        self.assertNotIn("my-secret", kv_sanitized)
+        self.assertNotIn("378282246310005", kv_sanitized)
+        self.assertIn("cvv=<redacted>", kv_sanitized)
+        self.assertIn("password=<redacted>", kv_sanitized)
+        self.assertIn("<redacted-card>", kv_sanitized)
 
 
 class TestTraceReplay(unittest.TestCase):

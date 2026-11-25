@@ -629,6 +629,449 @@ function uploadFileUrlError(inlineSkipped) {
   return new Error(inlineSkipped ? `${UPLOAD_FILE_URL_ERR}, or fix the inline fallback: ${inlineSkipped}` : UPLOAD_FILE_URL_ERR);
 }
 
+function fnv1a32(str) {
+  let h = 0x811c9dc5;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+function normalizeFieldValueForCheck(str) {
+  return String(str || "").replace(/[\s\-/]+/g, "");
+}
+
+const CDP_SPECIAL_KEYS = {
+  backspace: ["Backspace", "Backspace", 8, null],
+  tab: ["Tab", "Tab", 9, null],
+  enter: ["Enter", "Enter", 13, "\r"],
+  return: ["Enter", "Enter", 13, "\r"],
+  escape: ["Escape", "Escape", 27, null],
+  esc: ["Escape", "Escape", 27, null],
+  space: [" ", "Space", 32, " "],
+  end: ["End", "End", 35, null],
+  home: ["Home", "Home", 36, null],
+  arrowleft: ["ArrowLeft", "ArrowLeft", 37, null],
+  left: ["ArrowLeft", "ArrowLeft", 37, null],
+  arrowup: ["ArrowUp", "ArrowUp", 38, null],
+  up: ["ArrowUp", "ArrowUp", 38, null],
+  arrowright: ["ArrowRight", "ArrowRight", 39, null],
+  right: ["ArrowRight", "ArrowRight", 39, null],
+  arrowdown: ["ArrowDown", "ArrowDown", 40, null],
+  down: ["ArrowDown", "ArrowDown", 40, null],
+  delete: ["Delete", "Delete", 46, null],
+  del: ["Delete", "Delete", 46, null]
+};
+
+const CDP_CHAR_KEYS = {
+  " ": ["Space", 32, false],
+  "-": ["Minus", 189, false],
+  "_": ["Minus", 189, true],
+  "=": ["Equal", 187, false],
+  "+": ["Equal", 187, true],
+  "[": ["BracketLeft", 219, false],
+  "{": ["BracketLeft", 219, true],
+  "]": ["BracketRight", 221, false],
+  "}": ["BracketRight", 221, true],
+  "\\": ["Backslash", 220, false],
+  "|": ["Backslash", 220, true],
+  ";": ["Semicolon", 186, false],
+  ":": ["Semicolon", 186, true],
+  "'": ["Quote", 222, false],
+  '"': ["Quote", 222, true],
+  ",": ["Comma", 188, false],
+  "<": ["Comma", 188, true],
+  ".": ["Period", 190, false],
+  ">": ["Period", 190, true],
+  "/": ["Slash", 191, false],
+  "?": ["Slash", 191, true],
+  "`": ["Backquote", 192, false],
+  "~": ["Backquote", 192, true],
+  "!": ["Digit1", 49, true],
+  "@": ["Digit2", 50, true],
+  "#": ["Digit3", 51, true],
+  "$": ["Digit4", 52, true],
+  "%": ["Digit5", 53, true],
+  "^": ["Digit6", 54, true],
+  "&": ["Digit7", 55, true],
+  "*": ["Digit8", 56, true],
+  "(": ["Digit9", 57, true],
+  ")": ["Digit0", 48, true]
+};
+
+function isMacHost() {
+  if (typeof navigator !== "undefined") {
+    const plat = `${navigator.platform || ""} ${navigator.userAgent || ""}`;
+    if (plat.trim()) return /Mac|Darwin/i.test(plat);
+  }
+  return typeof process !== "undefined" && process.platform === "darwin";
+}
+
+function parseCdpKeySpec(rawKey) {
+  const keyStr = String(rawKey || "Enter");
+  let modifiers = 0;
+  let main = keyStr;
+  if (keyStr.length > 1 && keyStr.includes("+")) {
+    const parts = keyStr.split("+").map(p => p.trim()).filter(Boolean);
+    if (keyStr.endsWith("+") && parts.length > 0) parts.push("+");
+    main = parts.length > 0 ? parts[parts.length - 1] : keyStr;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const m = parts[i].toLowerCase();
+      if (m === "alt" || m === "opt" || m === "option") modifiers |= 1;
+      else if (m === "ctrl" || m === "control") modifiers |= 2;
+      else if (m === "meta" || m === "cmd" || m === "command" || m === "super") modifiers |= 4;
+      else if (m === "shift") modifiers |= 8;
+      else if (m === "cmdorctrl") modifiers |= isMacHost() ? 4 : 2;
+    }
+  }
+  const low = main.toLowerCase();
+  let commands = [];
+  if (Object.prototype.hasOwnProperty.call(CDP_SPECIAL_KEYS, low)) {
+    const [keyVal, code, vk, txt] = CDP_SPECIAL_KEYS[low];
+    if (modifiers === 0 && low === "backspace") commands = ["deleteBackward"];
+    else if (modifiers === 0 && (low === "delete" || low === "del")) commands = ["deleteForward"];
+    const noCmd = (modifiers & 7) === 0;
+    return {
+      key: keyVal,
+      code,
+      vk,
+      modifiers,
+      text: noCmd ? txt : null,
+      unmodifiedText: noCmd ? txt : null,
+      commands
+    };
+  }
+  if (main.length === 1) {
+    const ch = main;
+    const chCode = ch.charCodeAt(0);
+    let code = "";
+    let vk = 0;
+    if (ch >= "0" && ch <= "9") {
+      code = `Digit${ch}`;
+      vk = chCode;
+    } else if (low >= "a" && low <= "z") {
+      code = `Key${ch.toUpperCase()}`;
+      vk = ch.toUpperCase().charCodeAt(0);
+      if (ch !== low) modifiers |= 8;
+      if ((modifiers & 6) !== 0 && (modifiers & 9) === 0 && low === "a") {
+        commands = ["selectAll"];
+      }
+    } else if (Object.prototype.hasOwnProperty.call(CDP_CHAR_KEYS, ch)) {
+      const [cName, cVk, needShift] = CDP_CHAR_KEYS[ch];
+      code = cName;
+      vk = cVk;
+      if (needShift) modifiers |= 8;
+    } else {
+      vk = chCode < 128 ? ch.toUpperCase().charCodeAt(0) : 0;
+    }
+    const noCmd = (modifiers & 7) === 0;
+    const txt = (noCmd && chCode >= 32) ? ch : null;
+    const unmod = (noCmd && chCode >= 32) ? ((ch >= "A" && ch <= "Z") ? ch.toLowerCase() : ch) : null;
+    return { key: ch, code, vk, modifiers, text: txt, unmodifiedText: unmod, commands };
+  }
+  return { key: main, code: main, vk: 0, modifiers, text: null, unmodifiedText: null, commands };
+}
+
+async function dispatchCdpKey(tabId, rawKey) {
+  const ks = parseCdpKeySpec(rawKey);
+  const downParams = {
+    type: "keyDown",
+    key: ks.key,
+    code: ks.code,
+    windowsVirtualKeyCode: ks.vk,
+    nativeVirtualKeyCode: ks.vk,
+    modifiers: ks.modifiers
+  };
+  if (ks.text !== null) {
+    downParams.text = ks.text;
+    downParams.unmodifiedText = ks.unmodifiedText;
+  }
+  if (ks.commands && ks.commands.length > 0) {
+    downParams.commands = ks.commands;
+  }
+  await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", downParams);
+  await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: ks.key,
+    code: ks.code,
+    windowsVirtualKeyCode: ks.vk,
+    nativeVirtualKeyCode: ks.vk,
+    modifiers: ks.modifiers
+  });
+}
+
+async function dispatchCdpTextKeys(tabId, text) {
+  const s = String(text || "");
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const cp = ch.charCodeAt(0);
+    if (ch === "\n" || ch === "\r") {
+      await dispatchCdpKey(tabId, "Enter");
+    } else if (cp >= 32 && cp <= 126) {
+      const ks = parseCdpKeySpec(ch);
+      await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: ch,
+        code: ks.code,
+        windowsVirtualKeyCode: ks.vk,
+        nativeVirtualKeyCode: ks.vk,
+        modifiers: ks.modifiers,
+        text: ch,
+        unmodifiedText: (ch >= "A" && ch <= "Z") ? ch.toLowerCase() : ch
+      });
+      await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: ch,
+        code: ks.code,
+        windowsVirtualKeyCode: ks.vk,
+        nativeVirtualKeyCode: ks.vk,
+        modifiers: ks.modifiers
+      });
+    } else {
+      await sendDebuggerCommand(tabId, "Input.insertText", { text: ch });
+    }
+    await new Promise(r => setTimeout(r, 5));
+  }
+}
+
+async function probeAndPrepIframeInTab(tabId, opts) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return { supported: false, matched: false };
+  }
+  const value = String((opts && opts.value) || "");
+  const expNorm = normalizeFieldValueForCheck(value);
+  const probeArg = {
+    action: String((opts && opts.action) || "verify"),
+    frameSrc: String((opts && opts.frameSrc) || "").trim(),
+    frameName: String((opts && opts.frameName) || "").trim(),
+    expectedHash: fnv1a32(value),
+    expectedLen: value.length,
+    expectedNormHash: fnv1a32(expNorm),
+    expectedNormLen: expNorm.length
+  };
+  let frameResults = [];
+  try {
+    frameResults = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [probeArg],
+      func: (arg) => {
+        if (window === window.top) return null;
+        const curHref = String(location.href || "");
+        let score = 0;
+        if (arg.frameSrc) {
+          if (curHref === arg.frameSrc) {
+            score = 100;
+          } else {
+            try {
+              const u1 = new URL(curHref);
+              const u2 = new URL(arg.frameSrc, curHref);
+              const p1 = u1.pathname.replace(/\/+$/, "") || "/";
+              const p2 = u2.pathname.replace(/\/+$/, "") || "/";
+              if (u1.origin === u2.origin && p1 === p2) {
+                score = 80 + (arg.frameName && window.name === arg.frameName ? 10 : 0);
+              } else {
+                return null;
+              }
+            } catch (_) {
+              return null;
+            }
+          }
+        } else {
+          score = (arg.frameName && window.name === arg.frameName) ? 60 : 10;
+        }
+        const isEditable = (el) => {
+          if (!el || el.disabled) return false;
+          const tag = (el.tagName || "").toLowerCase();
+          if (tag === "textarea") return true;
+          if (tag === "input") {
+            const tp = String(el.type || "text").toLowerCase();
+            return !["hidden", "checkbox", "radio", "button", "submit", "reset", "file", "image"].includes(tp);
+          }
+          const ce = el.getAttribute && el.getAttribute("contenteditable");
+          return Boolean(el.isContentEditable || ce === "true" || ce === "" || ce === "plaintext-only");
+        };
+        const isVisibleEditable = (el) => {
+          if (!isEditable(el)) return false;
+          try {
+            const r = el.getBoundingClientRect();
+            const st = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden";
+          } catch (_) {
+            return true;
+          }
+        };
+        const findFirstEditableDeep = (root) => {
+          const sel = "input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='button']):not([type='submit']):not([type='reset']):not([type='file']):not([type='image']), textarea, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
+          const list = root.querySelectorAll ? Array.from(root.querySelectorAll(sel)) : [];
+          let fallback = null;
+          for (const cand of list) {
+            if (isVisibleEditable(cand)) return cand;
+            if (!fallback && isEditable(cand)) fallback = cand;
+          }
+          const all = root.querySelectorAll ? root.querySelectorAll("*") : [];
+          for (let i = 0; i < all.length; i++) {
+            if (all[i].shadowRoot) {
+              const inner = findFirstEditableDeep(all[i].shadowRoot);
+              if (inner) return inner;
+            }
+          }
+          return fallback;
+        };
+        let a = document.activeElement;
+        while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+        const target = isEditable(a) ? a : findFirstEditableDeep(document);
+        if (!target) {
+          return { supported: true, matched: false, score, hasFocus: Boolean(document.hasFocus && document.hasFocus()) };
+        }
+        const readVal = () => (
+          "value" in target && target.value !== undefined && typeof target.value === "string"
+            ? target.value
+            : String(target.innerText || target.textContent || "")
+        );
+        if (arg.action === "focus_and_select") {
+          try { target.focus({ preventScroll: true }); } catch (_) { try { target.focus(); } catch (_) {} }
+          try {
+            if (typeof target.select === "function") {
+              target.select();
+            } else if (window.getSelection && document.createRange) {
+              const range = document.createRange();
+              range.selectNodeContents(target);
+              const selObj = window.getSelection();
+              if (selObj) { selObj.removeAllRanges(); selObj.addRange(range); }
+            }
+          } catch (_) {}
+          return {
+            supported: true,
+            matched: true,
+            score,
+            hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+            curLen: readVal().length
+          };
+        }
+        if (arg.action === "force_clear") {
+          try { target.focus({ preventScroll: true }); } catch (_) {}
+          const tag = (target.tagName || "").toLowerCase();
+          if (tag === "input" || tag === "textarea") {
+            const proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+            const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+            try {
+              if (desc && desc.set) desc.set.call(target, "");
+              else target.value = "";
+            } catch (_) { target.value = ""; }
+          } else {
+            target.textContent = "";
+          }
+          target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+          target.dispatchEvent(new Event("change", { bubbles: true }));
+          return {
+            supported: true,
+            matched: true,
+            score,
+            hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+            curLen: readVal().length
+          };
+        }
+        const actual = readVal();
+        const normActual = actual.replace(/[\s\-/]+/g, "");
+        const fnv = (s) => {
+          let h = 0x811c9dc5;
+          for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 0x01000193) >>> 0;
+          }
+          return h.toString(16).padStart(8, "0");
+        };
+        const exactMatch = fnv(actual) === arg.expectedHash && actual.length === arg.expectedLen;
+        const normMatch = fnv(normActual) === arg.expectedNormHash && normActual.length === arg.expectedNormLen;
+        const bulletMasked = normActual.length > 0 && /^[•*]+$/.test(normActual) && arg.expectedNormLen >= 8 && normActual.length === arg.expectedNormLen;
+        return {
+          supported: true,
+          matched: true,
+          score,
+          hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+          curLen: actual.length,
+          actualNormLen: normActual.length,
+          verified: Boolean(exactMatch || normMatch || bulletMasked)
+        };
+      }
+    });
+  } catch (_) {
+    return { supported: false, matched: false };
+  }
+  let best = null;
+  for (const fr of frameResults || []) {
+    const r = fr && fr.result;
+    if (!r || !r.matched) continue;
+    if (!best || (r.score || 0) > (best.score || 0) || ((r.score || 0) === (best.score || 0) && r.hasFocus && !best.hasFocus)) {
+      best = r;
+    }
+  }
+  return best || { supported: true, matched: false };
+}
+
+async function clearCdpFocusedInput(tabId, spec) {
+  await dispatchCdpKey(tabId, isMacHost() ? "Meta+a" : "Control+a");
+  await dispatchCdpKey(tabId, "Backspace");
+  await dispatchCdpKey(tabId, "Delete");
+  await new Promise(r => setTimeout(r, 20));
+  const st = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value: "" });
+  if (st.matched && Number(st.curLen || 0) > 0) {
+    await probeAndPrepIframeInTab(tabId, { ...spec, action: "focus_and_select" });
+    await dispatchCdpKey(tabId, "Backspace");
+    await new Promise(r => setTimeout(r, 15));
+    const st2 = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value: "" });
+    if (st2.matched && Number(st2.curLen || 0) > 0) {
+      await probeAndPrepIframeInTab(tabId, { ...spec, action: "force_clear" });
+    }
+  }
+}
+
+async function dispatchCdpInput(tabId, spec) {
+  const kind = String((spec && spec.kind) || "fill");
+  if (kind === "key") {
+    await dispatchCdpKey(tabId, String((spec && spec.key) || "Enter"));
+    return;
+  }
+  if (kind === "type") {
+    await dispatchCdpTextKeys(tabId, String((spec && spec.value) || ""));
+    return;
+  }
+  const x = Number(spec.x);
+  const y = Number(spec.y);
+  const value = String(spec.value || "");
+  const clear = spec.clear !== false;
+  const uid = String(spec.uid || spec.label || "iframe");
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+  await new Promise(r => setTimeout(r, 30));
+  await probeAndPrepIframeInTab(tabId, { ...spec, action: "focus_and_select" });
+  if (clear) {
+    await clearCdpFocusedInput(tabId, spec);
+  }
+  if (value) {
+    await sendDebuggerCommand(tabId, "Input.insertText", { text: value });
+    await new Promise(r => setTimeout(r, 25));
+  }
+  let verifyRes = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value });
+  if (verifyRes.matched && !verifyRes.verified) {
+    await probeAndPrepIframeInTab(tabId, { ...spec, action: "focus_and_select" });
+    await clearCdpFocusedInput(tabId, spec);
+    if (value) {
+      await dispatchCdpTextKeys(tabId, value);
+      await new Promise(r => setTimeout(r, 25));
+    }
+    verifyRes = await probeAndPrepIframeInTab(tabId, { ...spec, action: "verify", value });
+    if (verifyRes.matched && !verifyRes.verified) {
+      const expLen = normalizeFieldValueForCheck(value).length;
+      const actLen = Number(verifyRes.actualNormLen || 0);
+      throw new Error(`cross-origin iframe verification failed for ${uid} (expected_len=${expLen}, actual_len=${actLen})`);
+    }
+  }
+}
+
 const NON_EXPR_STMT_RE = /^(?:const|let|var|if|for|while|do|switch|try|throw|return|break|continue|function|class|debugger)\b/;
 
 function isNavigationError(err) {
@@ -1724,20 +2167,26 @@ async function handleRpc(msg) {
             if (batchRes.cursor) lastCursor = batchRes.cursor;
           }
 
-          if (batchRes && batchRes.cdpClick && canCdpClick) {
-            const pt = batchRes.cdpClick;
+          const cdpPt = batchRes && batchRes.cdpClick;
+          const cdpInp = batchRes && batchRes.cdpInput;
+          if ((cdpPt || cdpInp) && canCdpClick) {
             const clickUrl = String(batchRes.url || curTabUrl || "");
             const nextIdx = typeof batchRes.nextStepIndex === "number" ? batchRes.nextStepIndex : curSteps.length;
             stepOffset += nextIdx;
             curSteps = nextIdx < curSteps.length ? curSteps.slice(nextIdx) : [];
             hadPreSteps = true;
+            const actionLabel = cdpPt ? "click" : String((cdpInp && cdpInp.kind) || "input");
             try {
-              await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: pt.x, y: pt.y, button: "none" });
-              await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: pt.x, y: pt.y, button: "left", buttons: 1, clickCount: 1 });
-              await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: pt.x, y: pt.y, button: "left", buttons: 0, clickCount: 1 });
+              if (cdpPt) {
+                await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: cdpPt.x, y: cdpPt.y, button: "none" });
+                await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: cdpPt.x, y: cdpPt.y, button: "left", buttons: 1, clickCount: 1 });
+                await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: cdpPt.x, y: cdpPt.y, button: "left", buttons: 0, clickCount: 1 });
+              } else if (cdpInp) {
+                await dispatchCdpInput(tabId, cdpInp);
+              }
             } catch (clickErr) {
               if (!isNavigationError(clickErr)) {
-                accErrors.push(`step ${stepOffset} (click): ${(clickErr && clickErr.message) || clickErr}`);
+                accErrors.push(`step ${stepOffset} (${actionLabel}): ${(clickErr && clickErr.message) || clickErr}`);
               }
             }
             await new Promise(r => setTimeout(r, 15));
@@ -2091,7 +2540,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.2" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.3" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

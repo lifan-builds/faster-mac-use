@@ -4807,6 +4807,100 @@ class TestReplTabErgonomics(unittest.TestCase):
         finally:
             rt._pool.shutdown(wait=False)
 
+    def test_tab_click_coords_waitfor_seconds_and_batch_strict_csp_cache(self) -> None:
+        from fmu.browser_engine import BrowserEngine, normalize_step_dict
+
+        rt = self._make_mock_runtime()
+        try:
+            tab = rt.cua.createBrowserTab("headless", "https://example.com")
+            tab.click({"x": 1720, "y": 832})
+            tab.click(100, 200)
+            tab.click(x=300, y=400, optional=True)
+            tab.click({"selector": "#pay-btn", "optional": True})
+            tab.click("@u5")
+            tab.moveCursor({"x": 50, "y": 60})
+            self.assertEqual(
+                tab._pending_steps,
+                [
+                    {"op": "click", "x": 1720, "y": 832},
+                    {"op": "click", "x": 100, "y": 200},
+                    {"op": "click", "x": 300, "y": 400, "optional": True},
+                    {"op": "click", "selector": "#pay-btn", "optional": True},
+                    {"op": "click", "uid": "@u5"},
+                    {"op": "move", "x": 50, "y": 60},
+                ],
+            )
+
+            tab._pending_steps.clear()
+            tab.waitFor({"text": "Ready", "timeout": 15})
+            tab.waitFor("Loaded", timeout=10)
+            tab.waitFor("Done", timeout_s=8)
+            tab.waitFor("Exact", timeoutMs=90)
+            tab.waitFor("Large", timeout=4000)
+            self.assertEqual(
+                [s["timeoutMs"] for s in tab._pending_steps],
+                [15000, 10000, 8000, 90, 4000],
+            )
+
+            # Raw JSON step normalization also converts small timeout (seconds) -> timeoutMs
+            self.assertEqual(
+                normalize_step_dict({"op": "waitFor", "text": "X", "timeout": 15})["timeoutMs"],
+                15000,
+            )
+            self.assertEqual(
+                normalize_step_dict({"waitFor": {"text": "X", "timeout": 10}})["timeoutMs"],
+                10000,
+            )
+            self.assertEqual(
+                normalize_step_dict({"op": "waitFor", "text": "X", "timeoutMs": 15})["timeoutMs"],
+                15,
+            )
+            self.assertEqual(
+                normalize_step_dict({"op": "waitFor", "text": "X", "timeoutSeconds": 12})["timeoutMs"],
+                12000,
+            )
+        finally:
+            rt._pool.shutdown(wait=False)
+
+        # executeBatch seeds strictCsp from _strict_csp_hosts and logs cached eval_csp as eval_csp_cached
+        eng = BrowserEngine()
+        eng._strict_csp_hosts.add("app-signup.us.bill.com")
+        captured_payloads: list[dict[str, Any]] = []
+        fake_page = mock.Mock()
+        fake_page.url = "https://app-signup.us.bill.com/neo/settings"
+        fake_page.is_closed.return_value = False
+
+        def _fake_eval(expr: str, arg: Any = None) -> dict[str, Any]:
+            captured_payloads.append(dict(arg))
+            return {
+                "url": fake_page.url,
+                "title": "BILL",
+                "errors": [],
+                "evalOutputs": [],
+                "rawEvalValues": [],
+                "escalations": [{"step": 1, "reason": "eval_csp", "code": "return 1;", "cached": True}],
+                "timings": {"execMs": 1.0, "settleMs": 0.0, "snapMs": 1.0, "totalInPageMs": 2.0},
+                "lines": [],
+            }
+
+        fake_page.evaluate.side_effect = _fake_eval
+        fake_sess = mock.Mock()
+        fake_sess.is_extension = True
+        fake_sess.last_url = fake_page.url
+        fake_sess.last_title = "BILL"
+        fake_sess._raw_page = fake_page
+        fake_sess._raw_cdp = None
+
+        res = eng._eval_batch_handling_navigation(
+            fake_sess,
+            {"agent": "test", "steps": [{"op": "eval", "code": "return 1;"}]},
+            tab_id="t1",
+        )
+        self.assertTrue(captured_payloads[0].get("strictCsp"))
+        # Cached eval_csp escalation maps to routine 'eval_csp_cached'
+        esc = res["escalations"][0]
+        self.assertTrue(esc.get("cached"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

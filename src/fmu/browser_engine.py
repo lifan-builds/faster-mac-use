@@ -504,10 +504,42 @@ _SHORTHAND_STEP_VERBS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _normalize_waitfor_timeout_fields(step: dict[str, Any]) -> dict[str, Any]:
+    sop = str(step.get("op") or step.get("action") or "").lower()
+    if sop not in ("waitfor", "wait_for", "waituntil"):
+        return step
+    if "timeoutMs" in step:
+        return step
+    if "timeout_ms" in step and step["timeout_ms"] is not None:
+        out = dict(step)
+        out["timeoutMs"] = max(0, int(round(float(out.pop("timeout_ms")))))
+        return out
+    if "timeout_s" in step or "timeoutSeconds" in step:
+        out = dict(step)
+        raw_s = out.pop("timeout_s", None)
+        if raw_s is None:
+            raw_s = out.pop("timeoutSeconds", None)
+        if raw_s is not None:
+            out["timeoutMs"] = max(0, int(round(float(raw_s) * 1000.0)))
+        return out
+    if "timeout" in step and step["timeout"] is not None:
+        try:
+            tv = float(step["timeout"])
+        except (TypeError, ValueError):
+            return step
+        out = dict(step)
+        out.pop("timeout", None)
+        out["timeoutMs"] = max(0, int(round(tv * 1000.0 if 0 < tv <= 30 else tv)))
+        return out
+    return step
+
+
 def normalize_step_dict(step: dict[str, Any]) -> dict[str, Any]:
     """Expand single-verb shorthand steps (e.g. {'click': '@u1'}, {'wait': 300}, {'key': 'Enter'})."""
-    if not isinstance(step, dict) or step.get("op") or step.get("action"):
+    if not isinstance(step, dict):
         return step
+    if step.get("op") or step.get("action"):
+        return _normalize_waitfor_timeout_fields(step)
     for verb, param_key in _SHORTHAND_STEP_VERBS:
         matched_key = verb if verb in step else (verb.lower() if verb.lower() in step else None)
         if matched_key is None:
@@ -520,7 +552,7 @@ def normalize_step_dict(step: dict[str, Any]) -> dict[str, Any]:
                 out.setdefault(rk, rv)
         elif param_key and not isinstance(raw_val, bool) and raw_val is not None:
             out.setdefault(param_key, raw_val)
-        return out
+        return _normalize_waitfor_timeout_fields(out)
     return step
 
 
@@ -2699,6 +2731,9 @@ IN_PAGE_RUNTIME_JS = r"""
   async function executeBatch(req) {
     const tBatchStart = performance.now();
     store.navigating = false;
+    if (req.strictCsp) {
+      store.strictCsp = true;
+    }
     if (req.virtualTools) {
       registerVirtualTools(req.virtualTools);
     }
@@ -6078,6 +6113,14 @@ class BrowserEngine:
         }
 
         def _invoke(p: dict[str, Any]) -> dict[str, Any]:
+            if "strictCsp" not in p and self._strict_csp_hosts:
+                cur_u = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
+                try:
+                    cur_h = (urlparse(_normalize_nav_url(cur_u)).hostname or "").lower()
+                except ValueError:
+                    cur_h = ""
+                if cur_h and cur_h in self._strict_csp_hosts:
+                    p = {**p, "strictCsp": True}
             try:
                 out = sess._raw_page.evaluate("req => window.__fmu.executeBatch(req)", p)
                 return out if isinstance(out, dict) else {}
@@ -6455,7 +6498,9 @@ class BrowserEngine:
                 tot_js_ms = float(tm.get("totalInPageMs") or 0.0)
                 nav_w_ms = float(res.get("navWaitMs") or 0.0)
                 escs_logged = [
-                    str(e["reason"])
+                    "eval_csp_cached"
+                    if e.get("reason") == "eval_csp" and e.get("cached")
+                    else str(e["reason"])
                     for e in (res.get("escalations") or [])
                     if isinstance(e, dict) and e.get("reason")
                 ]
@@ -7043,7 +7088,10 @@ class BrowserEngine:
                     in_page_total_js_ms += float(tm.get("totalInPageMs") or 0.0)
                 for esc_item in (r.get("escalations") or []):
                     if isinstance(esc_item, dict) and esc_item.get("reason"):
-                        all_escalations.append(str(esc_item["reason"]))
+                        reason = str(esc_item["reason"])
+                        if reason == "eval_csp" and esc_item.get("cached"):
+                            reason = "eval_csp_cached"
+                        all_escalations.append(reason)
 
         active_steps = [
             s for s in steps if (s.get("op") or s.get("action")) != "close"

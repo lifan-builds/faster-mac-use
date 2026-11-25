@@ -402,15 +402,51 @@ class TabHandle:
 
     navigate = goto
 
-    def click(self, target: str) -> TabHandle:
+    def click(
+        self,
+        target: str | int | float | dict[str, Any] | None = None,
+        y: int | float | None = None,
+        *,
+        x: int | float | None = None,
+        selector: str | None = None,
+        optional: bool = False,
+        **kwargs: Any,
+    ) -> TabHandle:
         self._fresh = False
-        self._pending_steps.append({"op": "click", "uid": str(target)})
+        step: dict[str, Any] = {"op": "click"}
+        if isinstance(target, dict):
+            for k, v in target.items():
+                if v is not None:
+                    step[k] = v
+        elif y is not None and isinstance(target, (int, float)):
+            step["x"] = int(round(float(target)))
+            step["y"] = int(round(float(y)))
+        elif target is not None:
+            step["uid"] = str(target)
+        if x is not None:
+            step["x"] = int(round(float(x)))
+        if y is not None and not isinstance(target, (int, float)):
+            step["y"] = int(round(float(y)))
+        if selector is not None:
+            step["selector"] = str(selector)
+        if optional:
+            step["optional"] = True
+        for k, v in kwargs.items():
+            if v is not None:
+                step[k] = v
+        self._pending_steps.append(step)
         return self
 
-    def moveCursor(self, target: str | int, y: int | None = None) -> TabHandle:
+    def moveCursor(self, target: str | int | float | dict[str, Any], y: int | float | None = None) -> TabHandle:
         self._fresh = False
-        if y is not None and isinstance(target, (int, float)):
-            self._pending_steps.append({"op": "move", "x": int(target), "y": int(y)})
+        if isinstance(target, dict):
+            step: dict[str, Any] = {"op": "move"}
+            for k, v in target.items():
+                if v is not None:
+                    step[k] = v
+            self._pending_steps.append(step)
+        elif y is not None and isinstance(target, (int, float)):
+            self._pending_steps.append({"op": "move", "x": int(round(float(target))), "y": int(round(float(y)))})
         else:
             self._pending_steps.append({"op": "move", "uid": str(target)})
         return self
@@ -467,6 +503,11 @@ class TabHandle:
             if v is not None:
                 if k == "timeout_ms":
                     step["timeoutMs"] = max(0, int(round(float(v))))
+                elif k in ("timeout_s", "timeoutSeconds"):
+                    step["timeoutMs"] = max(0, int(round(float(v) * 1000.0)))
+                elif k == "timeout":
+                    tv = float(v)
+                    step["timeoutMs"] = max(0, int(round(tv * 1000.0 if 0 < tv <= 30 else tv)))
                 elif k == "any_text":
                     step["anyText"] = list(v) if isinstance(v, (list, tuple)) else [str(v)]
                 elif k == "text_gone":
@@ -475,6 +516,15 @@ class TabHandle:
                     step["selectorGone"] = str(v)
                 else:
                     step[k] = v
+        if "timeoutMs" not in step:
+            if step.get("timeout_s") is not None or step.get("timeoutSeconds") is not None:
+                raw_s = step.pop("timeout_s", None)
+                if raw_s is None:
+                    raw_s = step.pop("timeoutSeconds", None)
+                step["timeoutMs"] = max(0, int(round(float(raw_s) * 1000.0)))
+            elif step.get("timeout") is not None:
+                tv = float(step.pop("timeout"))
+                step["timeoutMs"] = max(0, int(round(tv * 1000.0 if 0 < tv <= 30 else tv)))
         self._pending_steps.append(step)
         return self
 

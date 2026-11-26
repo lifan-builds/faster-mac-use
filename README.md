@@ -1,16 +1,37 @@
 # Faster Mac Use (`fmu`)
 
-[![PyPI](https://img.shields.io/pypi/v/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![Downloads](https://img.shields.io/pypi/dm/faster-mac-use)](https://pypi.org/project/faster-mac-use/) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+[![PyPI](https://img.shields.io/pypi/v/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![Downloads](https://img.shields.io/pypi/dm/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![GitHub stars](https://img.shields.io/github/stars/lifan-builds/faster-mac-use?style=flat)](https://github.com/lifan-builds/faster-mac-use/stargazers) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-Let your AI agent drive Chrome and native Mac apps in the background. Your mouse stays where you left it, your window keeps focus, and each step comes back as a few hundred tokens of text instead of a screenshot.
+`fmu` lets AI agents drive your logged-in Chrome tabs and native macOS apps in the background. Your mouse stays where you left it, your active window keeps focus, Chrome 144 shows zero remote-debugging popups, and each step returns a few hundred tokens of `+`/`~`/`-` `@uid` text diffs instead of a screenshot.
 
-Try it in one command (needs macOS and [`uv`](https://docs.astral.sh/uv/)). It clicks `7 × 6 =` in Calculator without bringing the app to the front:
+![Faster Mac Use 3-Cursor Parallel Swarm vs @playwright/mcp Live Token Counter](https://raw.githubusercontent.com/lifan-builds/faster-mac-use/main/docs/assets/swarm-vs-mcp-demo.svg)
+
+## Quickstart
+
+Run `7 × 6 =` in macOS Calculator right now with [`uv`](https://docs.astral.sh/uv/) (zero install, zero focus change):
 
 ```bash
-uvx --from faster-mac-use fmu '{"surface":"app","app":"Calculator","steps":[{"op":"key","name":"escape"},{"op":"click","name":"7"},{"op":"click","name":"Multiply"},{"op":"click","name":"6"},{"op":"click","name":"Equals"}]}'
+uvx --from faster-mac-use fmu '{
+  "surface": "app",
+  "app": "Calculator",
+  "steps": [
+    {"op": "key", "name": "escape"},
+    {"op": "click", "name": "7"},
+    {"op": "click", "name": "Multiply"},
+    {"op": "click", "name": "6"},
+    {"op": "click", "name": "Equals"}
+  ]
+}'
 ```
 
-Then add it to Claude Code, Codex, Cursor, or any MCP client:
+Add `fmu` to Claude Code or Codex in one command:
+
+```bash
+claude mcp add faster-mac-use -- uvx --from faster-mac-use fmu mcp
+codex mcp add faster-mac-use -- uvx --from faster-mac-use fmu mcp
+```
+
+Or drop it into Cursor, Windsurf, Antigravity, or any MCP client config:
 
 ```json
 {
@@ -20,148 +41,83 @@ Then add it to Claude Code, Codex, Cursor, or any MCP client:
 }
 ```
 
-If `fmu` saves your agent tokens or time, a [GitHub star](https://github.com/lifan-builds/faster-mac-use) helps other agent builders find it.
+Installing from `uvx` or PyPI? [Star `lifan-builds/faster-mac-use` on GitHub](https://github.com/lifan-builds/faster-mac-use) so you can track releases and help other Mac agent builders find it.
 
-## Proof
+## Benchmarks
 
-Three agents working in parallel, compared against `@playwright/mcp` on the same task:
-
-![Faster Mac Use 3-Cursor Parallel Swarm vs @playwright/mcp Live Token Counter](https://raw.githubusercontent.com/lifan-builds/faster-mac-use/main/docs/assets/swarm-vs-mcp-demo.svg)
-
-Cumulative input tokens and engine time across five workloads. The harness, raw JSON, and per-turn numbers are in [`benchmarks/`](https://github.com/lifan-builds/faster-mac-use/tree/main/benchmarks) and the [benchmark report](https://github.com/lifan-builds/faster-mac-use/blob/main/docs/architecture_and_benchmarks.md); rerun them with `PYTHONPATH=src python3 benchmarks/run_benchmarks.py`.
+Cumulative input tokens and engine time across five workloads. Raw JSON, per-turn traces, and the runner live in [`benchmarks/`](https://github.com/lifan-builds/faster-mac-use/tree/main/benchmarks) and the [benchmark report](https://github.com/lifan-builds/faster-mac-use/blob/main/docs/architecture_and_benchmarks.md); rerun them locally with `PYTHONPATH=src python3 benchmarks/run_benchmarks.py` or inspect every turn in the [interactive benchmark explorer](https://clifan.com/faster-mac-use/).
 
 | Workload | `faster-mac-use` (Cumulative Tokens / Engine Time) | OpenAI Codex `cua_repl` Ref | `@playwright/mcp` / Stacked MCPs | Anthropic Pixel CUA |
 | :--- | :--- | :--- | :--- | :--- |
 | **A. Enterprise SaaS Console (10 ops)** | **1,290 tok / 94 ms** (Native WebMCP)<br>**1,290 tok / 97 ms** (Virtual WebMCP Macro)<br>**2,024 tok / 133 ms** (DOM Diff) | 5,732 tok / 359 ms | 231,125 tok / 1,850 ms | 83,215 tok / 3,400 ms |
-| **B. macOS Native Calculator (11 ops)** | **1,264 tok / 395 ms** (`< 1 ms` `AXObserver` diff) | 1,502 tok / 554 ms | 48,477 tok / 12,718 ms (`ocu`) | — |
-| **C. Hybrid Web + macOS (14 ops)** | **2,179 tok / 335 ms** | 2,437 tok / 568 ms | 129,010 tok / 3,200 ms | — |
+| **B. macOS Native Calculator (11 ops)** | **1,264 tok / 395 ms** (`< 1 ms` `AXObserver` diff) | 1,502 tok / 554 ms | 48,477 tok / 12,718 ms (`ocu`) | n/a |
+| **C. Hybrid Web + macOS (14 ops)** | **2,179 tok / 335 ms** | 2,437 tok / 568 ms | 129,010 tok / 3,200 ms | n/a |
 | **D. 3-Agent Multi-Cursor Swarm (25 ops)** | **1,510 tok / 326 ms** (2 turns) | 15,923 tok / 1,122 ms (6 turns) | 293,950 tok / 4,850 ms | 430,800 tok / 7,600 ms |
 | **E. Long-Horizon 30-Op + Window OCR** | **4,584 tok / 494 ms** (0 vision tok) | 8,355 tok / 942 ms | 400,725 tok / 6,100 ms | 620,535 tok / 9,200 ms |
 
-The [interactive benchmark explorer](https://clifan.com/faster-mac-use/) breaks these down turn by turn. A test guard polls the cursor position and frontmost app at 50 Hz during runs and reports 0.0 px of cursor movement and 0 focus changes.
+During benchmark runs, [`BackgroundIntrusionGuard`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/guard.py) polls CoreGraphics cursor coordinates and `lsappinfo front` at 50 Hz and verifies `0.0 px` of cursor movement and `0` focus changes.
 
-### Replay what your agent did
+## Replay what your agent did
 
-Set `FMU_TRACE` to record a run, then render it as a self-contained HTML player or an animated SVG you can drop into an issue or README. Each frame draws the `@u`/`@a` element bounds, colors added, changed, and removed elements, and shows the step's latency and token count. Traced calls send `"bounds": true`, which appends `box=x,y,w,h` to each element line; you can also pass that flag yourself on any web or app request.
+Set `FMU_TRACE` to record any CLI or MCP session, then render a self-contained HTML player or looping SVG for pull requests and bug reports. Each frame draws `@u`/`@a` element bounds, colors added, changed, and removed elements, and shows per-step latency and token counts.
 
 ```bash
-export FMU_TRACE=~/fmu-run.jsonl        # every fmu call (CLI or MCP) appends request, output, and wall ms
+export FMU_TRACE=~/fmu-run.jsonl
 # ... let your agent work ...
-fmu replay ~/fmu-run.jsonl              # -> ~/fmu-run.html (←/→ to step, space to play)
+fmu replay ~/fmu-run.jsonl              # -> ~/fmu-run.html (left/right arrows to step, space to play)
 fmu replay ~/fmu-run.jsonl -o run.svg   # looping animated SVG
-fmu replay ~/.fmu/logs/perf-2026-11-22.jsonl   # perf logs replay as a latency-only timeline
+fmu replay ~/.fmu/logs/perf-2026-11-25.jsonl   # perf logs render as a latency timeline
 ```
 
 ![fmu replay of example.com and Calculator 7 × 6 with @uid bounds and latency HUD](https://raw.githubusercontent.com/lifan-builds/faster-mac-use/main/docs/assets/replay-demo.svg)
 
-Try it without installing (needs 0.5.0 or later):
-
-```bash
-FMU_TRACE=/tmp/run.jsonl uvx --from 'faster-mac-use>=0.5.0' fmu '{"surface":"app","app":"Calculator","steps":[{"op":"click","name":"7"}]}'
-uvx --from 'faster-mac-use>=0.5.0' fmu replay /tmp/run.jsonl   # -> /tmp/run.html
-```
-
 ## Why `faster-mac-use`?
 
-Most computer-use tools make you pick one of these trade-offs:
-- Screenshot loops (the `computer` tool) move your real cursor, steal window focus, and spend 40k–80k tokens over 10–30 turns.
-- Accessibility and Playwright MCPs (`@playwright/mcp`, `chrome-devtools-mcp`) load 4,000–12,500 tokens of tool schemas up front and return the full ARIA tree after every click.
-- Single-session REPLs like OpenAI Codex's `cua_repl` are fast for one agent, but run multi-agent work one at a time and fall back to screenshots on custom-drawn macOS windows and `<canvas>` apps.
+Existing computer-use stacks force an awkward choice:
+- Screenshot loops (`computer` tools) hijack your physical cursor, bring windows to the front, and burn 40k to 80k tokens across 10 to 30 turns.
+- Browser and accessibility MCPs (`@playwright/mcp`, `chrome-devtools-mcp`) spend 4,000 to 12,500 tokens on tool schemas before the first call and dump full ARIA trees after every click.
+- Single-session REPLs like OpenAI Codex's `cua_repl` handle one agent well, serialize multi-agent work, and drop back to screenshots on custom-drawn macOS views and `<canvas>` surfaces.
 
-`fmu` started from the `cua_repl` design and extends it. It exposes one MCP tool with a 268-token schema and keeps a stateful async REPL. Elements get stable IDs (`@u1..@uN` on the web, `@a1..@aN` in macOS apps), so follow-up turns return only `+`/`~`/`-` diffs; on macOS those come from push-based `AXObserver` notifications in under 1 ms. It also records multi-step site flows as reusable WebMCP macros (`~/.fmu/macros/`), reads `<canvas>` and window text with on-device Vision OCR at zero vision tokens, drives your logged-in Chrome through an MV3 extension bridge inside a dedicated "Agent" tab group (no Chrome 144 remote-debugging popups), and runs several agents with separate cursors at the same time.
+`fmu` builds on the single-tool `cua_repl` model and extends it across both logged-in Chrome and macOS Accessibility:
+- **Logged-in Chrome without popups ([`browser_engine.py`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/browser_engine.py), [`extension/background.js`](https://github.com/lifan-builds/faster-mac-use/blob/main/extension/background.js))**: An outbound MV3 extension bridge (`ws://127.0.0.1:19222/ext`) drives unfocused tabs inside per-session `"Agent"` tab groups without triggering Chrome 144 `DevToolsActivePort` modal prompts. For public or local dev pages, `mode: "headless"` runs in a background Playwright worker with focus and lifecycle emulation. Agents can also list and toggle Chrome extensions (`cua.listExtensions()`, `cua.setExtensionEnabled()`), fill cross-origin payment/auth iframes via trusted CDP input, edit rich-text `contenteditable` surfaces without touching the clipboard, and upload files via `DOM.setFileInputFiles` without opening `NSOpenPanel`.
+- **Sub-millisecond macOS Accessibility & 0-vision-token OCR ([`fmu_ax.swift`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/native/fmu_ax.swift), [`mac_engine.py`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/mac_engine.py))**: A warm universal2 Swift daemon (`/tmp/fmu-ax.sock`) caches `AXUIElement` handles and subscribes to `AXObserver` dirty-subtree notifications on a dedicated `CFRunLoop` thread so follow-up diffs return in under 1 ms. Built-in Apple Silicon `Vision.framework` OCR (`await tab.ocr()`, `await app.ocr()`) turns `<canvas>` and custom window text into clickable `@ocr1..@ocrN` targets at zero image tokens, alongside an optional non-activating floating Live View PiP monitor and menu bar `Stop` / `Resume` (`fmu --live-view on|off`, `fmu --stop`).
+- **Stateful Python/JS REPL, WebMCP macros & context compaction ([`cua_runtime.py`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/cua_runtime.py))**: Exposes a single `cua` MCP tool supporting stateful REPL scripts (`cua.createBrowserTab`, `cua.getTab`, `cua.getApp`), declarative `steps` batches, reusable per-domain Virtual WebMCP macros (`~/.fmu/macros/`), concurrent swarms (`{"parallel": [...]}`), and 18-token tombstones that mask superseded snapshots so long runs stay linear in tokens.
 
----
+## Install and CLI usage
 
-## Core Architecture
+Install `fmu` permanently with `uv`, `pip`, or Homebrew (first macOS run compiles the universal2 `fmu-ax` helper automatically):
 
-1. **Tier 1 — Native Browser Engine ([`BrowserEngine`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/browser_engine.py))**
-   - **Dual-Mode Zero-Popup Chrome Control**:
-     - **Live Logged-In Chrome via Outbound MV3 Extension WebSocket Bridge (`ws://127.0.0.1:19222/ext`)**: [`extension/background.js`](https://github.com/lifan-builds/faster-mac-use/blob/main/extension/background.js) connects outward to `/tmp/fmu-runtime.sock`'s single-owner `ExtensionWebSocketBridge` (`fmu mcp` proxies calls through the daemon so port `19222` is never contested; inspectable via `{"bridgeStatus": true}` / `await cua.getBridgeStatus()`) and drives unfocused, per-agent color-coded **`"Agent"` Tab Groups** (`active: false`, with multi-window `window`, `windowId`, and `reuseExisting` tab targeting) via `chrome.debugger` / `chrome.scripting` / `chrome.tabGroups` with **zero Chrome 144 `DevToolsActivePort` `"Allow remote debugging?"` modal popups**. When `mode: "extension"` (or `"live"` / `requireExtension: true`) is requested while disconnected, `fmu` fails fast with an actionable setup diagnostic; when default `mode: "chrome"` targets an external URL without the extension connected, `fmu` tags the header `bridge="headless-fallback"` and emits an explicit `! warning:` (and `! errors:` if `els=0`) instead of silently failing in an unauthenticated session.
-     - **Zero-Config Background Worker (`mode: "headless"` & local dev URLs)**: When running in `"headless"` mode or against local/test URLs without the extension bridge, `fmu` uses a thread-safe background Playwright worker (`fmu-pw-worker`) with per-tab background focus and lifecycle emulation (`Emulation.setFocusEmulationEnabled({enabled: true})` + `Page.setWebLifecycleState({state: "active"})`).
-   - **Persistent `WeakMap` UIDs (`@u1..@uN`) + Pre-Registered Table Row Folding (`foldTables`)**: Indexes all table rows in `uidToRef` so agents can target folded rows by label or UID while cutting initial dense table snapshots by >2.5×.
-   - **Native WebMCP (`navigator.modelContext`) + Auto-Synthesized Virtual WebMCP Macros (`~/.fmu/macros/`)**: Detects page-registered WebMCP tools and allows agents to synthesize multi-step DOM trajectories into reusable 1-turn Virtual WebMCP tools (`await tab.saveMacro(name, steps, desc)` -> `await tab.callTool(name, args)`), auto-loaded per domain in the `# web ... webmcp=[...]` header.
-   - **In-Browser `<canvas>` / WebGL Semantic OCR Fusion**: Clip-captures `<canvas>` elements via CDP and runs Apple Silicon `Vision.framework` (`VNRecognizeTextRequest`) via `fmu-ax` to inject clickable `@ocr1..@ocrN canvas-text "..." (x,y) [wxh]` targets directly into the web snapshot (`await tab.ocr()` or automatic canvas detection) with **0 VLM image tokens**.
-   - **Deterministic Rich-Text Editing & Zero-Dialog File Uploads**: Replaces (or appends with `append: true`) multi-block `contenteditable` / Draft.js / ProseMirror editors in `< 50 ms` without touching the system clipboard, and intercepts `<input type="file">` uploads via CDP (`DOM.setFileInputFiles`) so native macOS `NSOpenPanel` dialogs never open or get blocked by AppKit/TCC.
-
-2. **Tier 2 — Native macOS Accessibility, Push-Based `AXObserver` & Vision OCR ([`fmu_ax.swift`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/native/fmu_ax.swift) / [`MacNativeEngine`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/mac_engine.py))**
-   - **Persistent Unix Socket Daemon (`/tmp/fmu-ax.sock`, universal2 binary `bin/fmu-ax`)**: Keeps a warm 4,000-element `AXUIElement` LRU cache, PID/window cache, per-agent `+/~/-` diff baselines, and per-agent virtual cursors (`VirtualCursorState`) across turns.
-   - **Push-Based `AXObserver` Dirty-Subtree Tracking**: Subscribes to `kAXValueChangedNotification`, `kAXTitleChangedNotification`, `kAXCreatedNotification`, `kAXUIElementDestroyedNotification`, and window/layout notifications on a dedicated `CFRunLoop` thread (`fmu-ax-observer`). Turn 2+ unchanged or leaf-dirty snapshots short-circuit full AX tree walks in **`< 1 ms`** (`obs=` sequence telemetry).
-   - **Batched Attribute Reads, Non-Destructive Clipboard Hygiene & Multi-Window Guards**: Batches reads via `AXUIElementCopyMultipleAttributeValues`, lazily wakes background Electron/Chromium AX trees (`AXManualAccessibility = true`), never overwrites `NSPasteboard.general` on `op: "set"` (verifying `AXTextArea` read-back and detecting `NSOpenPanel` TCC-disabled `Open` buttons), and guards `CGEvent.postToPid` key routing when targeting a non-main window of a multi-window process.
-   - **0-Vision-Token Apple Silicon Window & Canvas OCR**: Built-in `CGWindowListCreateImage` + `ImageIO` + `VNRecognizeTextRequest` engine (`op: "ocr"` / `await app.ocr()`) extracts clickable text and bounding boxes in `< 70 ms`.
-   - **Real-Time Pixel `fmu Live View` HUD & One-Click Menu Bar Stop**: Streams live pixels of the actual controlled background Chrome tab (`Page.startScreencast` + async post-action `Page.captureScreenshot` over `ws://127.0.0.1:19222/ext`) or native macOS app window (`ScreenCaptureKit`) into a non-activating floating PiP monitor with target cursor reticles, HD Zoom (`460px` / `740px`, `{"toggleZoom": true}`), `Highlight` (`fmu --highlight`), draggable positioning, persistent Live View toggle (`fmu --live-view on|off`, `~/.fmu/prefs.json`), per-session & global agent Chrome tab cleanup, and instant `Stop` / `Resume` (`fmu --stop` / `fmu --resume`).
-
-3. **Tier 3 — Unified Multi-Cursor / Multi-Agent Stateful REPL, Warm Daemon & Context Hygiene ([`FasterMacUseRuntime`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/cua_runtime.py))**
-   - **268-Token Single-Tool Schema & Strict `steps` Validation**: Supports OpenAI Codex-style stateful `cua_repl` scripts (`cua.createBrowserTab`, `cua.getTab`, `cua.getApp`, `cua.getBridgeStatus`, `cua.saveMacro`, `cua.listMacros`, `cua.getState`, `cua.getCursors`), 1-trip declarative `steps` batches (with `op`/`uid` and `action`/`target`/`text` normalization plus explicit error reporting on missing or unsupported `"op"`), and concurrent multi-agent swarms (`{"parallel": [{"agent": "agent-1", "code": "..."}, ...]}`).
-   - **Per-Agent Isolation & Stale-Observation Masking**: Each `AgentSession` has independent REPL handles, virtual cursor `(x, y)` coordinates (`tab.moveCursor` / `app.moveCursor`), and `ContextWindowTracker` 18-token tombstones that replace superseded snapshots to prevent quadratic O(N²) context growth.
-   - **50Hz Hardware Intrusion Guard ([`BackgroundIntrusionGuard`](https://github.com/lifan-builds/faster-mac-use/blob/main/src/fmu/guard.py))**: Polls CoreGraphics (`CGEventGetLocation` + `CGEventSourceSecondsSinceLastEventType`) and `lsappinfo front` at 50Hz to prove `0.0 px` cursor displacement and `0` automated focus changes.
-
----
-
-## Install and Usage
-
-### 1. Install
 ```bash
-# From PyPI (compiles the universal2 fmu-ax helper on first macOS run)
 uv tool install faster-mac-use      # or: pip install faster-mac-use
-
-# From source
-git clone https://github.com/lifan-builds/faster-mac-use.git
-cd faster-mac-use
-pip install -e .
-
-# Homebrew formula
-brew install --Formula ./Formula/faster-mac-use.rb
+# From source: git clone https://github.com/lifan-builds/faster-mac-use.git && cd faster-mac-use && pip install -e .
+# Homebrew:    brew install --Formula ./Formula/faster-mac-use.rb
 ```
 
-### 2. MCP client config for an installed `fmu`
-```json
-{
-  "mcpServers": {
-    "faster-mac-use": {
-      "command": "fmu",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-*(Or point `"command"` to `/path/to/faster-mac-use/bin/fmu`.)*
+Once installed globally, you can point `"command"` in `mcpServers` directly to `"fmu"` with `"args": ["mcp"]`, or invoke `fmu` from the shell:
 
-### 3. CLI Usage (`fmu` or `./bin/fmu`)
 ```bash
-# Native macOS Calculator in background (zero focus steal, <1ms AXObserver diff on Turn 2+)
-./bin/fmu '{"surface":"app","app":"Calculator","steps":[{"op":"key","name":"escape"},{"op":"click","name":"7"},{"op":"click","name":"Multiply"},{"op":"click","name":"6"},{"op":"click","name":"Equals"}]}'
+# Stateful cua REPL: open a tab, record a reusable WebMCP macro, and close agent-opened tabs when done
+fmu '{"code":"tab = cua.createBrowserTab(\"chrome\", \"https://example.com\", sessionLabel=\"Docs\"); tab.saveMacro(\"more_info\", [{\"op\": \"click\", \"uid\": \"More information\"}], \"Open More info\"); cua.closeMyTabs()"}'
 
-# Codex-style stateful cua_repl script + Virtual WebMCP macro recording
-./bin/fmu '{"code":"let tab = await cua.createBrowserTab(\"chrome\", \"https://example.com\", {sessionName: \"Agent\"}); await tab.saveMacro(\"quick_lookup\", [{op: \"click\", uid: \"More information\"}], \"Click More info\");"}'
+# Multi-cursor parallel execution across Chrome tabs and native macOS apps
+fmu '{"parallel":[{"agent":"web-1","code":"t = cua.createBrowserTab(\"headless\", \"https://example.com\"); t.move(\"More information\")"},{"agent":"mac-1","code":"a = cua.getApp(\"Calculator\"); a.pressKey(\"escape\").click(\"8\")"}]}'
 
-# Multi-cursor / multi-agent parallel execution across Chrome tabs + native macOS apps
-./bin/fmu '{"parallel":[{"agent":"agent-1","code":"let t = await cua.createBrowserTab(\"chrome\", \"https://example.com\"); await t.move(\"More information\");"},{"agent":"agent-2","code":"let a = await cua.getApp(\"Calculator\"); await a.pressKey(\"escape\"); await a.click(\"8\");"}]}'
-
-# Review real-world p50/p95/p99 latency, sub-phase breakdowns, and token efficiency (~/.fmu/logs)
-./bin/fmu --perf 7
+# Inspect 7-day p50/p95/p99 latency, sub-phase breakdowns, and token telemetry (~/.fmu/logs)
+fmu --perf 7
 ```
 
-### Multiple Agents on One Mac
+### Multiple agents on one Mac
 
-Every request to the warm daemon is attributed to the agent session that sent it: the daemon reads the caller's pid from the Unix socket (`LOCAL_PEERPID`) and walks up to the nearest harness process (Devin, Codex, Claude Code, Antigravity, Gemini, Cursor). Each session then gets:
+The warm daemon reads each caller's PID over the Unix socket (`LOCAL_PEERPID`) and walks up to the owning harness (Claude Code, Codex, Devin, Antigravity, Gemini, Cursor):
+- **Isolated tab namespaces and groups**: Sessions get distinct IDs (`devin1:t1`, `codex1:t1`) and color-coded Chrome tab groups titled `Harness · project` (or `sessionLabel` when passed from multi-conversation MCP hosts).
+- **Safe tab cleanup**: `cua.closeMyTabs({keep: [...]})` and `{"closeAgentTabs": true}` close only tabs opened by that session. Calling `tab.close()` on a user-opened tab detaches without closing the user's tab unless `force=True` is passed.
 
-- **Its own namespace:** tab ids look like `devin1:t1` and `codex1:t1`, so two agents' default `t1` tabs never collide, and `getTab("amazon.com")` only matches tabs the caller already owns or unclaimed ones.
-- **Its own Chrome tab group:** titled `Harness · project` (project = git root of the shell's working directory, or `sessionLabel` when passed) with a stable color per project. Sub-agents add a suffix (`Devin · alexa-photos · audit`).
-- **Scoped cleanup:** `{"reset": true}` and `{"closeAgentTabs": true}` only touch the caller's tabs, and only tabs the agent opened are ever closed; tabs it merely attached to stay open. When a harness process exits, its blank tabs close and its group collapses.
-- **Menu bar view:** *Agent Sessions* lists each live session with its group color and tab count, with a per-session close action. `{"agentSessions": true}` prints the same list.
+### Tests and benchmarks
 
-Harnesses that host many conversations in one process and reach fmu over MCP (Devin Desktop, Antigravity) can't be told apart by process; pass `sessionLabel` to give each conversation its own group.
-
-### 4. Run the Unit & Integration Suite
 ```bash
-PYTHONPATH=src python3 tests/test_fmu.py
-```
-
-### 5. Run the 5-Workload Competitor Benchmark Suite
-```bash
+python3 tests/test_fmu.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 ```
-Results are written to [`benchmarks/results/latest_benchmark.md`](https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/results/latest_benchmark.md) and [`benchmarks/results/latest_benchmark.json`](https://github.com/lifan-builds/faster-mac-use/blob/main/benchmarks/results/latest_benchmark.json).
 
 ## License
 

@@ -760,11 +760,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.5.5"
+_FMU_RUNTIME_VERSION = "0.5.6"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.5.5";
+  const FMU_RUNTIME_VERSION = "0.5.6";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -4187,6 +4187,9 @@ class BrowserTabSession:
                     self._ocr_checked = False
                     self._ocr_populated = False
                     self._focus_emulated = False
+                if new_u:
+                    self.last_url = new_u
+                    self._engine._tab_last_urls[self.tab_id] = new_u
         except Exception:
             self._runtime_ensured = False
             self._ocr_checked = False
@@ -5529,6 +5532,93 @@ class BrowserEngine:
             self._apply_inline_preview(sess, ext_res["preview"], url_hint=actual_url, push_frame=True)
         return sess
 
+    def _refresh_live_tab_meta(self, tab_id: str) -> tuple[str, str]:
+        sess = self._tabs.get(tab_id)
+        if sess is None or not self._is_session_alive(sess):
+            return (
+                self._tab_last_urls.get(tab_id, ""),
+                self._tab_last_titles.get(tab_id, ""),
+            )
+        if sess.is_extension:
+            ctid = getattr(sess._raw_page, "chrome_tab_id", None)
+            if ctid is not None and self._ext_bridge is not None and self._ext_bridge.is_connected():
+                info: Any = None
+                try:
+                    info = self._ext_bridge.call_rpc(
+                        "getTabInfo",
+                        {"tabId": int(ctid)},
+                        timeout=2.0,
+                        check_stopped=False,
+                    )
+                except Exception as exc:
+                    if "Unknown extension RPC method" in str(exc):
+                        try:
+                            info = self._ext_bridge.call_rpc(
+                                "getTab",
+                                {"chromeTabId": int(ctid), "allowMissing": True, "focusEmulation": False},
+                                timeout=2.0,
+                                check_stopped=False,
+                            )
+                        except _BROWSER_OPS_ERRORS:
+                            info = None
+                if isinstance(info, dict) and info.get("found"):
+                    live_u = str(info.get("url") or "")
+                    live_t = str(info.get("title") or "")
+                    if live_u:
+                        sess.last_url = live_u
+                        sess._raw_page.url = live_u
+                        self._tab_last_urls[tab_id] = live_u
+                    if "title" in info:
+                        sess.last_title = live_t
+                        sess._raw_page.title = live_t
+                        self._tab_last_titles[tab_id] = live_t
+                    return (
+                        live_u or sess.last_url or self._tab_last_urls.get(tab_id, ""),
+                        live_t if "title" in info else (sess.last_title or self._tab_last_titles.get(tab_id, "")),
+                    )
+            raw_u = getattr(sess._raw_page, "url", None)
+            raw_t = getattr(sess._raw_page, "title", None)
+            u_str = raw_u if isinstance(raw_u, str) and raw_u else (sess.last_url or self._tab_last_urls.get(tab_id, ""))
+            t_str = raw_t if isinstance(raw_t, str) and raw_t else (sess.last_title or self._tab_last_titles.get(tab_id, ""))
+            return u_str, t_str
+
+        if self._pw is not None and self._worker.is_alive() and hasattr(sess._raw_page, "wait_for_timeout"):
+            try:
+                def _probe_pw() -> tuple[str, str]:
+                    sess._raw_page.wait_for_timeout(0)
+                    u_now = str(getattr(sess._raw_page, "url", "") or "")
+                    try:
+                        t_now = str(sess._raw_page.title() or "")
+                    except Exception:
+                        t_now = str(sess.last_title or "")
+                    return u_now, t_now
+
+                live_u, live_t = self._run_sync(_probe_pw)
+                if live_u:
+                    sess.last_url = live_u
+                    self._tab_last_urls[tab_id] = live_u
+                if live_t or not sess.last_title:
+                    sess.last_title = live_t
+                    self._tab_last_titles[tab_id] = live_t
+                return (
+                    live_u or sess.last_url or self._tab_last_urls.get(tab_id, ""),
+                    live_t or sess.last_title or self._tab_last_titles.get(tab_id, ""),
+                )
+            except _BROWSER_OPS_ERRORS:
+                pass
+        raw_u = getattr(sess._raw_page, "url", None)
+        u_str = raw_u if isinstance(raw_u, str) and raw_u else (sess.last_url or self._tab_last_urls.get(tab_id, ""))
+        if u_str and sess.last_url != u_str:
+            sess.last_url = u_str
+            self._tab_last_urls[tab_id] = u_str
+        return u_str, str(sess.last_title or self._tab_last_titles.get(tab_id, ""))
+
+    def get_live_tab_url(self, tab_id: str) -> str:
+        return self._refresh_live_tab_meta(tab_id)[0]
+
+    def get_live_tab_title(self, tab_id: str) -> str:
+        return self._refresh_live_tab_meta(tab_id)[1]
+
     def list_tabs(
         self,
         query: str = "",
@@ -6385,6 +6475,23 @@ class BrowserEngine:
             "diff",
         }
 
+        def _sync_out_meta(out: Any) -> dict[str, Any]:
+            if not isinstance(out, dict):
+                return {}
+            u_out = out.get("url")
+            if isinstance(u_out, str) and u_out:
+                sess.last_url = u_out
+                self._tab_last_urls[tab_id] = u_out
+                if sess.is_extension:
+                    sess._raw_page.url = u_out
+            if "title" in out:
+                t_out = str(out.get("title") or "")
+                sess.last_title = t_out
+                self._tab_last_titles[tab_id] = t_out
+                if sess.is_extension:
+                    sess._raw_page.title = t_out
+            return out
+
         def _invoke(p: dict[str, Any]) -> dict[str, Any]:
             if "strictCsp" not in p and self._strict_csp_hosts:
                 cur_u = str(getattr(sess._raw_page, "url", "") or sess.last_url or "")
@@ -6396,7 +6503,7 @@ class BrowserEngine:
                     p = {**p, "strictCsp": True}
             try:
                 out = sess._raw_page.evaluate("req => window.__fmu.executeBatch(req)", p)
-                return out if isinstance(out, dict) else {}
+                return _sync_out_meta(out)
             except Exception as inner_exc:
                 msg = str(inner_exc)
                 if (
@@ -6408,7 +6515,7 @@ class BrowserEngine:
                     sess.enable_background_focus_emulation()
                     sess.ensure_runtime(force=True)
                     out = sess._raw_page.evaluate("req => window.__fmu.executeBatch(req)", p)
-                    return out if isinstance(out, dict) else {}
+                    return _sync_out_meta(out)
                 raise
 
         if sess.is_extension:
@@ -7087,7 +7194,7 @@ class BrowserEngine:
             self._ext_bridge.call_rpc("reloadExtension", {}, timeout=3.0, check_stopped=False)
             return "# fmu-web extension reloading"
 
-        if req.get("listExtensions") or isinstance(req.get("listExtensions"), dict):
+        if req.get("listExtensions") not in (None, False):
             le_spec = req["listExtensions"]
             if isinstance(le_spec, dict):
                 q_val = str(le_spec.get("query") or req.get("query") or "")
@@ -7127,7 +7234,7 @@ class BrowserEngine:
                 return json.dumps(updated, ensure_ascii=False)
             return self._format_extension_state_text(updated, self_id=getattr(self, "_ext_self_id", ""))
 
-        if req.get("listTabs"):
+        if req.get("listTabs") not in (None, False):
             lt_spec = req["listTabs"]
             if isinstance(lt_spec, dict):
                 return self._list_tabs_inner(

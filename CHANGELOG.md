@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.6 (2026-11-25)
+
+### Added
+- **Scoped agent tab cleanup & user-tab guard (`closeMyTabs`)**: Added `cua.closeMyTabs({keep, tabs})` / `{"closeMyTabs": ...}` to close only tabs opened by the calling session while keeping user-opened tabs untouched on `tab.close()` unless `force: true` is passed, consolidated `cua-*` parallel sub-agent Chrome tab groups, and preserved `agentTag` claims across process retirement for post-exit worker cleanup.
+- **REPL statements, stdlib imports & nested-quote recovery**: `cua` REPL now executes top-level subscript and attribute assignments (`res["k"] = tab.eval(...)`, `obj.k = v`), augmented assignments (`+=`), `del`, `assert`, safe Python stdlib `import` / `from ... import ...` (`re`, `json`, `urllib.parse`, `datetime`, `math`, `collections`, etc.), comments before indented blocks, unquoted IIFEs, and unescaped nested quotes inside `.eval(...)`, and documents `listExtensions` / `setExtensionEnabled` in the MCP `cua` tool schema.
+
+### Fixed
+- **Live `TabHandle.url()` & `TabHandle.title()` across client-side redirects**: `TabHandle.url` / `TabHandle.url()` and `TabHandle.title` / `TabHandle.title()` now flush pending steps and query the live tab URL/title (`getTabInfo` over the MV3 extension bridge and live Playwright frame state) instead of returning stale cached `sess.last_url` after JS, meta-refresh, or affiliate interstitial redirects.
+- **README quickstart & architecture pass**: Tightened above-the-fold hook, visual proof, one-command `uvx` / MCP setup, and architecture reference.
+
 ## 0.5.5 (2026-11-25)
 
 ### Added

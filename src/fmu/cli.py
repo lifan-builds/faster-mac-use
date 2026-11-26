@@ -72,25 +72,30 @@ def execute_via_daemon(
         is_user_stopped,
     )
 
-    is_control = "liveView" in req or "menuAction" in req or "menuOutline" in req or any(
-        req.get(k)
-        for k in (
-            "stop",
-            "resume",
-            "statusBar",
-            "getStatus",
-            "clickStatusBar",
-            "highlightWindow",
-            "togglePreview",
-            "dumpUiSnapshots",
-            "shutdown_daemon",
-            "perfReport",
-            "bridgeStatus",
-            "listTabs",
-            "listExtensions",
-            "closeAgentTabs",
-            "closeMyTabs",
-            "agentSessions",
+    is_control = (
+        "liveView" in req
+        or "menuAction" in req
+        or "menuOutline" in req
+        or req.get("listTabs") not in (None, False)
+        or req.get("listExtensions") not in (None, False)
+        or any(
+            req.get(k)
+            for k in (
+                "stop",
+                "resume",
+                "statusBar",
+                "getStatus",
+                "clickStatusBar",
+                "highlightWindow",
+                "togglePreview",
+                "dumpUiSnapshots",
+                "shutdown_daemon",
+                "perfReport",
+                "bridgeStatus",
+                "closeAgentTabs",
+                "closeMyTabs",
+                "agentSessions",
+            )
         )
     )
     if not is_control and is_user_stopped():

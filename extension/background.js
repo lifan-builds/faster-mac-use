@@ -2161,6 +2161,38 @@ async function handleRpc(msg) {
         }
       };
     }
+    if (method === "getTabInfo") {
+      const tid = Number(params && (params.tabId !== undefined ? params.tabId : params.chromeTabId));
+      if (!tid || Number.isNaN(tid)) {
+        throw new Error("getTabInfo requires numeric tabId");
+      }
+      if (!chrome.tabs || typeof chrome.tabs.get !== "function") {
+        return { id, result: { found: false } };
+      }
+      try {
+        const t = await chrome.tabs.get(tid);
+        if (!t) return { id, result: { found: false } };
+        const committedUrl = String(t.url || "");
+        const liveUrl = (committedUrl && committedUrl !== "about:blank")
+          ? committedUrl
+          : String(t.pendingUrl || committedUrl || "");
+        return {
+          id,
+          result: {
+            found: true,
+            tabId: t.id,
+            windowId: t.windowId,
+            groupId: t.groupId,
+            status: String(t.status || ""),
+            discarded: isDiscardedTab(t),
+            url: liveUrl,
+            title: String(t.title || "")
+          }
+        };
+      } catch (_) {
+        return { id, result: { found: false } };
+      }
+    }
     if (method === "setInputFiles") {
       const { tabId, selector = "input[type='file']", files = [], inlineFiles = null, inlineSkipped = "" } = params;
       const res = await setInputFilesOnTab(tabId, selector, files, inlineFiles, inlineSkipped);
@@ -2915,7 +2947,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.5" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.6" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

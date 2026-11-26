@@ -381,19 +381,48 @@ class TabHandle:
                 return int(ctid)
         return self.tab_id
 
+    def _flush_pending_for_read(self) -> None:
+        if self.has_pending():
+            flushed = self.flush(diff=True)
+            sess = self.runtime._get_agent_session(self.agent_id)
+            if sess.active_outputs is not None and flushed:
+                sess.active_outputs.append(flushed)
+
+    def _live_url(self) -> str:
+        live_fn = getattr(self.runtime.browser, "get_live_tab_url", None)
+        if callable(live_fn):
+            live = live_fn(self.tab_id)
+            if isinstance(live, str):
+                return live
+        sess = self.runtime.browser._tabs.get(self.tab_id)
+        if sess is not None:
+            raw_u = getattr(getattr(sess, "_raw_page", None), "url", None)
+            if isinstance(raw_u, str) and raw_u:
+                return raw_u
+            if isinstance(getattr(sess, "last_url", None), str) and sess.last_url:
+                return sess.last_url
+        return str(self.runtime.browser._tab_last_urls.get(self.tab_id, ""))
+
+    def _live_title(self) -> str:
+        live_fn = getattr(self.runtime.browser, "get_live_tab_title", None)
+        if callable(live_fn):
+            live = live_fn(self.tab_id)
+            if isinstance(live, str):
+                return live
+        sess = self.runtime.browser._tabs.get(self.tab_id)
+        if sess is not None and isinstance(getattr(sess, "last_title", None), str) and sess.last_title:
+            return sess.last_title
+        return str(self.runtime.browser._tab_last_titles.get(self.tab_id, ""))
+
     @property
     def url(self) -> str:
-        sess = self.runtime.browser._tabs.get(self.tab_id)
-        if sess is not None and sess.last_url:
-            return _CallableStr(sess.last_url)
-        return _CallableStr(self.runtime.browser._tab_last_urls.get(self.tab_id, ""))
+        self._flush_pending_for_read()
+        return _CallableStr(self._live_url())
 
     @property
     def title(self) -> str:
-        sess = self.runtime.browser._tabs.get(self.tab_id)
-        if sess is not None and sess.last_title:
-            return _CallableStr(sess.last_title)
-        return _CallableStr(self.runtime.browser._tab_last_titles.get(self.tab_id, ""))
+        self._flush_pending_for_read()
+        return _CallableStr(self._live_title())
 
     def goto(self, url: str) -> TabHandle:
         self._fresh = False
@@ -1264,7 +1293,7 @@ class CuaNamespace:
                 if isinstance(h, TabHandle):
                     b_s = self.runtime.browser._tabs.get(h.tab_id)
                     if b_s is not None and self.runtime.browser._is_session_alive(b_s):
-                        if needle in h.url.lower() or needle in h.title.lower():
+                        if needle in h._live_url().lower() or needle in h._live_title().lower():
                             live_candidates.append(h)
             if live_candidates:
                 if ext_connected:
@@ -1391,16 +1420,18 @@ class CuaNamespace:
                         continue
                     if want_win_id is not None and h.window_id != int(want_win_id):
                         continue
+                    h_url = h._live_url()
+                    h_title = h._live_title()
                     if want_url and str(want_url) != "about:blank":
                         u_needle = str(want_url).lower()
                         u_stripped = re.sub(r"^[a-z]+://(www\.)?", "", u_needle).rstrip("/")
-                        if u_needle not in h.url.lower() and (not u_stripped or u_stripped not in h.url.lower()):
+                        if u_needle not in h_url.lower() and (not u_stripped or u_stripped not in h_url.lower()):
                             continue
                     if want_win:
                         wl = str(want_win).lower()
                         if (
-                            wl not in h.url.lower()
-                            and wl not in h.title.lower()
+                            wl not in h_url.lower()
+                            and wl not in h_title.lower()
                             and not (h.window and wl == h.window.lower())
                         ):
                             continue
@@ -1419,7 +1450,8 @@ class CuaNamespace:
                     )
 
                 for h in matched_handles:
-                    if h.url and h.url != "about:blank":
+                    u_val = h._live_url()
+                    if u_val and u_val != "about:blank":
                         return h
                 if matched_handles and not want_url and not want_win:
                     return matched_handles[0]
@@ -1470,8 +1502,10 @@ class CuaNamespace:
         for h in reversed(list(self.handles.values())):
             if isinstance(h, TabHandle):
                 b_s = self.runtime.browser._tabs.get(h.tab_id)
-                if b_s is not None and self.runtime.browser._is_session_alive(b_s) and h.url and h.url != "about:blank":
-                    return h
+                if b_s is not None and self.runtime.browser._is_session_alive(b_s):
+                    u_val = h._live_url()
+                    if u_val and u_val != "about:blank":
+                        return h
         for h in reversed(list(self.handles.values())):
             if isinstance(h, TabHandle):
                 b_s = self.runtime.browser._tabs.get(h.tab_id)
@@ -1824,8 +1858,68 @@ class _TopLevelReturnRewriter(ast.NodeTransformer):
         return ast.copy_location(ast.Raise(exc=exc_call, cause=None), node)
 
 
+_SAFE_REPL_MODULES: frozenset[str] = frozenset(
+    {
+        "ast",
+        "base64",
+        "binascii",
+        "bisect",
+        "collections",
+        "copy",
+        "csv",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "difflib",
+        "enum",
+        "fractions",
+        "functools",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "itertools",
+        "json",
+        "math",
+        "numbers",
+        "operator",
+        "pprint",
+        "random",
+        "re",
+        "statistics",
+        "string",
+        "textwrap",
+        "time",
+        "typing",
+        "unicodedata",
+        "urllib",
+        "urllib.parse",
+        "uuid",
+    }
+)
+
+
+def _fmu_safe_import(
+    name: str,
+    globals: dict[str, Any] | None = None,
+    locals: dict[str, Any] | None = None,
+    fromlist: tuple[str, ...] | list[str] = (),
+    level: int = 0,
+) -> Any:
+    mod_name = str(name or "").strip()
+    root = mod_name.split(".", 1)[0]
+    allowed = mod_name in _SAFE_REPL_MODULES or (root in _SAFE_REPL_MODULES and root != "urllib")
+    if allowed and mod_name == "urllib" and fromlist:
+        if any(str(item) != "parse" for item in fromlist):
+            allowed = False
+    if level != 0 or not allowed:
+        raise ImportError(f"Module {mod_name!r} is not permitted in cua_repl")
+    return __import__(mod_name, globals, locals, fromlist, level)
+
+
 _REPL_SAFE_BUILTINS: dict[str, Any] = {
     "__build_class__": __build_class__,
+    "__import__": _fmu_safe_import,
     "_FmuReplReturn": _FmuReplReturn,
     "_fmu_destr": _fmu_destr,
     "len": len,
@@ -1854,6 +1948,10 @@ _REPL_SAFE_BUILTINS: dict[str, Any] = {
     "sorted": sorted,
     "round": round,
     "abs": abs,
+    "pow": pow,
+    "divmod": divmod,
+    "ord": ord,
+    "chr": chr,
     "any": any,
     "all": all,
     "zip": zip,
@@ -1869,6 +1967,8 @@ _REPL_SAFE_BUILTINS: dict[str, Any] = {
     "issubclass": issubclass,
     "hasattr": hasattr,
     "getattr": getattr,
+    "setattr": setattr,
+    "delattr": delattr,
     "callable": callable,
     "type": type,
     "BaseException": BaseException,
@@ -2065,17 +2165,28 @@ def _rewrite_braces(expr: str) -> str:
     return "".join(out)
 
 
+def _has_depth0_assign(stmt: str) -> bool:
+    if stmt.startswith(("if ", "elif ", "while ", "assert ", "return ", "for ")):
+        return False
+    depth = 0
+    n = len(stmt)
+    for idx, ch in enumerate(stmt):
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif ch == "=" and depth == 0:
+            prev_ch = stmt[idx - 1] if idx > 0 else ""
+            next_ch = stmt[idx + 1] if idx + 1 < n else ""
+            if prev_ch not in ("!", "<", ">", "=", ":") and next_ch not in ("=", ">"):
+                return True
+    return False
+
+
 def _rewrite_value_evals(stmt: str) -> str:
     """Rewrite `.eval(...)` / `.text(...)` to `.evalValue(...)` / `.textValue(...)` when used as a value rather than a chained/standalone step."""
     is_return = stmt.startswith("return ")
-    is_assign = bool(
-        not is_return
-        and not stmt.startswith(("if ", "assert "))
-        and re.match(
-            r"^(?:[\[\(]?[a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)*[\]\)]?|__OBJ_DESTR__[^=]+)\s*=\s*(?!=)",
-            stmt,
-        )
-    )
+    is_assign = (not is_return) and _has_depth0_assign(stmt)
     eval_re = re.compile(r"\.(eval|evaluate|text|readText|readMain|screenshot)\s*\(")
     pos = 0
     while True:
@@ -2342,8 +2453,157 @@ def _scan_js_callback_end(src: str, start: int) -> int:
     return -1
 
 
+def _is_raw_js_fn_or_iife(tail: str) -> bool:
+    s = tail.lstrip()
+    if _RAW_JS_FN_START_RE.match(s):
+        return True
+    if s.startswith("async"):
+        after_async = s[5:].lstrip()
+        if after_async.startswith("("):
+            close_p = _scan_balanced_block(after_async, 0, "(", ")")
+            if close_p > 0 and re.match(r"^\s*=>", after_async[close_p + 1 :]):
+                return True
+    if s.startswith("("):
+        close_p = _scan_balanced_block(s, 0, "(", ")")
+        if close_p > 0:
+            rest = s[close_p + 1 :].lstrip()
+            if rest.startswith("=>"):
+                return True
+            if _is_raw_js_fn_or_iife(s[1:close_p]):
+                return True
+    return False
+
+
+def _is_already_invoked_iife(cb_src: str) -> bool:
+    s = cb_src.strip()
+    if not s.startswith("("):
+        return False
+    fn_close = _scan_balanced_block(s, 0, "(", ")")
+    if fn_close < 0 or fn_close >= len(s) - 1:
+        return False
+    rest = s[fn_close + 1 :].lstrip()
+    if not rest.startswith("("):
+        return False
+    call_close = _scan_balanced_block(rest, 0, "(", ")")
+    return call_close == len(rest.rstrip().rstrip(";")) - 1
+
+
+def _scan_normal_py_eval_arg_end(code: str, arg_start: int) -> int:
+    n = len(code)
+    i = arg_start
+    depth = 1
+    in_str: str | None = None
+    escape = False
+    while i < n:
+        ch = code[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            if len(in_str) == 3:
+                if code[i : i + 3] == in_str:
+                    in_str = None
+                    i += 3
+                    continue
+                i += 1
+                continue
+            if ch == "\n":
+                return -1
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "#":
+            nl = code.find("\n", i)
+            if nl < 0:
+                return -1
+            i = nl + 1
+            continue
+        if code[i : i + 3] in ('"""', "'''"):
+            in_str = code[i : i + 3]
+            i += 3
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth -= 1
+            if depth == 0 and ch == ")":
+                return i
+        elif ch == "," and depth == 1:
+            return i
+        i += 1
+    return -1
+
+
+def _repair_broken_quoted_eval_arg(code: str, arg_start: int, ws_end: int) -> tuple[str, int] | None:
+    q = code[ws_end]
+    if q not in ('"', "'"):
+        return None
+    if code[ws_end : ws_end + 3] == q * 3 and code[ws_end : ws_end + 4] != q * 4:
+        return None
+    norm_end = _scan_normal_py_eval_arg_end(code, arg_start)
+    if norm_end > ws_end:
+        cand = code[ws_end:norm_end].strip()
+        try:
+            ast.parse(cand, mode="eval")
+            return None
+        except SyntaxError:
+            pass
+    n = len(code)
+    k = ws_end
+    depth = 1
+    escape = False
+    arg_end = -1
+    while k < n:
+        ch = code[k]
+        if escape:
+            escape = False
+            k += 1
+            continue
+        if ch == "\\":
+            escape = True
+            k += 1
+            continue
+        if ch == "\n" and depth <= 1:
+            break
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                arg_end = k
+                break
+        elif ch == "," and depth == 1:
+            before_comma = code[ws_end:k].rstrip()
+            after_comma = code[k + 1 :].lstrip()
+            if (
+                len(before_comma) >= 2
+                and before_comma[-1] == q
+                and re.match(r"^(?:\{|maxChars\b|\d+\b)", after_comma)
+            ):
+                arg_end = k
+                break
+        k += 1
+    if arg_end <= ws_end:
+        return None
+    raw_arg = code[ws_end:arg_end].strip()
+    if len(raw_arg) < 2 or raw_arg[0] != q or raw_arg[-1] != q:
+        return None
+    inner_js = raw_arg[1:-1]
+    return json.dumps(inner_js, ensure_ascii=False), arg_end
+
+
 def _quote_raw_eval_callbacks(code: str) -> str:
-    """Wrap unquoted Playwright-style JS callbacks in `.eval(() => ...)` as JSON code strings before REPL parsing."""
+    """Wrap unquoted JS callbacks/IIFEs and repair unescaped nested quotes in `.eval(...)` before REPL parsing."""
     if "eval" not in code:
         return code
     out: list[str] = []
@@ -2418,12 +2678,21 @@ def _quote_raw_eval_callbacks(code: str) -> str:
                 ws_end = arg_start
                 while ws_end < n and code[ws_end].isspace():
                     ws_end += 1
-                if _RAW_JS_FN_START_RE.match(code[ws_end:]):
+                if ws_end < n and _is_raw_js_fn_or_iife(code[ws_end:]):
                     arg_end = _scan_js_callback_end(code, arg_start)
                     if arg_end > ws_end:
-                        cb_src = code[ws_end:arg_end].strip()
+                        cb_src = code[ws_end:arg_end].strip().rstrip(";")
+                        js_expr = cb_src if _is_already_invoked_iife(cb_src) else f"({cb_src})()"
                         out.append(code[i : open_paren + 1])
-                        out.append(json.dumps(f"({cb_src})()", ensure_ascii=False))
+                        out.append(json.dumps(js_expr, ensure_ascii=False))
+                        i = arg_end
+                        continue
+                if ws_end < n and code[ws_end] in ('"', "'"):
+                    repaired = _repair_broken_quoted_eval_arg(code, arg_start, ws_end)
+                    if repaired is not None:
+                        fixed_lit, arg_end = repaired
+                        out.append(code[i : open_paren + 1])
+                        out.append(fixed_lit)
                         i = arg_end
                         continue
         out.append(ch)
@@ -2760,7 +3029,13 @@ class FasterMacUseRuntime:
                 i += 1
                 continue
             if (ch == "/" and nxt == "/") or ch == "#":
-                break
+                nl = text.find("\n", i)
+                if nl < 0:
+                    break
+                if depth > 0:
+                    buf.append("\n")
+                i = nl + 1
+                continue
             if ch == "/" and nxt == "*":
                 end = text.find("*/", i + 2)
                 if end < 0:
@@ -2900,7 +3175,7 @@ class FasterMacUseRuntime:
             norm_line = self._normalize_inline_py_stmt(text)
             if norm_line:
                 out_lines.append(f"{indent_str}{norm_line}")
-        return "\n".join(out_lines)
+        return textwrap.dedent("\n".join(out_lines))
 
     def _chunks_to_py_lines(self, code: str) -> list[str]:
         """Convert arbitrary JS/Python REPL code into valid Python lines for embedding in a suite."""
@@ -3273,7 +3548,28 @@ class FasterMacUseRuntime:
                                 outputs.append(str(val))
                             break
                         else:
-                            _emit_expr_val(eval(stmt, sess.repl_env))
+                            stmt_tree = ast.parse(stmt, mode="exec")
+                            if len(stmt_tree.body) == 1 and isinstance(stmt_tree.body[0], ast.Expr):
+                                expr_node = ast.Expression(body=stmt_tree.body[0].value)
+                                ast.fix_missing_locations(expr_node)
+                                _emit_expr_val(eval(compile(expr_node, "<repl>", "eval"), sess.repl_env))
+                            elif stmt_tree.body:
+                                if last_handle is not None and last_handle.has_pending():
+                                    outputs.append(last_handle.flush())
+                                    if is_user_stopped():
+                                        return USER_STOPPED_ERROR
+                                stmt_tree = _TopLevelReturnRewriter().visit(stmt_tree)
+                                ast.fix_missing_locations(stmt_tree)
+                                try:
+                                    exec(compile(stmt_tree, "<repl>", "exec"), sess.repl_env)
+                                except _FmuReplReturn as ret:
+                                    val = ret.value
+                                    if isinstance(val, (AppHandle, TabHandle)):
+                                        outputs.append(val.flush())
+                                        last_handle = None
+                                    elif val is not None:
+                                        outputs.append(str(val))
+                                    break
                     except SyntaxError as exc:
                         raise _format_repl_syntax_error(exc, stmt, raw_src) from exc
                     if not stmt_allows_stopped and is_user_stopped():
@@ -3499,10 +3795,10 @@ class FasterMacUseRuntime:
             self._prune_closed_tab_handles()
             return out
 
-        if req.get("listTabs") or isinstance(req.get("listTabs"), dict):
+        if req.get("listTabs") not in (None, False):
             return self.browser.execute_batch(req)
 
-        if req.get("listExtensions") or isinstance(req.get("listExtensions"), dict):
+        if req.get("listExtensions") not in (None, False):
             return self.browser.execute_batch(req)
 
         if "perfReport" in req and req["perfReport"]:
@@ -3682,7 +3978,7 @@ MCP_TOOL_SCHEMA = {
     "description": (
         "Background Chrome ('Agent' Tab Group) & macOS AX control with multi-cursor isolation, stateful REPL (`code`), "
         "or `steps` batching and `+/~/-` UID diffs. Zero focus/cursor theft. "
-        "Pass `code` (`tab=cua.createBrowserTab('chrome',url); tab.click('@u1').waitFor('Confirmed')`, `cua.listTabs()`, `tab.text()`, or `app=cua.getApp('Calculator'); app.click('@a6')`), "
+        "Pass `code` (`tab=cua.createBrowserTab('chrome',url); tab.click('@u1').waitFor('Confirmed')`, `cua.listTabs()`, `cua.listExtensions()`, `cua.setExtensionEnabled(name,enabled)`, `tab.text()`, or `app=cua.getApp('Calculator'); app.click('@a6')`), "
         "`{app|url, steps, agent}`, or `{parallel:[...]}`. "
         "Each agent session gets its own Chrome tab group; pass `sessionLabel` (task/project name) to title it. "
         "Call `cua.closeMyTabs({keep:[...]})` or `{closeMyTabs:true}` ONLY when the task is completely finished with no pending login, checkout, or follow-up (closes only tabs this session opened)."
@@ -3709,7 +4005,15 @@ MCP_TOOL_SCHEMA = {
             "reuseExisting": {"type": "boolean"},
             "listTabs": {"type": ["boolean", "string", "object"]},
             "listExtensions": {"type": ["boolean", "string", "object"]},
-            "setExtensionEnabled": {"type": "object"},
+            "setExtensionEnabled": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "enabled": {"type": "boolean"},
+                },
+                "required": ["enabled"],
+            },
             "bridgeStatus": {"type": "boolean"},
             "reloadExtension": {"type": "boolean"},
             "perfReport": {"type": ["boolean", "object"]},

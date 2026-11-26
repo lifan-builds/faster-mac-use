@@ -563,7 +563,7 @@ class TestFasterMacUse(unittest.TestCase):
 
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
-        self.assertIn("faster-mac-use 0.5.5", ver_proc.stdout)
+        self.assertIn("faster-mac-use 0.5.6", ver_proc.stdout)
         self.assertIn("Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
@@ -586,6 +586,13 @@ class TestFasterMacUse(unittest.TestCase):
         self.assertEqual([r["id"] for r in mcp_replies], [0, 1, 2])
         self.assertEqual(mcp_replies[0]["error"]["code"], -32601)
         self.assertIn("by lifan-builds", mcp_replies[1]["result"]["serverInfo"]["title"])
+        mcp_cua_tool = mcp_replies[2]["result"]["tools"][0]
+        mcp_props = mcp_cua_tool["inputSchema"]["properties"]
+        self.assertIn("listExtensions", mcp_props)
+        self.assertIn("setExtensionEnabled", mcp_props)
+        self.assertIn("enabled", mcp_props["setExtensionEnabled"]["properties"])
+        self.assertIn("listExtensions", mcp_cua_tool["description"])
+        self.assertIn("setExtensionEnabled", mcp_cua_tool["description"])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
@@ -2664,7 +2671,7 @@ setInterval(() => {{}}, 1000);
         try:
             self.assertTrue(bridge.wait_connected(timeout=3.0))
             bridge_st = self.rt.execute({"bridgeStatus": True})
-            self.assertIn('version="0.5.5"', bridge_st)
+            self.assertIn('version="0.5.6"', bridge_st)
 
             tabs_list = self.rt.execute({"code": 'return await cua.listTabs("hertz");'})
             self.assertIn('@tab id=501', tabs_list)
@@ -4472,7 +4479,7 @@ const state = {{
   createdUrls: [],
   setEnabledCalls: [],
   extensions: [
-    {{ id: "{self_ext_id}", name: "Faster Mac Use — Agent Bridge", enabled: true, type: "extension", version: "0.5.5" }},
+    {{ id: "{self_ext_id}", name: "Faster Mac Use — Agent Bridge", enabled: true, type: "extension", version: "0.5.6" }},
     {{ id: "chhjbkfssaaaaaaaaaaaaaaaaaaaaaaa", name: "Rakuten: Get Cash Back For Shopping", enabled: false, type: "extension", version: "5.38.0" }},
     {{ id: "topcashbackbbbbbbbbbbbbbbbbbbbbb", name: "TopCashback: Get Cashback & Coupons", enabled: true, type: "extension", version: "2.1.0" }},
     {{ id: "shopbackcccccccccccccccccccccccc", name: "ShopBack: Cashback & Coupons", enabled: false, type: "extension", version: "3.0.4" }},
@@ -4594,7 +4601,7 @@ setInterval(() => {{}}, 1000);
             # 2. Extension listing via CuaNamespace, BrowserEngine, line iteration, filters, and JSON format
             listed = self.rt.execute({"code": "return await cua.listExtensions();"})
             self.assertIn('# extensions count=5 bridge="mv3"', listed)
-            self.assertIn(f"@ext id={self_ext_id} enabled=true type=extension version=\"0.5.5\" [self]", listed)
+            self.assertIn(f"@ext id={self_ext_id} enabled=true type=extension version=\"0.5.6\" [self]", listed)
             self.assertIn('@ext id=chhjbkfssaaaaaaaaaaaaaaaaaaaaaaa enabled=false type=extension version="5.38.0" "Rakuten: Get Cash Back For Shopping"', listed)
 
             iter_rows = json.loads(self.rt.execute({"code": '[e for e in cua.listExtensions() if "Offer.love" in e]'}))
@@ -4620,6 +4627,10 @@ setInterval(() => {{}}, 1000);
             self.assertEqual(
                 self.rt.execute({"listExtensions": {"query": "Offer.love"}}).count("@ext "),
                 1,
+            )
+            self.assertEqual(
+                self.rt.execute({"listExtensions": ""}).count("@ext "),
+                5,
             )
 
             # 4. Ambiguity, unknown extension, non-boolean enabled, and self-disable protection (Python + MV3 JS)
@@ -5351,6 +5362,284 @@ setInterval(() => {{}}, 1000);
             if node_proc.stderr:
                 node_proc.stderr.close()
             rt.shutdown()
+
+    def test_repl_subscript_assign_comments_imports_and_nested_eval_quotes(self) -> None:
+        """Regression #127: top-level res['k']=v, comments, stdlib imports, and nested quotes/IIFEs inside eval()."""
+        rt = self._make_mock_runtime()
+        eval_calls: list[str] = []
+
+        def _fake_eval_value(**kwargs: Any) -> Any:
+            code_arg = str(kwargs.get("code") or "")
+            eval_calls.append(code_arg)
+            if "breadcrumbs" in code_arg:
+                return "Shoes > Running"
+            if ".price" in code_arg:
+                return "$67.50"
+            if "data-sku" in code_arg:
+                return "JP7149"
+            return f"JS:{code_arg}"
+
+        rt.browser.evaluate_value.side_effect = _fake_eval_value
+        try:
+            # 1. Comments (unindented header comment before indented block + inline # / // / /* */ + multiline dict)
+            #    + stdlib imports + top-level dict subscript / nested subscript / augmented assign / del
+            out = rt.execute(
+                {
+                    "code": "\n".join(
+                        [
+                            "# 1. Inspect tabs and normalize URLs",
+                            "    import re, json as _j",
+                            "    from urllib.parse import urlparse, parse_qs",
+                            '    t = cua.createBrowserTab("headless", "https://www.ebay.com/itm/168823291378?mkevt=1&mkcid=1")',
+                            "    res = {",
+                            "        # initial counters",
+                            '        "clicks": 1,  # inline py comment',
+                            '        "nested": {},  // inline js comment',
+                            "    }",
+                            '    res["clicks"] += 2',
+                            '    res["drop_me"] = "temp"',
+                            '    del res["drop_me"]',
+                            '    res["cat"] = t.eval("document.querySelector(\'nav.breadcrumbs\')?.innerText || \'\'")',
+                            '    res["price_dq"] = t.eval("document.querySelector(".price")?.innerText || """)',
+                            "    res[\"sku_sq\"] = t.eval('document.querySelector('[data-sku]')?.getAttribute('data-sku') || ''')",
+                            '    res["iife"] = t.eval((() => { const tag = "EVO_SL"; return tag; })())',
+                            '    for k in ["host", "mkevt"]:',
+                            "        # populate parsed query metadata",
+                            '        u = "https://www.ebay.com/itm/168823291378?mkevt=1&mkcid=1"',
+                            '        if k == "host":',
+                            '            res["nested"][k] = urlparse(u).netloc',
+                            "        else:",
+                            '            res["nested"][k] = parse_qs(urlparse(u).query)["mkevt"][0]',
+                            '    res["digits"] = re.findall(r"\\d+", res["price_dq"])',
+                            "    _j.dumps(res, sort_keys=True)",
+                        ]
+                    )
+                }
+            )
+            parsed = json.loads(out)
+            self.assertEqual(parsed["clicks"], 3)
+            self.assertNotIn("drop_me", parsed)
+            self.assertEqual(parsed["cat"], "Shoes > Running")
+            self.assertEqual(parsed["price_dq"], "$67.50")
+            self.assertEqual(parsed["sku_sq"], "JP7149")
+            self.assertEqual(parsed["iife"], 'JS:(() => { const tag = "EVO_SL"; return tag; })()')
+            self.assertEqual(parsed["nested"], {"host": "www.ebay.com", "mkevt": "1"})
+            self.assertEqual(parsed["digits"], ["67", "50"])
+            self.assertIn('document.querySelector(".price")?.innerText || ""', eval_calls)
+            self.assertIn("document.querySelector('[data-sku]')?.getAttribute('data-sku') || ''", eval_calls)
+
+            # Comment-only snippet returns empty string cleanly without SyntaxError
+            self.assertEqual(rt.execute({"code": "# only a comment\n// and js comment\n/* block */"}), "")
+
+            # Unsafe system/process modules remain blocked in REPL sandbox
+            for blocked_mod in ("import os", "import subprocess", "from urllib import request"):
+                with self.assertRaises(ImportError):
+                    rt.execute({"code": blocked_mod})
+        finally:
+            rt._pool.shutdown(wait=False)
+
+    def test_tab_handle_live_url_after_client_side_redirects_mv3_and_headless(self) -> None:
+        """Regression #126: TabHandle.url / TabHandle.url() reflects live tab URL after JS/interstitial redirects and queued goto."""
+        import time
+
+        # 1. MV3 extension bridge: C1S affiliate interstitial redirecting client-side to ebay.com without an fmu batch in between
+        rt = FasterMacUseRuntime()
+        bridge = rt.browser.ensure_bridge()
+        bg_js = (Path(__file__).resolve().parents[1] / "extension" / "background.js").read_text(encoding="utf-8")
+        bg_js_patched = bg_js.replace("ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{bridge.port}/ext")
+        c1s_interstitial = "https://capitaloneshopping.com/s/ebay.com/coupon?aff=tok123"
+        ebay_landed = "https://www.ebay.com/?mkevt=1&mkcid=1&campid=5338&customid=c1strip"
+        ebay_search = "https://www.ebay.com/sch/i.html?_ssn=adidas_official&_nkw=evo+sl"
+
+        mv3_redirect_harness = f"""
+const state = {{
+  tabs: [
+    {{
+      id: 701,
+      windowId: 88,
+      groupId: 20,
+      active: false,
+      title: "Offer Activated! Taking you to eBay",
+      url: {json.dumps(c1s_interstitial)},
+      status: "complete"
+    }}
+  ],
+  groups: [{{ id: 20, windowId: 88, title: "Agent", collapsed: false }}],
+  storage: {{}},
+  getTabCalls: 0,
+  getTabInfoCalls: 0
+}};
+globalThis.chrome = {{
+  storage: {{
+    local: {{
+      get: async (k) => ({{ [k]: state.storage[k] }}),
+      set: async (obj) => {{ Object.assign(state.storage, obj); }}
+    }}
+  }},
+  tabs: {{
+    query: async () => {{
+      state.getTabCalls += 1;
+      return state.tabs;
+    }},
+    get: async (id) => {{
+      state.getTabInfoCalls += 1;
+      const f = state.tabs.find(t => t.id === id);
+      if (!f) throw new Error("No tab: " + id);
+      return f;
+    }},
+    update: async (id, opts) => {{
+      const f = state.tabs.find(t => t.id === id);
+      if (f && opts.url) {{
+        f.url = opts.url;
+        f.title = opts.url.includes("_nkw=evo") ? "Evo Sl for sale | eBay" : f.title;
+      }}
+      return f;
+    }},
+    group: async () => 20,
+    onCreated: {{ addListener: () => {{}} }},
+    onUpdated: {{ addListener: () => {{}} }},
+    onRemoved: {{ addListener: () => {{}} }}
+  }},
+  tabGroups: {{
+    get: async (gid) => state.groups.find(g => g.id === gid),
+    query: async () => state.groups,
+    update: async (gid, opts) => Object.assign(state.groups[0], opts)
+  }},
+  windows: {{ getAll: async () => [{{ id: 88, focused: false }}] }},
+  debugger: {{
+    attach: async () => ({{}}),
+    detach: async () => ({{}}),
+    sendCommand: async (_target, method, params) => {{
+      if (method === "Runtime.evaluate") {{
+        const expr = String((params && params.expression) || "");
+        if (expr.includes("FMU_RUNTIME_VERSION")) return {{ result: {{ value: true }} }};
+        if (expr.includes("__simulate_c1s_redirect__")) {{
+          state.tabs[0].url = {json.dumps(ebay_landed)};
+          state.tabs[0].title = "Electronics, Cars, Fashion | eBay";
+          return {{
+            result: {{
+              value: {{
+                url: {json.dumps(c1s_interstitial)},
+                title: "Offer Activated! Taking you to eBay",
+                vw: 1280, vh: 800, crc: "aa", seq: 1, count: 0,
+                useDiff: false, unchanged: false, webMcpTools: [], canvases: [],
+                errors: [], evalOutputs: ["scheduled"], rawEvalValues: ["scheduled"],
+                escalations: [], lines: []
+              }}
+            }}
+          }};
+        }}
+        if (expr.startsWith("window.__fmu.executeBatch(")) {{
+          const cur = state.tabs[0];
+          return {{
+            result: {{
+              value: {{
+                url: cur.url,
+                title: cur.title,
+                vw: 1280, vh: 800, crc: "bb", seq: 2, count: 1,
+                useDiff: false, unchanged: false, webMcpTools: [], canvases: [],
+                errors: [], evalOutputs: [], rawEvalValues: [],
+                escalations: [], lines: ['@u1 link "Shop"']
+              }}
+            }}
+          }};
+        }}
+        return {{ result: {{ value: true }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }}
+  }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  runtime: {{ onInstalled: {{ addListener: () => {{}} }}, onStartup: {{ addListener: () => {{}} }} }}
+}};
+{bg_js_patched}
+setInterval(() => {{}}, 1000);
+"""
+        node_proc = subprocess.Popen(["node", "-e", mv3_redirect_harness], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(bridge.wait_connected(timeout=3.0))
+            init_u = rt.execute({"code": "t = cua.getTab(chromeTabId=701)\nt.url()"})
+            self.assertEqual(init_u, c1s_interstitial)
+
+            # Simulate async client-side JS redirect completing after initial batch returned interstitial URL
+            rt.execute({"code": 't.evalValue("__simulate_c1s_redirect__")'})
+            live_res = json.loads(
+                rt.execute(
+                    {
+                        "code": """
+                        by_domain = cua.getTab("ebay.com")
+                        {"prop": t.url, "call": t.url(), "title": t.title(), "matched_id": by_domain.id}
+                        """
+                    }
+                )
+            )
+            self.assertEqual(live_res["prop"], ebay_landed)
+            self.assertEqual(live_res["call"], ebay_landed)
+            self.assertEqual(live_res["title"], "Electronics, Cars, Fashion | eBay")
+            self.assertEqual(live_res["matched_id"], 701)
+
+            # Queued t.goto(...) followed immediately by t.url() in the same turn flushes goto first
+            after_goto = rt.execute(
+                {"code": f"t.goto({ebay_search!r})\nreturn JSON.stringify({{u: t.url(), title: t.title()}})"}
+            )
+            goto_data = json.loads(after_goto.splitlines()[-1])
+            self.assertEqual(goto_data["u"], ebay_search)
+            self.assertEqual(goto_data["title"], "Evo Sl for sale | eBay")
+        finally:
+            node_proc.terminate()
+            try:
+                node_proc.wait(timeout=2.0)
+            except Exception:
+                node_proc.kill()
+            if node_proc.stdout:
+                node_proc.stdout.close()
+            if node_proc.stderr:
+                node_proc.stderr.close()
+            rt.shutdown()
+
+        # 2. Live headless Playwright: async setTimeout location.replace + history.replaceState updates tab.url() & tab.title()
+        import http.server
+        import socketserver
+        import threading
+
+        class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                if self.path.startswith("/interstitial"):
+                    self.wfile.write(
+                        b"<title>Offer Activated</title><script>setTimeout(()=>{location.replace('/ebay?mkevt=1&mkcid=1')},50)</script>Wait"
+                    )
+                else:
+                    self.wfile.write(
+                        b"<title>Evo Sl | eBay</title><script>setTimeout(()=>{history.replaceState(null,'','/ebay/itm/123?mkevt=1&mkcid=1')},50)</script>Shop"
+                    )
+
+        redir_srv = socketserver.TCPServer(("127.0.0.1", 0), _RedirectHandler)
+        redir_port = redir_srv.server_address[1]
+        threading.Thread(target=redir_srv.serve_forever, daemon=True).start()
+        rt_pw = FasterMacUseRuntime()
+        try:
+            start_url = f"http://127.0.0.1:{redir_port}/interstitial"
+            rt_pw.execute({"code": f"p = cua.createBrowserTab('headless', {start_url!r})"})
+            deadline = time.monotonic() + 4.0
+            final_pw_url = ""
+            while time.monotonic() < deadline:
+                final_pw_url = rt_pw.execute({"code": "p.url()"})
+                if "/ebay/itm/123" in final_pw_url:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(final_pw_url, f"http://127.0.0.1:{redir_port}/ebay/itm/123?mkevt=1&mkcid=1")
+            self.assertEqual(rt_pw.execute({"code": "p.title()"}), "Evo Sl | eBay")
+        finally:
+            rt_pw.shutdown()
+            redir_srv.shutdown()
+            redir_srv.server_close()
 
 
 if __name__ == "__main__":

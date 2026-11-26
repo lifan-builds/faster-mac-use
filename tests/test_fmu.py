@@ -5641,6 +5641,73 @@ setInterval(() => {{}}, 1000);
             redir_srv.shutdown()
             redir_srv.server_close()
 
+    def test_playwright_pseudo_selectors_and_step_target_aliases(self) -> None:
+        """resolveEl() supports Playwright :visible/:has-text()/text= selectors, and step targetRef accepts css/id/label/locator."""
+        import http.server
+        import socketserver
+        import threading
+
+        html = (
+            b"<html><body>"
+            b"<a id='hidden-cta' style='display:none' href='#hidden'>Get ExpressVPN Now</a>"
+            b"<a id='vis-cta' href='#clicked' onclick=\"document.body.dataset.clicked='yes'\">Get ExpressVPN Now</a>"
+            b"<input id='street-box' aria-label='Street Address' value=''>"
+            b"<input id='city-box' name='city' value=''>"
+            b"<button type='button' onclick=\"document.body.dataset.done='1'\">Continue</button>"
+            b"</body></html>"
+        )
+
+        class _SelHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(html)
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), _SelHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        rt = FasterMacUseRuntime()
+        try:
+            url = f"http://127.0.0.1:{port}/"
+            rt.execute({"code": f"p = cua.createBrowserTab('headless', {url!r})"})
+            out = rt.execute(
+                {
+                    "target": "t1",
+                    "steps": [
+                        {"op": "click", "selector": 'a:visible:has-text("Get ExpressVPN Now")'},
+                        {"op": "fill", "css": "#street-box", "value": "123 Main St"},
+                        {"op": "fill", "id": "city-box", "value": "Seattle"},
+                        {"op": "click", "locator": "text=Continue"},
+                    ],
+                }
+            )
+            self.assertNotIn("target not found", out)
+            self.assertNotIn("missing target", out)
+            state = json.loads(
+                rt.execute(
+                    {
+                        "code": (
+                            "import json\n"
+                            "json.dumps({"
+                            "'clicked': p.eval('document.body.dataset.clicked'), "
+                            "'done': p.eval('document.body.dataset.done'), "
+                            "'street': p.eval(\"document.getElementById('street-box').value\"), "
+                            "'city': p.eval(\"document.getElementById('city-box').value\")"
+                            "})"
+                        )
+                    }
+                )
+            )
+            self.assertEqual(state, {"clicked": "yes", "done": "1", "street": "123 Main St", "city": "Seattle"})
+        finally:
+            rt.shutdown()
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

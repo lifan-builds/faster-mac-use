@@ -1065,6 +1065,52 @@ IN_PAGE_RUNTIME_JS = r"""
     return base;
   }
 
+  function resolvePlaywrightSelector(sel) {
+    const raw = String(sel || "").trim();
+    if (!raw) return null;
+    const textPrefix = raw.match(/^text\s*=\s*(?:"([^"]+)"|'([^']+)'|(.+))$/i);
+    if (textPrefix) {
+      const needle = (textPrefix[1] || textPrefix[2] || textPrefix[3] || "").trim().toLowerCase();
+      if (!needle) return null;
+      const candidates = getSearchCandidates();
+      let partial = null;
+      for (const el of candidates) {
+        if (!isVisible(el)) continue;
+        const txt = cleanStr(el.innerText || el.textContent || getLabel(el, 200), 400).toLowerCase();
+        if (txt === needle) return el;
+        if (!partial && txt.includes(needle)) partial = el;
+      }
+      return partial;
+    }
+    if (!/:(?:visible|has-text\(|text\()/i.test(raw)) return null;
+    let requireVisible = false;
+    let textNeedle = "";
+    let baseSel = raw.replace(/:visible\b/gi, () => {
+      requireVisible = true;
+      return "";
+    });
+    baseSel = baseSel.replace(/:(?:has-text|text)\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi, (_, d, s, u) => {
+      textNeedle = String(d !== undefined ? d : (s !== undefined ? s : (u || ""))).trim().toLowerCase();
+      return "";
+    }).trim();
+    if (!baseSel) baseSel = "*";
+    let matches;
+    try {
+      matches = Array.from(queryAllDeep(baseSel));
+    } catch (_) {
+      return null;
+    }
+    let partial = null;
+    for (const el of matches) {
+      if (requireVisible && !isVisible(el)) continue;
+      if (!textNeedle) return el;
+      const txt = cleanStr(el.innerText || el.textContent || getLabel(el, 200), 400).toLowerCase();
+      if (txt === textNeedle) return el;
+      if (!partial && txt.includes(textNeedle)) partial = el;
+    }
+    return partial;
+  }
+
   function resolveEl(target) {
     if (!target) return null;
     const t = String(target).trim();
@@ -1102,6 +1148,8 @@ IN_PAGE_RUNTIME_JS = r"""
         }
       }
     }
+    const byPw = resolvePlaywrightSelector(t);
+    if (byPw) return byPw;
     try {
       const bySel = queryOneDeep(t);
       if (bySel) return bySel;
@@ -2879,7 +2927,7 @@ IN_PAGE_RUNTIME_JS = r"""
     for (let i = 0; i < steps.length; i++) {
       const s = normalizeStepInPage(steps[i] || {});
       let op = String(s.op || s.action || "").trim().toLowerCase();
-      const targetRef = s.uid || s.ref || s.target || s.selector || s.name;
+      const targetRef = s.uid || s.ref || s.target || s.selector || s.css || s.locator || s.label || s.id || s.name;
       const stepValue = s.value !== undefined ? s.value : s.text;
         const stepNum = stepOffset + i + 1;
       if (!op) {

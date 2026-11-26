@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.7 (2026-11-25)
+
+### Added
+- **MCP Registry manifest & Glama score badge**: Added `server.json` conforming to the official MCP Registry `2025-12-11` schema (`io.github.lifan-builds/faster-mac-use`), Glama B-rating score badge backlink, and `mcp-name` PyPI ownership tag in `README.md`.
+- **Adversarial regression suite (`tests/test_adversarial_fixtures.py`)**: Added deterministic adversarial fixtures covering JS/meta/history client-side redirects, strict-CSP & Trusted Types pages, REPL nested quotes/comments/subscripts/augassign/dict comprehensions/imports/IIFEs, and sibling OOPIF & discarded/unloaded-tab edge cases.
+
+### Fixed
+- **REPL transpiler & sandbox edge cases**: Fixed `_rewrite_braces` corrupting Python dict/set comprehensions with tuple unpacking (`{k: v for k, v in pairs}`), updated `TabHandle.evalValue` to accept optional `options`/`maxChars` arguments when rewritten from `tab.eval(js, maxChars)`, and blocked bare `import urllib` in `_fmu_safe_import`.
+- **Trusted Types strict-CSP escalation**: In-page `runInPageEval` and `executeBatch` now recognize Trusted Types `TypeError` (`TrustedScript`) alongside `EvalError`/`unsafe-eval` and cache the live page hostname in `_strict_csp_hosts`.
+- **Sibling OOPIF ranking & unloaded-tab normalization**: `probeAndPrepIframeInTab` and `_probe_playwright_iframe` now exclude `readOnly` inputs from `isEditable`, rank exact href / `frameName` `score` ahead of stale sibling `hasFocus`, preserve explicit nested `frameIndex == -1` targeting, normalize `status: "unloaded"` tabs as `discarded: true` in `listTabs`, and expose `pendingUrl` in `getTabInfo`.
+
 ## 0.5.6 (2026-11-25)
 
 ### Added

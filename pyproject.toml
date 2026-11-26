@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faster-mac-use"
-version = "0.5.6"
+version = "0.5.7"
 description = "Background-first, multi-cursor browser and native macOS computer-use engine for AI agents"
 readme = "README.md"
 license = "AGPL-3.0-only"

@@ -285,7 +285,7 @@ def _parse_cdp_key_spec(raw_key: str) -> dict[str, Any]:
 
 _IFRAME_PROBE_JS = r"""(arg) => {
   const isEditable = (el) => {
-    if (!el || el.disabled) return false;
+    if (!el || el.disabled || el.readOnly) return false;
     const tag = (el.tagName || "").toLowerCase();
     if (tag === "textarea") return true;
     if (tag === "input") {
@@ -760,11 +760,11 @@ def _build_js_eval_candidates(raw_code: str) -> list[str]:
     return candidates
 
 
-_FMU_RUNTIME_VERSION = "0.5.6"
+_FMU_RUNTIME_VERSION = "0.5.7"
 
 IN_PAGE_RUNTIME_JS = r"""
 (() => {
-  const FMU_RUNTIME_VERSION = "0.5.6";
+  const FMU_RUNTIME_VERSION = "0.5.7";
   if (window.__fmu && window.__fmu.version === FMU_RUNTIME_VERSION) return true;
 
   const store = window.__fmuStore || (window.__fmuStore = {
@@ -2718,6 +2718,7 @@ IN_PAGE_RUNTIME_JS = r"""
           (synErr && synErr.name === "EvalError")
           || msg.includes("Content Security Policy")
           || msg.includes("unsafe-eval")
+          || msg.includes("TrustedScript")
         ) {
           throw synErr;
         }
@@ -2955,6 +2956,7 @@ IN_PAGE_RUNTIME_JS = r"""
               (evalErr && evalErr.name === "EvalError")
               || msg.includes("Content Security Policy")
               || msg.includes("unsafe-eval")
+              || msg.includes("TrustedScript")
             ) {
               store.strictCsp = true;
               escalations.push({ step: stepNum, reason: "eval_csp", code, maxChars: s.maxChars });
@@ -6151,7 +6153,7 @@ class BrowserEngine:
             ran_any = True
             esc["handled"] = True
             try:
-                cur_host = (urlparse(_normalize_nav_url(sess.last_url)).hostname or "").lower()
+                cur_host = (urlparse(_normalize_nav_url(str(res.get("url") or sess.last_url or ""))).hostname or "").lower()
                 if cur_host:
                     self._strict_csp_hosts.add(cur_host)
             except ValueError:
@@ -6376,12 +6378,16 @@ class BrowserEngine:
                 continue
             exact_idx = (
                 1
-                if (isinstance(want_frame_idx, int) and want_frame_idx >= 0 and out.get("frameIndex") == want_frame_idx)
+                if (
+                    isinstance(want_frame_idx, int)
+                    and not isinstance(want_frame_idx, bool)
+                    and out.get("frameIndex") == want_frame_idx
+                )
                 else 0
             )
             focused_edit = 1 if (out.get("hasFocus") and out.get("activeIsEditable")) else 0
             focused = 1 if out.get("hasFocus") else 0
-            cand_rank = (exact_idx, focused_edit, focused, score)
+            cand_rank = (exact_idx, score, focused_edit, focused)
             if not best_res.get("matched") or cand_rank > best_rank:
                 best_res = out
                 best_rank = cand_rank

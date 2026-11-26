@@ -1,0 +1,40 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.lifan-builds/faster-mac-use",
+  "title": "Faster Mac Use (fmu)",
+  "description": "Background-first, multi-cursor Chrome and native macOS computer-use engine for AI agents.",
+  "version": "0.5.7",
+  "websiteUrl": "https://clifan.com/faster-mac-use/",
+  "repository": {
+    "url": "https://github.com/lifan-builds/faster-mac-use",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "faster-mac-use",
+      "version": "0.5.7",
+      "runtimeHint": "uvx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--from",
+          "value": "faster-mac-use"
+        },
+        {
+          "type": "positional",
+          "value": "fmu"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

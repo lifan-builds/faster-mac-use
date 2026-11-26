@@ -853,9 +853,9 @@ async function probeAndPrepIframeInTab(tabId, opts) {
   const explicitFrameId = (opts && opts.frameId !== undefined && opts.frameId !== null)
     ? Number(opts.frameId)
     : null;
-  const wantFrameIndex = (opts && typeof opts.frameIndex === "number" && opts.frameIndex >= 0)
+  const wantFrameIndex = (opts && typeof opts.frameIndex === "number")
     ? opts.frameIndex
-    : -1;
+    : null;
   const probeArg = {
     action: String((opts && opts.action) || "verify"),
     frameSrc: String((opts && opts.frameSrc) || "").trim(),
@@ -911,7 +911,7 @@ async function probeAndPrepIframeInTab(tabId, opts) {
           }
         } catch (_) {}
         const isEditable = (el) => {
-          if (!el || el.disabled) return false;
+          if (!el || el.disabled || el.readOnly) return false;
           const tag = (el.tagName || "").toLowerCase();
           if (tag === "textarea") return true;
           if (tag === "input") {
@@ -1049,10 +1049,10 @@ async function probeAndPrepIframeInTab(tabId, opts) {
     return { supported: false, matched: false };
   }
   const rankOf = (r) => [
-    (wantFrameIndex >= 0 && r.frameIndex === wantFrameIndex) ? 1 : 0,
+    (wantFrameIndex !== null && r.frameIndex === wantFrameIndex) ? 1 : 0,
+    Number(r.score || 0),
     (r.hasFocus && r.activeIsEditable) ? 1 : 0,
-    r.hasFocus ? 1 : 0,
-    Number(r.score || 0)
+    r.hasFocus ? 1 : 0
   ];
   const isBetterRank = (a, b) => {
     for (let i = 0; i < a.length; i++) {
@@ -2053,7 +2053,7 @@ async function handleRpc(msg) {
           groupId: t.groupId !== undefined ? t.groupId : -1,
           groupTitle: gTitle,
           active: Boolean(t.active),
-          discarded: Boolean(t.discarded),
+          discarded: isDiscardedTab(t),
           status: String(t.status || ""),
           url: u,
           title
@@ -2186,6 +2186,7 @@ async function handleRpc(msg) {
             status: String(t.status || ""),
             discarded: isDiscardedTab(t),
             url: liveUrl,
+            pendingUrl: String(t.pendingUrl || ""),
             title: String(t.title || "")
           }
         };
@@ -2947,7 +2948,7 @@ function connectRelay() {
     ws.onopen = () => {
       isConnecting = false;
       try {
-        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.6" }));
+        ws.send(JSON.stringify({ type: "hello", client: "fmu-mv3-extension", version: "0.5.7" }));
       } catch (_) {}
     };
     ws.onmessage = async (ev) => {

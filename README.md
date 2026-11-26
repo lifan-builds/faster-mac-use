@@ -1,6 +1,6 @@
 # Faster Mac Use (`fmu`)
 
-[![PyPI](https://img.shields.io/pypi/v/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![Downloads](https://img.shields.io/pypi/dm/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![GitHub stars](https://img.shields.io/github/stars/lifan-builds/faster-mac-use?style=flat)](https://github.com/lifan-builds/faster-mac-use/stargazers) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+[![PyPI](https://img.shields.io/pypi/v/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![Downloads](https://img.shields.io/pypi/dm/faster-mac-use)](https://pypi.org/project/faster-mac-use/) [![GitHub stars](https://img.shields.io/github/stars/lifan-builds/faster-mac-use?style=flat)](https://github.com/lifan-builds/faster-mac-use/stargazers) [![Glama Score](https://glama.ai/mcp/servers/lifan-builds/faster-mac-use/badges/score.svg)](https://glama.ai/mcp/servers/lifan-builds/faster-mac-use) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 `fmu` lets AI agents drive your logged-in Chrome tabs and native macOS apps in the background. Your mouse stays where you left it, your active window keeps focus, Chrome 144 shows zero remote-debugging popups, and each step returns a few hundred tokens of `+`/`~`/`-` `@uid` text diffs instead of a screenshot.
 
@@ -126,3 +126,5 @@ Open source under [AGPL-3.0-only](https://github.com/lifan-builds/faster-mac-use
 > Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)
 
 Copyright © 2026 [lifan-builds](https://github.com/lifan-builds). Pull requests are welcome under [CONTRIBUTING.md](https://github.com/lifan-builds/faster-mac-use/blob/main/CONTRIBUTING.md) with a one-time [CLA](https://github.com/lifan-builds/faster-mac-use/blob/main/CLA.md). For licensing outside AGPL, open an issue.
+
+<!-- mcp-name: io.github.lifan-builds/faster-mac-use -->

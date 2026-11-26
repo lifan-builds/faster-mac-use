@@ -617,14 +617,30 @@ class TabHandle:
 
     evaluate = eval
 
-    def evalValue(self, code: str) -> Any:
+    def evalValue(
+        self,
+        code: str,
+        options: int | dict[str, Any] | None = None,
+        *,
+        maxChars: int | None = None,
+        max_chars: int | None = None,
+    ) -> Any:
         self._fresh = False
         if self.has_pending():
             flushed = self.flush(diff=True)
             sess = self.runtime._get_agent_session(self.agent_id)
             if sess.active_outputs is not None and flushed:
                 sess.active_outputs.append(flushed)
-        return self.runtime.browser.evaluate_value(
+        cap: int | None = maxChars if maxChars is not None else max_chars
+        if cap is None:
+            if isinstance(options, int) and not isinstance(options, bool):
+                cap = options
+            elif isinstance(options, dict) and (
+                options.get("maxChars") is not None or options.get("max_chars") is not None
+            ):
+                raw_cap = options.get("maxChars") if options.get("maxChars") is not None else options.get("max_chars")
+                cap = int(raw_cap)
+        val = self.runtime.browser.evaluate_value(
             code=str(code),
             agent=self.agent_id,
             session=self.tab_id,
@@ -635,6 +651,9 @@ class TabHandle:
             chrome_tab_id=self.chrome_tab_id,
             require_extension=self.require_extension,
         )
+        if cap is not None and cap > 0 and isinstance(val, str) and len(val) > cap:
+            return val[:cap]
+        return val
 
     evaluateValue = evalValue
     evaluate_value = evalValue
@@ -1909,8 +1928,8 @@ def _fmu_safe_import(
     mod_name = str(name or "").strip()
     root = mod_name.split(".", 1)[0]
     allowed = mod_name in _SAFE_REPL_MODULES or (root in _SAFE_REPL_MODULES and root != "urllib")
-    if allowed and mod_name == "urllib" and fromlist:
-        if any(str(item) != "parse" for item in fromlist):
+    if allowed and mod_name == "urllib":
+        if not fromlist or any(str(item) != "parse" for item in fromlist):
             allowed = False
     if level != 0 or not allowed:
         raise ImportError(f"Module {mod_name!r} is not permitted in cua_repl")
@@ -2093,6 +2112,22 @@ def _is_block_brace(prefix: str) -> bool:
     return False
 
 
+def _has_top_level_comp_for_in(inner: str) -> bool:
+    """Return True if `inner` has a top-level Python comprehension `for ... in ...` clause."""
+    depth = 0
+    top_chunks: list[str] = []
+    for ch in inner:
+        if ch in ("(", "[", "{"):
+            depth += 1
+            top_chunks.append(" ")
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+            top_chunks.append(" ")
+        elif depth == 0:
+            top_chunks.append(ch)
+    return bool(re.search(r"\bfor\b.+\bin\b", "".join(top_chunks)))
+
+
 def _rewrite_braces(expr: str) -> str:
     """Recursively transpile JS object literals, shorthand `{ fields, iframes }`, and `...spread` into Python dicts."""
     out: list[str] = []
@@ -2121,6 +2156,10 @@ def _rewrite_braces(expr: str) -> str:
             continue
         if not inner.strip():
             out.append("{}")
+            i = j
+            continue
+        if _has_top_level_comp_for_in(inner):
+            out.append("{" + _rewrite_braces(inner) + "}")
             i = j
             continue
         raw_parts = _split_top_level_commas(inner)

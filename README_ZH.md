@@ -76,6 +76,8 @@ uvx --from faster-mac-use fmu '{
 - 原生 Swift `AXObserver` 和 Apple Silicon `Vision.framework` OCR 仅支持 macOS（需要给终端开辅助功能权限）。
 - 操控已登录 Chrome 后台标签页需要加载仓库内附带的本地未打包 MV3 扩展（`extension/`）；无头模式 `headless` 无需扩展即可直接跑。
 
-## 开源协议
+## 社区与开源协议
+
+感谢 [LINUX DO](https://linux.do) 社区的开源氛围与技术交流支持。
 
 本项目基于 [AGPL-3.0-only](LICENSE) 开源，并附带 [ATTRIBUTION.md](ATTRIBUTION.md) 中的 Section 7 署名条款；向本仓库提交 PR 需一次性签署 [CLA](CLA.md)。觉得顺手的话，欢迎点个 Star 支持一下。

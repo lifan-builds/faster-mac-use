@@ -160,6 +160,10 @@ python3 tests/test_fmu.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 ```
 
+## Community
+
+Thanks to the [LINUX DO](https://linux.do) open-source developer community for discussions and feedback.
+
 ## License
 
 Open source under [AGPL-3.0-only](https://github.com/lifan-builds/faster-mac-use/blob/main/LICENSE), with the Section 7 attribution terms in [ATTRIBUTION.md](https://github.com/lifan-builds/faster-mac-use/blob/main/ATTRIBUTION.md). Copies and modified versions must keep this credit in their README and `--version` or About output, mark their changes, and may not use the Faster Mac Use name:

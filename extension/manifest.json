@@ -10,7 +10,8 @@
     "debugger",
     "alarms",
     "storage",
-    "management"
+    "management",
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>"

@@ -3632,6 +3632,8 @@ class ExtensionWebSocketBridge:
         self._ready_event = threading.Event()
         self._hello_event = threading.Event()
         self._hello_info: dict[str, Any] = {}
+        self.recent_downloads: list[dict[str, Any]] = []
+        self._downloads_lock = threading.Lock()
         self._sent_runtime_version: str = ""
         self._next_req_id = 1
         self._pending: dict[int, tuple[threading.Event, list[Any]]] = {}
@@ -3840,6 +3842,9 @@ class ExtensionWebSocketBridge:
                         self._hello_event.set()
                         self._ready_event.set()
                         continue
+                    if msg_type == "saveAgentDownload":
+                        self._handle_save_agent_download(conn, msg)
+                        continue
                     if msg_type and self.on_event is not None:
                         try:
                             self.on_event(msg)
@@ -3873,6 +3878,93 @@ class ExtensionWebSocketBridge:
                 conn.close()
             except OSError:
                 pass
+
+    @staticmethod
+    def _resolve_download_dir() -> Path:
+        env_dir = os.environ.get("FMU_DOWNLOAD_DIR", "").strip()
+        if env_dir:
+            p = Path(env_dir).expanduser()
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        prefs_path = Path.home() / "Library" / "Application Support" / "Google" / "Chrome" / "Default" / "Preferences"
+        try:
+            if prefs_path.is_file():
+                prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+                default_dir = str(((prefs.get("download") or {}).get("default_directory")) or "").strip()
+                if default_dir:
+                    cand = Path(default_dir).expanduser()
+                    if cand.is_dir():
+                        return cand
+        except Exception:
+            pass
+        fallback = Path.home() / "Downloads"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+    @staticmethod
+    def _sanitize_download_filename(raw_name: str) -> str:
+        base = os.path.basename(str(raw_name or "").replace("\\", "/")).strip()
+        base = re.sub(r"[\x00-\x1f\x7f]+", "", base)
+        if not base or base in (".", ".."):
+            return "download"
+        return base
+
+    def _handle_save_agent_download(self, conn: socket.socket, msg: dict[str, Any]) -> None:
+        req_id = msg.get("reqId")
+        max_bytes = 25 * 1024 * 1024
+        ack: dict[str, Any] = {"type": "saveAgentDownloadAck", "reqId": req_id, "ok": False}
+        try:
+            b64 = msg.get("dataBase64")
+            if not isinstance(b64, str):
+                raise ValueError("missing dataBase64")
+            raw = base64.b64decode(b64.encode("ascii"), validate=False)
+            if len(raw) > max_bytes:
+                raise ValueError(f"download exceeds {max_bytes} byte limit")
+            dl_dir = self._resolve_download_dir()
+            name = self._sanitize_download_filename(str(msg.get("filename") or "download"))
+            stem, suffix = os.path.splitext(name)
+            dest: Path | None = None
+            for idx in range(1000):
+                cand_name = name if idx == 0 else f"{stem} ({idx}){suffix}"
+                cand = dl_dir / cand_name
+                try:
+                    fd = os.open(str(cand), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    try:
+                        os.write(fd, raw)
+                    finally:
+                        os.close(fd)
+                    dest = cand
+                    break
+                except FileExistsError:
+                    continue
+            if dest is None:
+                raise OSError("could not allocate unique download filename")
+            rec = {
+                "path": str(dest),
+                "filename": dest.name,
+                "url": str(msg.get("url") or ""),
+                "tabId": msg.get("tabId"),
+                "bytes": len(raw),
+                "savedAt": time.time(),
+            }
+            with self._downloads_lock:
+                self.recent_downloads.append(rec)
+                if len(self.recent_downloads) > 20:
+                    del self.recent_downloads[:-20]
+            ack = {
+                "type": "saveAgentDownloadAck",
+                "reqId": req_id,
+                "ok": True,
+                "path": str(dest),
+                "filename": dest.name,
+                "bytes": len(raw),
+            }
+        except Exception as exc:
+            ack["error"] = str(exc)
+        try:
+            self._send_ws_frame(conn, json.dumps(ack).encode("utf-8"), opcode=0x1)
+        except Exception:
+            pass
 
     def call_rpc(
         self,

@@ -53,6 +53,388 @@ const AGENT_GROUP_TITLE_RE = /^(?:(?:🤖\s*)?Agent(?:$|\s)|(?:Devin|Codex|Claud
 const agentTabClaims = new Map();
 let agentTabClaimsLoaded = null;
 
+const AGENT_DOWNLOAD_HOLD_MS = 8000;
+const AGENT_DOWNLOAD_POST_COMPLETE_MS = 1500;
+const AGENT_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;
+const agentTabUrls = new Map();
+const recentTabPostUrls = new Map();
+const activeAgentDownloadIds = new Set();
+const pendingBridgeAcks = new Map();
+let bridgeAckSeq = 0;
+let inFlightAgentDownloadActions = 0;
+let downloadUiSuppressed = false;
+let downloadUiHoldUntil = 0;
+let downloadUiRestoreTimer = null;
+
+function extractUrlOriginInfo(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (!s) return { url: "", origin: "", host: "" };
+  const unwrapped = s.startsWith("blob:") ? s.slice(5) : s;
+  try {
+    const u = new URL(unwrapped);
+    if (u.protocol === "http:" || u.protocol === "https:") {
+      return {
+        url: s,
+        origin: u.origin.toLowerCase(),
+        host: (u.hostname || "").toLowerCase()
+      };
+    }
+  } catch (_) {}
+  return { url: s, origin: "", host: "" };
+}
+
+function rememberAgentTabUrl(tabId, rawUrl) {
+  if (tabId === undefined || tabId === null) return;
+  const info = extractUrlOriginInfo(rawUrl);
+  if (!info.url || info.url === "about:blank") return;
+  agentTabUrls.set(Number(tabId), { ...info, updatedAt: Date.now() });
+}
+
+function rememberRecentPostUrl(rawUrl) {
+  const u = String(rawUrl || "").trim();
+  if (!u) return;
+  const now = Date.now();
+  recentTabPostUrls.set(u, now);
+  if (recentTabPostUrls.size > 64) {
+    for (const [k, ts] of recentTabPostUrls) {
+      if (now - ts > 30000) recentTabPostUrls.delete(k);
+    }
+  }
+}
+
+function isRecentPostUrl(rawUrl) {
+  const u = String(rawUrl || "").trim();
+  if (!u) return false;
+  const ts = recentTabPostUrls.get(u);
+  return Boolean(ts && (Date.now() - ts) < 30000);
+}
+
+function setDownloadUiEnabled(enabled) {
+  const wantSuppressed = !enabled;
+  if (downloadUiSuppressed === wantSuppressed) return;
+  if (!chrome.downloads) return;
+  try {
+    if (typeof chrome.downloads.setUiOptions === "function") {
+      const res = chrome.downloads.setUiOptions({ enabled: Boolean(enabled) });
+      if (res && typeof res.catch === "function") res.catch(() => {});
+      downloadUiSuppressed = wantSuppressed;
+      return;
+    }
+    if (typeof chrome.downloads.setShelfEnabled === "function") {
+      chrome.downloads.setShelfEnabled(Boolean(enabled));
+      downloadUiSuppressed = wantSuppressed;
+    }
+  } catch (_) {}
+}
+
+function clearDownloadUiRestoreTimer() {
+  if (downloadUiRestoreTimer) {
+    clearTimeout(downloadUiRestoreTimer);
+    downloadUiRestoreTimer = null;
+  }
+}
+
+function restoreDownloadUiIfIdle() {
+  clearDownloadUiRestoreTimer();
+  if (inFlightAgentDownloadActions > 0 || activeAgentDownloadIds.size > 0) return;
+  const remaining = downloadUiHoldUntil - Date.now();
+  if (remaining > 0) {
+    downloadUiRestoreTimer = setTimeout(() => restoreDownloadUiIfIdle(), remaining);
+    return;
+  }
+  setDownloadUiEnabled(true);
+}
+
+function scheduleDownloadUiRestore(minDelayMs = 0) {
+  clearDownloadUiRestoreTimer();
+  if (inFlightAgentDownloadActions > 0 || activeAgentDownloadIds.size > 0) return;
+  const delay = Math.max(0, minDelayMs, downloadUiHoldUntil - Date.now());
+  if (delay === 0) {
+    setDownloadUiEnabled(true);
+  } else {
+    downloadUiRestoreTimer = setTimeout(() => restoreDownloadUiIfIdle(), delay);
+  }
+}
+
+function beginAgentDownloadAction(tabId, rawUrl = "") {
+  if (tabId !== undefined && tabId !== null && rawUrl) {
+    rememberAgentTabUrl(tabId, rawUrl);
+  }
+  inFlightAgentDownloadActions += 1;
+  clearDownloadUiRestoreTimer();
+  setDownloadUiEnabled(false);
+}
+
+function endAgentDownloadAction(holdMs = AGENT_DOWNLOAD_HOLD_MS) {
+  inFlightAgentDownloadActions = Math.max(0, inFlightAgentDownloadActions - 1);
+  if (holdMs > 0) {
+    downloadUiHoldUntil = Math.max(downloadUiHoldUntil, Date.now() + holdMs);
+  }
+  scheduleDownloadUiRestore();
+}
+
+function findMatchingAgentTabId(item) {
+  if (!item || typeof item !== "object") return null;
+  const candidates = [
+    extractUrlOriginInfo(item.referrer),
+    extractUrlOriginInfo(item.finalUrl),
+    extractUrlOriginInfo(item.url)
+  ];
+  let hostFallback = null;
+  for (const [tid, tabInfo] of agentTabUrls) {
+    if (!tabInfo) continue;
+    for (const cand of candidates) {
+      if (tabInfo.origin && cand.origin && tabInfo.origin === cand.origin) return tid;
+      if (tabInfo.host && cand.host && tabInfo.host === cand.host && hostFallback === null) {
+        hostFallback = tid;
+      }
+    }
+  }
+  return hostFallback;
+}
+
+function isAgentDownloadItem(item) {
+  if (!item || typeof item !== "object") return false;
+  if (item.id !== undefined && activeAgentDownloadIds.has(item.id)) return true;
+  if (findMatchingAgentTabId(item) !== null) return true;
+  const hasActionWindow = inFlightAgentDownloadActions > 0 || Date.now() < downloadUiHoldUntil;
+  if (hasActionWindow) {
+    const rawUrl = String(item.url || "").trim().toLowerCase();
+    const hasReferrer = Boolean(String(item.referrer || "").trim());
+    if (!hasReferrer || rawUrl.startsWith("data:") || rawUrl.startsWith("blob:")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function safeSuggestedFilename(rawFilename) {
+  const cleaned = String(rawFilename || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(seg => seg && seg !== "." && seg !== "..")
+    .join("/");
+  return cleaned || "download";
+}
+
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  const chunks = [];
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + step)));
+  }
+  return btoa(chunks.join(""));
+}
+
+function decodeDataUrlToBase64(dataUrl) {
+  const commaIdx = dataUrl.indexOf(",");
+  if (commaIdx < 0) return null;
+  const meta = dataUrl.slice(5, commaIdx);
+  const body = dataUrl.slice(commaIdx + 1);
+  if (/;base64$/i.test(meta)) {
+    return body;
+  }
+  try {
+    const decoded = decodeURIComponent(body);
+    const bytes = new TextEncoder().encode(decoded);
+    if (bytes.byteLength > AGENT_DOWNLOAD_MAX_BYTES) return null;
+    return arrayBufferToBase64(bytes.buffer);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function readBlobUrlAsBase64FromTab(tabId, blobUrl) {
+  if (!tabId || !blobUrl || !chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return null;
+  }
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [blobUrl, AGENT_DOWNLOAD_MAX_BYTES],
+      func: async (u, maxBytes) => {
+        try {
+          const resp = await fetch(u);
+          if (!resp.ok) return null;
+          const blob = await resp.blob();
+          if (blob.size > maxBytes) return null;
+          const dataUrl = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(typeof reader.result === "string" ? reader.result : "");
+            reader.onerror = () => resolve("");
+            reader.readAsDataURL(blob);
+          });
+          const idx = dataUrl.indexOf(",");
+          return idx >= 0 ? dataUrl.slice(idx + 1) : null;
+        } catch (_) {
+          return null;
+        }
+      }
+    });
+    const first = Array.isArray(results) && results[0] ? results[0].result : null;
+    return typeof first === "string" ? first : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function fetchAgentDownloadBase64(item, tabId) {
+  const rawUrl = String(item.finalUrl || item.url || "").trim();
+  if (!rawUrl) return null;
+  if (rawUrl.startsWith("data:")) {
+    return decodeDataUrlToBase64(rawUrl);
+  }
+  if (rawUrl.startsWith("blob:")) {
+    return await readBlobUrlAsBase64FromTab(tabId, rawUrl);
+  }
+  if (!/^https?:\/\//i.test(rawUrl)) return null;
+  if (typeof fetch !== "function") return null;
+  try {
+    const resp = await fetch(rawUrl, { credentials: "include" });
+    if (!resp.ok) return null;
+    const lenHdr = Number(resp.headers && resp.headers.get ? resp.headers.get("content-length") : 0);
+    if (lenHdr > AGENT_DOWNLOAD_MAX_BYTES) return null;
+    const buf = await resp.arrayBuffer();
+    if (buf.byteLength > AGENT_DOWNLOAD_MAX_BYTES) return null;
+    return arrayBufferToBase64(buf);
+  } catch (_) {
+    return null;
+  }
+}
+
+function sendSaveAgentDownloadToBridge(payload, timeoutMs = 8000) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return Promise.resolve({ ok: false, error: "bridge not connected" });
+  }
+  const reqId = ++bridgeAckSeq;
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (res) => {
+      if (settled) return;
+      settled = true;
+      pendingBridgeAcks.delete(reqId);
+      resolve(res);
+    };
+    const timer = setTimeout(() => done({ ok: false, error: "timeout" }), timeoutMs);
+    pendingBridgeAcks.set(reqId, (ack) => {
+      clearTimeout(timer);
+      done(ack || { ok: false });
+    });
+    try {
+      ws.send(JSON.stringify({ type: "saveAgentDownload", reqId, ...payload }));
+    } catch (err) {
+      clearTimeout(timer);
+      done({ ok: false, error: String((err && err.message) || err) });
+    }
+  });
+}
+
+function rejectAllPendingBridgeAcks(reason = "disconnected") {
+  for (const [reqId, waiter] of Array.from(pendingBridgeAcks.entries())) {
+    pendingBridgeAcks.delete(reqId);
+    try { waiter({ ok: false, error: reason }); } catch (_) {}
+  }
+}
+
+async function saveAgentDownloadViaBridge(item, filename) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  const rawUrl = String(item.finalUrl || item.url || "").trim();
+  if (!rawUrl || isRecentPostUrl(rawUrl) || isRecentPostUrl(item.url)) return false;
+  const tabId = findMatchingAgentTabId(item);
+  const dataBase64 = await fetchAgentDownloadBase64(item, tabId);
+  if (dataBase64 === null) return false;
+  const ack = await sendSaveAgentDownloadToBridge({
+    filename,
+    dataBase64,
+    url: rawUrl,
+    tabId
+  });
+  if (!ack || !ack.ok) return false;
+  if (item.id !== undefined) {
+    activeAgentDownloadIds.delete(item.id);
+    if (chrome.downloads && typeof chrome.downloads.cancel === "function") {
+      try { await chrome.downloads.cancel(item.id); } catch (_) {}
+    }
+    if (chrome.downloads && typeof chrome.downloads.erase === "function") {
+      try { await chrome.downloads.erase({ id: item.id }); } catch (_) {}
+    }
+  }
+  downloadUiHoldUntil = Math.max(downloadUiHoldUntil, Date.now() + AGENT_DOWNLOAD_POST_COMPLETE_MS);
+  scheduleDownloadUiRestore(AGENT_DOWNLOAD_POST_COMPLETE_MS);
+  return true;
+}
+
+async function reconcileActiveAgentDownloads() {
+  if (activeAgentDownloadIds.size > 0 && chrome.downloads && typeof chrome.downloads.search === "function") {
+    try {
+      const inProgress = (await chrome.downloads.search({ state: "in_progress" })) || [];
+      const liveIds = new Set(inProgress.map(d => d && d.id).filter(id => id !== undefined));
+      for (const id of Array.from(activeAgentDownloadIds)) {
+        if (!liveIds.has(id)) {
+          activeAgentDownloadIds.delete(id);
+        }
+      }
+    } catch (_) {
+      activeAgentDownloadIds.clear();
+    }
+  }
+  restoreDownloadUiIfIdle();
+}
+
+if (chrome.downloads) {
+  if (chrome.downloads.onCreated && typeof chrome.downloads.onCreated.addListener === "function") {
+    chrome.downloads.onCreated.addListener(item => {
+      if (!isAgentDownloadItem(item)) return;
+      if (item.id !== undefined) activeAgentDownloadIds.add(item.id);
+      clearDownloadUiRestoreTimer();
+      setDownloadUiEnabled(false);
+    });
+  }
+  if (chrome.downloads.onDeterminingFilename && typeof chrome.downloads.onDeterminingFilename.addListener === "function") {
+    chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+      if (typeof suggest !== "function") return;
+      if (!isAgentDownloadItem(item)) {
+        suggest();
+        return;
+      }
+      if (item.id !== undefined) activeAgentDownloadIds.add(item.id);
+      clearDownloadUiRestoreTimer();
+      setDownloadUiEnabled(false);
+      const filename = safeSuggestedFilename(item.filename);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        void (async () => {
+          let savedByBridge = false;
+          try {
+            savedByBridge = await saveAgentDownloadViaBridge(item, filename);
+          } catch (_) {}
+          try {
+            if (savedByBridge) {
+              suggest();
+            } else {
+              suggest({ filename, conflictAction: "uniquify" });
+            }
+          } catch (_) {}
+        })();
+        return true;
+      }
+      suggest({ filename, conflictAction: "uniquify" });
+    });
+  }
+  if (chrome.downloads.onChanged && typeof chrome.downloads.onChanged.addListener === "function") {
+    chrome.downloads.onChanged.addListener(delta => {
+      if (!delta || delta.id === undefined || !activeAgentDownloadIds.has(delta.id)) return;
+      const nextState = delta.state && delta.state.current;
+      if (nextState === "complete" || nextState === "interrupted") {
+        activeAgentDownloadIds.delete(delta.id);
+        downloadUiHoldUntil = Math.max(downloadUiHoldUntil, Date.now() + AGENT_DOWNLOAD_POST_COMPLETE_MS);
+        scheduleDownloadUiRestore(AGENT_DOWNLOAD_POST_COMPLETE_MS);
+      }
+    });
+  }
+}
+
 function claimStorage() {
   return (chrome.storage && (chrome.storage.local || chrome.storage.session)) || null;
 }
@@ -115,7 +497,10 @@ async function foreignTabIds(owner) {
 async function releaseTabClaims(tabIds) {
   await loadAgentTabClaims();
   let changed = false;
-  for (const tabId of tabIds) changed = agentTabClaims.delete(tabId) || changed;
+  for (const tabId of tabIds) {
+    agentTabUrls.delete(Number(tabId));
+    changed = agentTabClaims.delete(tabId) || changed;
+  }
   if (changed) await saveAgentTabClaims();
 }
 
@@ -159,6 +544,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
   verifiedRendererTabs.delete(tabId);
   attachedDebuggers.delete(tabId);
   initializedRuntimeTabs.delete(tabId);
+  agentTabUrls.delete(Number(tabId));
   clearTabNavGeneration(tabId);
   for (const [sid, tid] of Array.from(sessionTabs.entries())) {
     if (tid === tabId) sessionTabs.delete(sid);
@@ -241,12 +627,19 @@ chrome.alarms.onAlarm.addListener(() => {
     connectRelay();
   }
   void detachIdleDebuggers();
+  void reconcileActiveAgentDownloads();
 });
 if (chrome.runtime && chrome.runtime.onStartup) {
-  chrome.runtime.onStartup.addListener(() => connectRelay());
+  chrome.runtime.onStartup.addListener(() => {
+    setDownloadUiEnabled(true);
+    connectRelay();
+  });
 }
 if (chrome.runtime && chrome.runtime.onInstalled) {
-  chrome.runtime.onInstalled.addListener(() => connectRelay());
+  chrome.runtime.onInstalled.addListener(() => {
+    setDownloadUiEnabled(true);
+    connectRelay();
+  });
 }
 
 function getHostname(rawUrl) {
@@ -465,6 +858,9 @@ if (chrome.debugger && chrome.debugger.onDetach) {
 
 if (chrome.tabs && chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addListener === "function") {
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo && changeInfo.url && (agentTabClaims.has(tabId) || agentTabUrls.has(Number(tabId)))) {
+      rememberAgentTabUrl(tabId, changeInfo.url);
+    }
     if (changeInfo && (changeInfo.status === "loading" || changeInfo.url)) {
       initializedRuntimeTabs.delete(tabId);
       bumpTabNavGeneration(tabId);
@@ -534,6 +930,11 @@ if (chrome.debugger && chrome.debugger.onEvent && typeof chrome.debugger.onEvent
       return;
     }
     if (method === "Network.requestWillBeSent" && params.requestId && params.request) {
+      const rMethod = String(params.request.method || "GET").toUpperCase();
+      const rUrl = String(params.request.url || "");
+      if (rMethod !== "GET" && rMethod !== "HEAD" && rUrl) {
+        rememberRecentPostUrl(rUrl);
+      }
       const rType = String(params.type || "");
       if (rType === "Document" || rType === "Fetch" || rType === "XHR") {
         if (pendingNetRequests.size > 250) {
@@ -541,8 +942,8 @@ if (chrome.debugger && chrome.debugger.onEvent && typeof chrome.debugger.onEvent
           if (oldest !== undefined) pendingNetRequests.delete(oldest);
         }
         pendingNetRequests.set(`${tabId}:${params.requestId}`, {
-          method: String(params.request.method || "GET"),
-          url: String(params.request.url || ""),
+          method: rMethod,
+          url: rUrl,
           type: rType
         });
       }
@@ -2193,58 +2594,66 @@ async function handleRpc(msg) {
       if (targetWindowId !== undefined) {
         createOpts.windowId = targetWindowId;
       }
-      let tab;
+      const trackDownloadAction = Boolean(navUrl && navUrl !== "about:blank");
+      if (trackDownloadAction) beginAgentDownloadAction(null, navUrl);
       try {
-        tab = await chrome.tabs.create(createOpts);
-      } catch (err) {
-        if (String(err && err.message || err).includes("No current window") && chrome.windows && typeof chrome.windows.create === "function") {
-          const win = await chrome.windows.create({ url: navUrl, focused: false });
-          tab = (win && Array.isArray(win.tabs) && win.tabs[0])
-            ? win.tabs[0]
-            : await chrome.tabs.create({ url: navUrl, active: false, windowId: win.id });
-        } else {
-          throw err;
-        }
-      }
-      await claimTab(tab.id, owner, true, agent);
-      const effectiveWinId = tab.windowId !== undefined ? tab.windowId : targetWindowId;
-      const groupId = await ensureAgentGroup(tab.id, sessionName, color, effectiveWinId);
-      await bindSessionTab(sessionId, tab.id, owner, undefined, agent);
-      if (params.focusEmulation !== false && params.skipPreview !== true) {
-        startLiveScreencast(tab.id);
-      }
-      if (navUrl && navUrl !== "about:blank") {
-        await waitForTabLoad(tab.id, timeoutMs, navUrl);
-      }
-      if (params.focusEmulation !== false) {
-        try { await ensureDebuggerAndFocusEmulation(tab.id); } catch (_) {}
-      }
-      let finalUrl = tab.pendingUrl || tab.url || url;
-      let finalTitle = tab.title || "";
-      if (chrome.tabs && typeof chrome.tabs.get === "function") {
+        let tab;
         try {
-          const refreshedTab = await chrome.tabs.get(tab.id);
-          if (refreshedTab) {
-            finalUrl = refreshedTab.url || refreshedTab.pendingUrl || finalUrl;
-            finalTitle = refreshedTab.title || finalTitle;
+          tab = await chrome.tabs.create(createOpts);
+        } catch (err) {
+          if (String(err && err.message || err).includes("No current window") && chrome.windows && typeof chrome.windows.create === "function") {
+            const win = await chrome.windows.create({ url: navUrl, focused: false });
+            tab = (win && Array.isArray(win.tabs) && win.tabs[0])
+              ? win.tabs[0]
+              : await chrome.tabs.create({ url: navUrl, active: false, windowId: win.id });
+          } else {
+            throw err;
           }
-        } catch (_) {}
-      }
-      stopLiveScreencast(tab.id);
-      if (params.skipPreview !== true) {
-        scheduleAsyncPreviewPush(tab.id);
-      }
-      return {
-        id,
-        result: {
-          tabId: tab.id,
-          windowId: effectiveWinId,
-          groupId,
-          sessionName,
-          url: finalUrl,
-          title: finalTitle
         }
-      };
+        rememberAgentTabUrl(tab.id, tab.pendingUrl || tab.url || navUrl);
+        await claimTab(tab.id, owner, true, agent);
+        const effectiveWinId = tab.windowId !== undefined ? tab.windowId : targetWindowId;
+        const groupId = await ensureAgentGroup(tab.id, sessionName, color, effectiveWinId);
+        await bindSessionTab(sessionId, tab.id, owner, undefined, agent);
+        if (params.focusEmulation !== false && params.skipPreview !== true) {
+          startLiveScreencast(tab.id);
+        }
+        if (navUrl && navUrl !== "about:blank") {
+          await waitForTabLoad(tab.id, timeoutMs, navUrl);
+        }
+        if (params.focusEmulation !== false) {
+          try { await ensureDebuggerAndFocusEmulation(tab.id); } catch (_) {}
+        }
+        let finalUrl = tab.pendingUrl || tab.url || url;
+        let finalTitle = tab.title || "";
+        if (chrome.tabs && typeof chrome.tabs.get === "function") {
+          try {
+            const refreshedTab = await chrome.tabs.get(tab.id);
+            if (refreshedTab) {
+              finalUrl = refreshedTab.url || refreshedTab.pendingUrl || finalUrl;
+              finalTitle = refreshedTab.title || finalTitle;
+            }
+          } catch (_) {}
+        }
+        rememberAgentTabUrl(tab.id, finalUrl);
+        stopLiveScreencast(tab.id);
+        if (params.skipPreview !== true) {
+          scheduleAsyncPreviewPush(tab.id);
+        }
+        return {
+          id,
+          result: {
+            tabId: tab.id,
+            windowId: effectiveWinId,
+            groupId,
+            sessionName,
+            url: finalUrl,
+            title: finalTitle
+          }
+        };
+      } finally {
+        if (trackDownloadAction) endAgentDownloadAction();
+      }
     }
     if (method === "navigate" || method === "goto") {
       clearPendingPreview();
@@ -2252,30 +2661,37 @@ async function handleRpc(msg) {
       const navUrl = normalizeNavUrl(url);
       initializedRuntimeTabs.delete(tabId);
       bumpTabNavGeneration(tabId);
-      if (!skipPreview) {
-        startLiveScreencast(tabId);
+      const trackDownloadAction = Boolean(navUrl && navUrl !== "about:blank");
+      if (trackDownloadAction) beginAgentDownloadAction(tabId, navUrl);
+      try {
+        if (!skipPreview) {
+          startLiveScreencast(tabId);
+        }
+        await chrome.tabs.update(tabId, { url: navUrl, active: false });
+        if (navUrl && navUrl !== "about:blank") {
+          await waitForTabLoad(tabId, timeoutMs, navUrl);
+        }
+        await ensureDebuggerAndFocusEmulation(tabId);
+        let finalUrl = navUrl;
+        let tabTitle = "";
+        if (chrome.tabs && typeof chrome.tabs.get === "function") {
+          try {
+            const t = await chrome.tabs.get(tabId);
+            if (t) {
+              if (t.url || t.pendingUrl) finalUrl = t.url || t.pendingUrl;
+              if (t.title) tabTitle = t.title;
+            }
+          } catch (_) {}
+        }
+        rememberAgentTabUrl(tabId, finalUrl);
+        stopLiveScreencast(tabId);
+        if (!skipPreview) {
+          scheduleAsyncPreviewPush(tabId);
+        }
+        return { id, result: { tabId, url: finalUrl, title: tabTitle } };
+      } finally {
+        if (trackDownloadAction) endAgentDownloadAction();
       }
-      await chrome.tabs.update(tabId, { url: navUrl, active: false });
-      if (navUrl && navUrl !== "about:blank") {
-        await waitForTabLoad(tabId, timeoutMs, navUrl);
-      }
-      await ensureDebuggerAndFocusEmulation(tabId);
-      let finalUrl = navUrl;
-      let tabTitle = "";
-      if (chrome.tabs && typeof chrome.tabs.get === "function") {
-        try {
-          const t = await chrome.tabs.get(tabId);
-          if (t) {
-            if (t.url || t.pendingUrl) finalUrl = t.url || t.pendingUrl;
-            if (t.title) tabTitle = t.title;
-          }
-        } catch (_) {}
-      }
-      stopLiveScreencast(tabId);
-      if (!skipPreview) {
-        scheduleAsyncPreviewPush(tabId);
-      }
-      return { id, result: { tabId, url: finalUrl, title: tabTitle } };
     }
     if (method === "listTabs") {
       const {
@@ -2470,18 +2886,25 @@ async function handleRpc(msg) {
       const { tabId, expression, arg, runtimeInit, awaitPromise = true } = params;
       const curTab = await getLiveTabOrThrow(tabId);
       const curTabUrl = curTab ? String(curTab.url || curTab.pendingUrl || "") : "";
+      rememberAgentTabUrl(tabId, curTabUrl);
       await ensureResponsiveTabDebugger(tabId, curTabUrl, 3000);
       const wrappedExpr = runtimeInit
         ? expression
         : `((__fn, __arg) => (typeof __fn === "function" ? __fn(__arg) : __fn))((${expression}), ${JSON.stringify(arg === undefined ? null : arg)})`;
+      const trackDownloadAction = !runtimeInit;
+      if (trackDownloadAction) beginAgentDownloadAction(tabId, curTabUrl);
       let val;
       try {
-        val = await evalInTab(tabId, wrappedExpr, awaitPromise);
-      } catch (evalErr) {
-        if (!isNavigationError(evalErr)) throw evalErr;
-        const navSt = await waitForNavigationSettlement(tabId, "", 10000);
-        if (!navSt.alive) throw evalErr;
-        val = await evalInTab(tabId, wrappedExpr, awaitPromise);
+        try {
+          val = await evalInTab(tabId, wrappedExpr, awaitPromise);
+        } catch (evalErr) {
+          if (!isNavigationError(evalErr)) throw evalErr;
+          const navSt = await waitForNavigationSettlement(tabId, "", 10000);
+          if (!navSt.alive) throw evalErr;
+          val = await evalInTab(tabId, wrappedExpr, awaitPromise);
+        }
+      } finally {
+        if (trackDownloadAction) endAgentDownloadAction();
       }
       return { id, result: val };
     }
@@ -2568,6 +2991,10 @@ async function handleRpc(msg) {
       );
 
       const origSteps = Array.isArray(reqPayload.steps) ? reqPayload.steps : [];
+      rememberAgentTabUrl(tabId, curTabUrl);
+      const trackDownloadAction = origSteps.length > 0;
+      if (trackDownloadAction) beginAgentDownloadAction(tabId, curTabUrl);
+      try {
       const tabHost = getHostname(curTabUrl);
       if (tabHost) await loadStrictCspHosts();
       const isPureEvalOnKnownCspHost = (
@@ -2891,6 +3318,9 @@ async function handleRpc(msg) {
         scheduleAsyncPreviewPush(tabId);
       }
       return { id, result: batchRes };
+      } finally {
+        if (trackDownloadAction) endAgentDownloadAction();
+      }
     }
     if (method === "capturePreview") {
       const { tabId, maxWidth = 1440 } = params;
@@ -3220,6 +3650,14 @@ function connectRelay() {
     };
     ws.onmessage = async (ev) => {
       const msg = JSON.parse(ev.data);
+      if (msg && msg.type === "saveAgentDownloadAck" && msg.reqId !== undefined) {
+        const waiter = pendingBridgeAcks.get(msg.reqId);
+        if (waiter) {
+          pendingBridgeAcks.delete(msg.reqId);
+          waiter(msg);
+        }
+        return;
+      }
       if (!msg || !msg.method) return;
       const resp = await handleRpc(msg);
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -3229,11 +3667,15 @@ function connectRelay() {
     ws.onclose = () => {
       isConnecting = false;
       ws = null;
+      rejectAllPendingBridgeAcks("closed");
+      void reconcileActiveAgentDownloads();
       scheduleReconnect(500);
     };
     ws.onerror = () => {
       isConnecting = false;
       ws = null;
+      rejectAllPendingBridgeAcks("error");
+      void reconcileActiveAgentDownloads();
       scheduleReconnect(500);
     };
   } catch (_) {

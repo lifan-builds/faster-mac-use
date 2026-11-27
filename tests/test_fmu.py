@@ -6310,6 +6310,200 @@ runScenario().then(res => {
         finally:
             rt.shutdown()
 
+    def test_mv3_silent_agent_downloads_suppress_save_dialog_and_bubble(self) -> None:
+        manifest = json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("downloads", manifest.get("permissions", []))
+
+        rt = FasterMacUseRuntime()
+        bridge = rt.browser.ensure_bridge()
+        bg_js = (ROOT / "extension" / "background.js").read_text(encoding="utf-8").replace(
+            "ws://127.0.0.1:19222/ext", f"ws://127.0.0.1:{bridge.port}/ext"
+        )
+        prev_dl_dir = os.environ.get("FMU_DOWNLOAD_DIR")
+        node_proc = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dl:
+                os.environ["FMU_DOWNLOAD_DIR"] = tmp_dl
+                harness = f"""
+const state = {{
+  tabs: [
+    {{ id: 701, windowId: 77, groupId: 70, active: false, title: "Broker", url: "https://broker.example.com/positions", status: "complete", discarded: false }}
+  ],
+  groups: [{{ id: 70, windowId: 77, title: "Agent", collapsed: false }}],
+  storage: {{}},
+  uiOptionsCalls: [],
+  cancelledIds: [],
+  erasedIds: [],
+  listeners: {{ onCreated: [], onDeterminingFilename: [], onChanged: [], onEvent: [] }}
+}};
+globalThis.fetch = async (url) => {{
+  if (String(url).includes("positions.csv")) {{
+    const bytes = new TextEncoder().encode("sym,qty\\nNVDA,10\\n");
+    return {{ ok: true, headers: {{ get: () => String(bytes.byteLength) }}, arrayBuffer: async () => bytes.buffer }};
+  }}
+  return {{ ok: false, headers: {{ get: () => "0" }}, arrayBuffer: async () => new ArrayBuffer(0) }};
+}};
+globalThis.chrome = {{
+  runtime: {{ id: "fmu-test-ext", onStartup: {{ addListener: () => {{}} }}, onInstalled: {{ addListener: () => {{}} }} }},
+  alarms: {{ create: () => {{}}, onAlarm: {{ addListener: () => {{}} }} }},
+  storage: {{ local: {{ async get(k) {{ return {{ [k]: state.storage[k] }}; }}, async set(o) {{ Object.assign(state.storage, o); }} }} }},
+  tabs: {{
+    query: async () => state.tabs,
+    get: async (id) => state.tabs.find(t => t.id === id),
+    update: async (id, opts) => Object.assign(state.tabs.find(t => t.id === id), opts),
+    group: async () => 70,
+    onCreated: {{ addListener: () => {{}} }},
+    onUpdated: {{ addListener: () => {{}} }},
+    onRemoved: {{ addListener: () => {{}} }}
+  }},
+  tabGroups: {{
+    get: async (gid) => state.groups.find(g => g.id === gid),
+    query: async () => state.groups,
+    update: async (gid, opts) => Object.assign(state.groups[0], opts)
+  }},
+  windows: {{ getAll: async () => [{{ id: 77, focused: false }}] }},
+  scripting: {{
+    executeScript: async ({{ target, args }}) => {{
+      if (target && target.tabId === 701 && String(args && args[0]).startsWith("blob:https://broker.example.com/")) {{
+        return [{{ result: Buffer.from("lot,cost\\n1,100\\n").toString("base64") }}];
+      }}
+      return [{{ result: null }}];
+    }}
+  }},
+  debugger: {{
+    attach: async () => ({{}}),
+    detach: async () => ({{}}),
+    sendCommand: async (_t, method, params) => {{
+      if (method === "Runtime.evaluate") {{
+        const expr = String((params && params.expression) || "");
+        if (expr.includes("FMU_RUNTIME_VERSION")) return {{ result: {{ value: true }} }};
+        return {{ result: {{ value: "ok" }} }};
+      }}
+      return {{}};
+    }},
+    onDetach: {{ addListener: () => {{}} }},
+    onEvent: {{ addListener: (fn) => state.listeners.onEvent.push(fn) }}
+  }},
+  downloads: {{
+    setUiOptions: async (opts) => {{ state.uiOptionsCalls.push(Boolean(opts && opts.enabled)); }},
+    cancel: async (id) => {{ state.cancelledIds.push(id); }},
+    erase: async (q) => {{ state.erasedIds.push(q && q.id); }},
+    search: async () => [],
+    onCreated: {{ addListener: (fn) => state.listeners.onCreated.push(fn) }},
+    onDeterminingFilename: {{ addListener: (fn) => state.listeners.onDeterminingFilename.push(fn) }},
+    onChanged: {{ addListener: (fn) => state.listeners.onChanged.push(fn) }}
+  }}
+}};
+{bg_js}
+async function run() {{
+  for (let i = 0; i < 60 && (!ws || ws.readyState !== WebSocket.OPEN); i++) {{
+    await new Promise(r => setTimeout(r, 25));
+  }}
+  rememberAgentTabUrl(701, "https://broker.example.com/positions");
+  beginAgentDownloadAction(701, "https://broker.example.com/positions");
+
+  const runDet = (item) => new Promise((resolve) => {{
+    let resolved = false;
+    const suggest = (arg) => {{
+      if (!resolved) {{ resolved = true; resolve(arg); }}
+    }};
+    for (const fn of state.listeners.onCreated) fn(item);
+    for (const fn of state.listeners.onDeterminingFilename) fn(item, suggest);
+  }});
+
+  // 1. Agent HTTP download (with path traversal sanitized) + duplicate uniquification
+  const s1 = await runDet({{
+    id: 101,
+    url: "https://cdn.example.com/positions.csv",
+    referrer: "https://broker.example.com/positions",
+    filename: "../../positions.csv"
+  }});
+  const s2 = await runDet({{
+    id: 102,
+    url: "https://cdn.example.com/positions.csv",
+    referrer: "https://broker.example.com/positions",
+    filename: "positions.csv"
+  }});
+
+  // 2. Agent blob download read from MAIN world
+  const s3 = await runDet({{
+    id: 103,
+    url: "blob:https://broker.example.com/uuid-1",
+    referrer: "https://broker.example.com/positions",
+    filename: "lots.csv"
+  }});
+
+  // 3. Agent POST download is NOT re-fetched via GET; falls back to suggest(uniquify)
+  for (const fn of state.listeners.onEvent) {{
+    fn({{ tabId: 701 }}, "Network.requestWillBeSent", {{
+      requestId: "r1",
+      type: "Document",
+      request: {{ method: "POST", url: "https://broker.example.com/export-post" }}
+    }});
+  }}
+  const s4 = await runDet({{
+    id: 104,
+    url: "https://broker.example.com/export-post",
+    referrer: "https://broker.example.com/positions",
+    filename: "post_export.csv"
+  }});
+  for (const fn of state.listeners.onChanged) fn({{ id: 104, state: {{ current: "complete" }} }});
+
+  // 4. Non-agent user download passes through untouched (suggest() with undefined)
+  const s5 = await runDet({{
+    id: 105,
+    url: "https://manual.user-site.org/invoice.pdf",
+    referrer: "https://manual.user-site.org/billing",
+    filename: "invoice.pdf"
+  }});
+
+  // 5. Ending action + idle restore re-enables Chrome download UI
+  endAgentDownloadAction(0);
+  downloadUiHoldUntil = 0;
+  restoreDownloadUiIfIdle();
+
+  console.log("RESULT:" + JSON.stringify({{
+    s1, s2, s3, s4, s5,
+    cancelledIds: state.cancelledIds,
+    erasedIds: state.erasedIds,
+    uiOptionsCalls: state.uiOptionsCalls
+  }}));
+  process.exit(0);
+}}
+run().catch(e => {{ console.error(e); process.exit(1); }});
+"""
+                node_proc = subprocess.run(
+                    ["node", "-e", harness],
+                    capture_output=True,
+                    text=True,
+                    timeout=15.0,
+                )
+                self.assertEqual(node_proc.returncode, 0, f"Node harness failed: {node_proc.stderr}\n{node_proc.stdout}")
+                res_line = [ln for ln in node_proc.stdout.splitlines() if ln.startswith("RESULT:")][-1]
+                res = json.loads(res_line.split("RESULT:", 1)[1])
+
+                # HTTP + duplicate + blob saved silently to tmp_dl and cancelled in Chrome
+                self.assertEqual((Path(tmp_dl) / "positions.csv").read_text(encoding="utf-8"), "sym,qty\nNVDA,10\n")
+                self.assertEqual((Path(tmp_dl) / "positions (1).csv").read_text(encoding="utf-8"), "sym,qty\nNVDA,10\n")
+                self.assertEqual((Path(tmp_dl) / "lots.csv").read_text(encoding="utf-8"), "lot,cost\n1,100\n")
+                self.assertEqual(res["cancelledIds"], [101, 102, 103])
+                self.assertEqual(res["erasedIds"], [101, 102, 103])
+                self.assertEqual(len(bridge.recent_downloads), 3)
+
+                # POST download fell back to suggest({filename, conflictAction: "uniquify"}) without cancelling
+                self.assertEqual(res["s4"], {"filename": "post_export.csv", "conflictAction": "uniquify"})
+                # User manual download passed through untouched (suggest() with no args -> undefined omitted by JSON)
+                self.assertIsNone(res.get("s5"))
+                # Download UI suppressed before downloads and restored when idle
+                self.assertEqual(res["uiOptionsCalls"][0], False)
+                self.assertEqual(res["uiOptionsCalls"][-1], True)
+        finally:
+            if prev_dl_dir is None:
+                os.environ.pop("FMU_DOWNLOAD_DIR", None)
+            else:
+                os.environ["FMU_DOWNLOAD_DIR"] = prev_dl_dir
+            rt.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

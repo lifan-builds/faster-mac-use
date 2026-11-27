@@ -1,0 +1,297 @@
+{
+  "generated_at": "2026-11-27T11:47:40.444667",
+  "wall_time_s": 279.92,
+  "total": 18,
+  "passed": 17,
+  "blocked": 0,
+  "results": [
+    {
+      "id": "D01_shoelace",
+      "kind": "bench",
+      "meta": {
+        "stratum": "ShadowDOM"
+      },
+      "url": "https://shoelace.style/components/switch",
+      "elapsed_s": 21.43,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://shoelace.style/components/switch",
+      "observed_answer": "The basic switch toggled from false to true and back to false.",
+      "evidence": "The switch and its Shadow DOM input both reported checked values of false, true, and false across two clicks. The headless tab was closed.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "F01_selenium",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Form"
+      },
+      "url": "https://www.selenium.dev/selenium/web/web-form.html",
+      "elapsed_s": 24.3,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://www.selenium.dev/selenium/web/web-form.html",
+      "observed_answer": "Text input was 'fmu-bench-42', Dropdown (select) showed 'Two' with value '2', and Default checkbox changed from unchecked to checked.",
+      "evidence": "A live DOM read verified all three values before the headless tab closed. The form was never submitted.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "F04_freshpowder",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Form"
+      },
+      "url": "https://freshpowder.clifan.com/",
+      "elapsed_s": 42.63,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://freshpowder.clifan.com/",
+      "observed_answer": "Searching for \u201czzznoexist99\u201d returned 0 deals. Reset cleared the search and restored the deal cards and the original count of 7,939 deals.",
+      "evidence": "The page displayed \u201cNo matches for \u2018zzznoexist99\u2019\u201d with zero deal links. After Reset, the search field was blank, the empty-state message disappeared, and the Ogasaka Keos PG Skis card returned. The headless tab was closed.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "F05_calc",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Form"
+      },
+      "url": "https://www.calculator.net/percent-calculator.html",
+      "elapsed_s": 22.88,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://www.calculator.net/percent-calculator.html?cpar1=17&cpar2=240&cpar3=&ctype=1&x=Calculate",
+      "observed_answer": "40.8",
+      "evidence": "The top calculator displayed \u201cResult: 40.8\u201d and \u201c17% of 240 = 0.17 \u00d7 240 = 40.8\u201d.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "I01_quotes",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Scroll"
+      },
+      "url": "https://quotes.toscrape.com/scroll",
+      "elapsed_s": 18.99,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://quotes.toscrape.com/scroll",
+      "observed_answer": "Pablo Neruda",
+      "evidence": "Two scrolls loaded 30 quotes in total. The 21st quote\u2019s author field read \u201cPablo Neruda\u201d.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "R01_gospec",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SSR_Docs"
+      },
+      "url": "https://go.dev/ref/spec",
+      "elapsed_s": 17.15,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://go.dev/ref/spec#Slice_types",
+      "observed_answer": "SliceType = \"[\" \"]\" ElementType .",
+      "evidence": "Read the production directly under \u201cSlice types\u201d in the Go specification and closed the headless tab.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "R02_mdn",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SSR_Docs"
+      },
+      "url": "https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/details",
+      "elapsed_s": 19.34,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/summary",
+      "observed_answer": "The <summary> element represents the visible caption or legend that users activate to expand or collapse its parent <details> element.",
+      "evidence": "MDN says it \u201cspecifies a summary, caption, or legend for a <details> element's disclosure box.\u201d",
+      "stderr_tail": ""
+    },
+    {
+      "id": "R03_pydocs",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SSR_Docs"
+      },
+      "url": "https://docs.python.org/3/library/collections.html",
+      "elapsed_s": 19.71,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://docs.python.org/3/library/collections.html",
+      "observed_answer": "Omitting n returns a list of all (element, count) pairs, ordered from highest to lowest count. Ties follow the order in which elements were first encountered.",
+      "evidence": "The documentation states, \u201cIf n is omitted or None, most_common() returns all elements in the counter.\u201d",
+      "stderr_tail": ""
+    },
+    {
+      "id": "R05_rfc9110",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SSR_Docs"
+      },
+      "url": "https://www.rfc-editor.org/rfc/rfc9110.html",
+      "elapsed_s": 15.68,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://www.rfc-editor.org/rfc/rfc9110.html",
+      "observed_answer": "404 Not Found",
+      "evidence": "Exact section heading: \u201c15.5.5. 404 Not Found\u201d",
+      "stderr_tail": ""
+    },
+    {
+      "id": "S01_poe2",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SPA"
+      },
+      "url": "https://poe2brain.clifan.com/",
+      "elapsed_s": 30.44,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://poe2brain.clifan.com/",
+      "observed_answer": "Searching the Build Index for 'zzzznoexist99' returned zero rows. Clearing the search restored all 20 build rows without reloading the page.",
+      "evidence": "The build row count went from 20 to 0 to 20. The page's performance.timeOrigin stayed at 1795808591854 from the initial view through restoration. The headless tab was closed.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "S02_clifan",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SPA"
+      },
+      "url": "https://clifan.com/",
+      "elapsed_s": 21.62,
+      "returncode": 0,
+      "status": "completed",
+      "passed": false,
+      "final_url": "https://clifan.com/?view=full",
+      "observed_answer": "All three view switches succeeded. The zero-error check failed with two console errors and two corresponding network failures.",
+      "evidence": "The Cover View button appeared after the first switch, Open Full Workbench reappeared after returning, and Selected Builds appeared after reopening. CORS preflight checks blocked POST requests to /api/event on stats.clifan.com and clifan-umami.vercel.app. The headless tab was closed.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "S03_todomvc",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SPA"
+      },
+      "url": "https://todomvc.com/examples/react/dist/",
+      "elapsed_s": 25.4,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://todomvc.com/examples/react/dist/#/active",
+      "observed_answer": "Only \u201cBeta task\u201d was visible under Active after marking \u201cAlpha task\u201d completed.",
+      "evidence": "The visible todo list contained exactly [\"Beta task\"], and the counter read \u201c1 item left!\u201d.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "S04_react",
+      "kind": "bench",
+      "meta": {
+        "stratum": "SPA"
+      },
+      "url": "https://react.dev/learn",
+      "elapsed_s": 16.66,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://react.dev/learn/thinking-in-react",
+      "observed_answer": "Thinking in React",
+      "evidence": "The sidebar link opened the final URL, where the main H1 read \u201cThinking in React\u201d.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "T01_datatables",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Table"
+      },
+      "url": "https://datatables.net/examples/basic_init/zero_configuration.html",
+      "elapsed_s": 24.22,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://datatables.net/examples/core/basic_init/zero_configuration.html",
+      "observed_answer": "Airi Satou\u2019s office is Tokyo.",
+      "evidence": "The search returned one matching row. After clearing the search, page 2 showed entries 11\u201320 of 57, starting with Charde Marshall. The headless tab was closed.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "T06_iana429",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Table"
+      },
+      "url": "https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml",
+      "elapsed_s": 16.16,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml",
+      "observed_answer": "HTTP 429 \u2014 Too Many Requests. Reference: RFC 6585.",
+      "evidence": "IANA table row: 429 | Too Many Requests | RFC 6585",
+      "stderr_tail": ""
+    },
+    {
+      "id": "T07_pg23505",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Table"
+      },
+      "url": "https://www.postgresql.org/docs/current/errcodes-appendix.html",
+      "elapsed_s": 19.96,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://www.postgresql.org/docs/current/errcodes-appendix.html",
+      "observed_answer": "SQLSTATE 23505 has the Condition Name `unique_violation` under Class 23 \u2014 Integrity Constraint Violation.",
+      "evidence": "Table A.1 lists \u201c23505 | unique_violation\u201d beneath \u201cClass 23 \u2014 Integrity Constraint Violation\u201d.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "T08_closesnow",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Table"
+      },
+      "url": "https://close-snow.clifan.com/",
+      "elapsed_s": 21.47,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://close-snow.clifan.com/?view=compare",
+      "observed_answer": "Alyeska Resort ranked first with 25 inches of forecast snowfall over 7 days. Jackson Hole Mountain Resort ranked second with 23 inches.",
+      "evidence": "The Ikon filter showed 66 resorts. Sorted by 7-Day Snow, the first two rows showed 25 and 23 inches in the 7-Day Total column.",
+      "stderr_tail": ""
+    },
+    {
+      "id": "X06_iframes",
+      "kind": "bench",
+      "meta": {
+        "stratum": "Iframe"
+      },
+      "url": "https://testpages.eviltester.com/styled/iframes-test.html",
+      "elapsed_s": 19.39,
+      "returncode": 0,
+      "status": "completed",
+      "passed": true,
+      "final_url": "https://testpages.eviltester.com/pages/embedded-pages/iframes/",
+      "observed_answer": "The first iframe showed \u201ciFrame\u201d followed by 100 consecutive entries from \u201ciFrame List Item 0\u201d through \u201ciFrame List Item 99\u201d. The second iframe showed \u201cIncrement Number\u201d, \u201cTotal Value:\u201d, \u201c+= Amount:\u201d, and \u201cAdd Amount\u201d.",
+      "evidence": "Read the rendered text directly from both iframe documents in page order and closed the headless tab.",
+      "stderr_tail": ""
+    }
+  ]
+}

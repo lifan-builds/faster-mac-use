@@ -128,10 +128,14 @@ def _same_origin_and_path(u1: str | None, u2: str | None) -> bool:
 def _fnv1a32(text: str) -> str:
     """Compute unsigned 32-bit FNV-1a hex digest matching JS charCodeAt hashes."""
     h = 0x811C9DC5
-    for ch in text:
-        h ^= ord(ch)
+    for (unit,) in struct.iter_unpack("<H", text.encode("utf-16-le", errors="surrogatepass")):
+        h ^= unit
         h = (h * 0x01000193) & 0xFFFFFFFF
     return f"{h:08x}"
+
+
+def _utf16_length(text: str) -> int:
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
 
 
 def _normalize_field_value(text: str) -> str:
@@ -305,12 +309,16 @@ _IFRAME_PROBE_JS = r"""(arg) => {
       return true;
     }
   };
-  let a = document.activeElement;
-  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  const focusedElement = () => {
+    let el = document.activeElement;
+    while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+    return el;
+  };
+  const a = focusedElement();
+  let fallback = null;
   const findFirstEditableDeep = (root) => {
     const sel = "input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='button']):not([type='submit']):not([type='reset']):not([type='file']):not([type='image']), textarea, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
     const list = root.querySelectorAll ? Array.from(root.querySelectorAll(sel)) : [];
-    let fallback = null;
     for (const cand of list) {
       if (isVisibleEditable(cand)) return cand;
       if (!fallback && isEditable(cand)) fallback = cand;
@@ -322,7 +330,7 @@ _IFRAME_PROBE_JS = r"""(arg) => {
         if (inner) return inner;
       }
     }
-    return fallback;
+    return null;
   };
   let frameIndex = -1;
   try {
@@ -334,7 +342,7 @@ _IFRAME_PROBE_JS = r"""(arg) => {
   } catch (_) {}
   const hasFocus = Boolean(document.hasFocus && document.hasFocus());
   const activeIsEditable = isEditable(a);
-  const target = activeIsEditable ? a : findFirstEditableDeep(document);
+  const target = activeIsEditable ? a : (findFirstEditableDeep(document) || fallback);
   if (!target) {
     return { matched: false, frameIndex, hasFocus, activeIsEditable };
   }
@@ -352,8 +360,13 @@ _IFRAME_PROBE_JS = r"""(arg) => {
       curLen: readVal().length
     };
   }
-  if (arg.action === "focus_and_select") {
+  if (arg.action === "focus_and_select" || arg.action === "force_clear") {
     try { target.focus({ preventScroll: true }); } catch (_) { try { target.focus(); } catch (_) {} }
+    if (focusedElement() !== target) {
+      return { matched: true, frameIndex, hasFocus, activeIsEditable: false, curLen: readVal().length };
+    }
+  }
+  if (arg.action === "focus_and_select") {
     try {
       if (typeof target.select === "function") {
         target.select();
@@ -368,12 +381,11 @@ _IFRAME_PROBE_JS = r"""(arg) => {
       matched: true,
       frameIndex,
       hasFocus: Boolean(document.hasFocus && document.hasFocus()),
-      activeIsEditable: isEditable(target),
+      activeIsEditable: focusedElement() === target,
       curLen: readVal().length
     };
   }
   if (arg.action === "force_clear") {
-    try { target.focus({ preventScroll: true }); } catch (_) {}
     const tag = (target.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea") {
       const proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
@@ -391,7 +403,7 @@ _IFRAME_PROBE_JS = r"""(arg) => {
       matched: true,
       frameIndex,
       hasFocus: Boolean(document.hasFocus && document.hasFocus()),
-      activeIsEditable: isEditable(target),
+      activeIsEditable: focusedElement() === target,
       curLen: readVal().length
     };
   }
@@ -407,7 +419,7 @@ _IFRAME_PROBE_JS = r"""(arg) => {
   };
   const exactMatch = fnv(actual) === arg.expectedHash && actual.length === arg.expectedLen;
   const normMatch = fnv(normActual) === arg.expectedNormHash && normActual.length === arg.expectedNormLen;
-  const bulletMasked = normActual.length > 0 && /^[•*]+$/.test(normActual) && arg.expectedNormLen >= 8 && normActual.length === arg.expectedNormLen;
+  const bulletMasked = normActual.length > 0 && /^[•*]+$/.test(normActual) && normActual.length === arg.expectedNormLen;
   return {
     matched: true,
     frameIndex,
@@ -415,7 +427,8 @@ _IFRAME_PROBE_JS = r"""(arg) => {
     activeIsEditable,
     curLen: actual.length,
     actualNormLen: normActual.length,
-    verified: Boolean(exactMatch || normMatch || bulletMasked)
+    masked_unverifiable: bulletMasked,
+    verified: !bulletMasked && (exactMatch || normMatch)
   };
 }"""
 
@@ -6423,9 +6436,9 @@ class BrowserEngine:
         arg = {
             "action": action,
             "expectedHash": _fnv1a32(value),
-            "expectedLen": len(value),
+            "expectedLen": _utf16_length(value),
             "expectedNormHash": _fnv1a32(exp_norm),
-            "expectedNormLen": len(exp_norm),
+            "expectedNormLen": _utf16_length(exp_norm),
         }
         if target_frame is not None:
             try:
@@ -6488,6 +6501,13 @@ class BrowserEngine:
                 best_frame = f
         return best_res, best_frame
 
+    def _focus_cdp_iframe_field(
+        self, sess: BrowserTabSession, spec: dict[str, Any], action: str, target_frame: Any
+    ) -> None:
+        result, _ = self._probe_playwright_iframe(sess, spec, action, target_frame=target_frame)
+        if result.get("matched") and not result["activeIsEditable"]:
+            raise RuntimeError("cross-origin iframe field did not receive focus")
+
     def _clear_cdp_focused_input(
         self,
         sess: BrowserTabSession,
@@ -6502,12 +6522,12 @@ class BrowserEngine:
         time.sleep(0.02)
         st, _ = self._probe_playwright_iframe(sess, spec, "verify", "", target_frame=target_frame)
         if st.get("matched") and int(st.get("curLen") or 0) > 0:
-            self._probe_playwright_iframe(sess, spec, "focus_and_select", target_frame=target_frame)
+            self._focus_cdp_iframe_field(sess, spec, "focus_and_select", target_frame)
             self._dispatch_cdp_key(sess, "Backspace")
             time.sleep(0.015)
             st2, _ = self._probe_playwright_iframe(sess, spec, "verify", "", target_frame=target_frame)
             if st2.get("matched") and int(st2.get("curLen") or 0) > 0:
-                self._probe_playwright_iframe(sess, spec, "force_clear", target_frame=target_frame)
+                self._focus_cdp_iframe_field(sess, spec, "force_clear", target_frame)
 
     def _dispatch_cdp_input(self, sess: BrowserTabSession, spec: dict[str, Any]) -> None:
         kind = str(spec.get("kind") or "fill")
@@ -6527,26 +6547,28 @@ class BrowserEngine:
         self._dispatch_cdp_mouse_click(sess, x, y)
         time.sleep(0.03)
         _probe_res, pinned_frame = self._probe_playwright_iframe(sess, spec, "probe")
-        self._probe_playwright_iframe(sess, spec, "focus_and_select", target_frame=pinned_frame)
+        self._focus_cdp_iframe_field(sess, spec, "focus_and_select", pinned_frame)
         if clear:
             self._clear_cdp_focused_input(sess, spec, target_frame=pinned_frame)
         if value:
             sess._raw_cdp.send("Input.insertText", {"text": value})
             time.sleep(0.025)
         verify_res, _ = self._probe_playwright_iframe(sess, spec, "verify", value, target_frame=pinned_frame)
-        if verify_res.get("matched") and not verify_res.get("verified"):
-            self._probe_playwright_iframe(sess, spec, "focus_and_select", target_frame=pinned_frame)
+        if verify_res.get("matched") and not verify_res.get("verified") and not verify_res.get("masked_unverifiable"):
+            self._focus_cdp_iframe_field(sess, spec, "focus_and_select", pinned_frame)
             self._clear_cdp_focused_input(sess, spec, target_frame=pinned_frame)
             if value:
                 self._dispatch_cdp_text_keys(sess, value)
                 time.sleep(0.025)
             verify_res, _ = self._probe_playwright_iframe(sess, spec, "verify", value, target_frame=pinned_frame)
-            if verify_res.get("matched") and not verify_res.get("verified"):
-                exp_len = len(_normalize_field_value(value))
-                act_len = int(verify_res.get("actualNormLen") or 0)
-                raise RuntimeError(
-                    f"cross-origin iframe verification failed for {uid} (expected_len={exp_len}, actual_len={act_len})"
-                )
+        if verify_res.get("masked_unverifiable"):
+            raise RuntimeError(f"cross-origin iframe verification failed for {uid} (masked_unverifiable)")
+        if verify_res.get("matched") and not verify_res.get("verified"):
+            exp_len = _utf16_length(_normalize_field_value(value))
+            act_len = int(verify_res.get("actualNormLen") or 0)
+            raise RuntimeError(
+                f"cross-origin iframe verification failed for {uid} (expected_len={exp_len}, actual_len={act_len})"
+            )
 
     def _eval_batch_handling_navigation(
         self,

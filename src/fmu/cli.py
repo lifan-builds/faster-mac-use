@@ -166,7 +166,12 @@ def execute_via_daemon(
                     for _ in range(80):
                         if can_connect_runtime_daemon(socket_path):
                             break
+                        exit_code = proc.poll()
+                        if exit_code is not None:
+                            raise RuntimeError(f"DAEMON_START_EXITED: fmu daemon exited with code {exit_code} before readiness")
                         time.sleep(0.015)
+                    else:
+                        raise TimeoutError("DAEMON_START_TIMEOUT: fmu daemon did not become ready")
                     from fmu.telemetry import record_perf_event
 
                     record_perf_event(

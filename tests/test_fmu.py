@@ -3870,6 +3870,63 @@ setInterval(() => {{}}, 1000);
             if node_proc.stderr:
                 node_proc.stderr.close()
 
+    def test_iframe_shadow_discovery_focus_and_utf16_verification(self) -> None:
+        engine = self.rt.browser
+        session = engine.create_tab(mode="headless")
+
+        def check_probe() -> None:
+            page = session._raw_page
+            page.set_content("""<div id="first"></div><div id="second"></div><script>
+                first.attachShadow({mode: "open"}).innerHTML = '<input style="display:none" value="decoy">';
+                second.attachShadow({mode: "open"}).innerHTML = '<input value="A😀B">';
+            </script>""")
+
+            def probe(action, value=""):
+                result, _ = engine._probe_playwright_iframe(
+                    session, {}, action, value, target_frame=page.main_frame
+                )
+                return result
+
+            self.assertTrue(probe("focus_and_select")["activeIsEditable"])
+            self.assertTrue(page.evaluate("second.shadowRoot.activeElement === second.shadowRoot.firstChild"))
+            exact = probe("verify", "A😀B")
+            self.assertEqual(exact["curLen"], 4)
+            self.assertTrue(exact["verified"])
+            self.assertFalse(probe("verify", "A😁B")["verified"])
+            self.assertTrue(probe("verify", "A-😀B")["verified"])
+
+            page.evaluate("second.shadowRoot.firstChild.value = '••••••••'")
+            for expected in ("12345678", "••••••••"):
+                masked = probe("verify", expected)
+                self.assertFalse(masked["verified"])
+                self.assertTrue(masked["masked_unverifiable"])
+
+            page.evaluate("second.remove()")
+            self.assertFalse(probe("focus_and_select")["activeIsEditable"])
+            self.assertFalse(probe("force_clear")["activeIsEditable"])
+            self.assertEqual(page.evaluate("first.shadowRoot.firstChild.value"), "decoy")
+
+        engine._run_sync(check_probe)
+
+    def test_cold_daemon_early_exit_and_readiness_timeout(self) -> None:
+        from fmu import cli
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(cli.subprocess, "Popen") as spawn,
+            mock.patch.object(cli.time, "sleep") as sleep,
+        ):
+            socket_path = str(Path(tmp) / "runtime.sock")
+            spawn.return_value.poll.return_value = 17
+            with self.assertRaisesRegex(RuntimeError, "DAEMON_START_EXITED.*code 17"):
+                cli.execute_via_daemon({"listTabs": True}, ROOT / "bin/fmu", socket_path)
+            sleep.assert_not_called()
+
+            spawn.return_value.poll.return_value = None
+            with self.assertRaisesRegex(TimeoutError, "DAEMON_START_TIMEOUT"):
+                cli.execute_via_daemon({"listTabs": True}, ROOT / "bin/fmu", socket_path)
+            self.assertEqual(sleep.call_count, 80)
+
     def test_35_cross_origin_iframe_cdp_fill_key_and_sensitive_redaction(self) -> None:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading

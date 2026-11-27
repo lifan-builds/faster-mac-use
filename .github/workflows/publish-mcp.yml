@@ -1,0 +1,51 @@
+name: publish-mcp
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify mcp-publisher
+        run: |
+          set -euo pipefail
+          archive="mcp-publisher_linux_amd64.tar.gz"
+          base_url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          ver="${MCP_PUBLISHER_VERSION#v}"
+          checksums="registry_${ver}_checksums.txt"
+          curl --fail --location --silent --show-error -O "${base_url}/${archive}"
+          curl --fail --location --silent --show-error -O "${base_url}/${checksums}"
+          grep -E "[[:space:]]${archive}$" "${checksums}" | sha256sum --check
+          tar -xzf "${archive}"
+
+      - name: Login to Official MCP Registry via GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Wait for PyPI release availability
+        run: |
+          set -euo pipefail
+          ver=$(python3 -c 'import json; print(json.load(open("server.json"))["version"])')
+          for _ in $(seq 1 24); do
+            if curl --fail --silent --head "https://pypi.org/pypi/faster-mac-use/${ver}/json" >/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for faster-mac-use==${ver} on PyPI" >&2
+          exit 1
+
+      - name: Publish server.json to Official MCP Registry
+        run: ./mcp-publisher publish

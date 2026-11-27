@@ -28,6 +28,32 @@ USER_STOPPED_ERROR = (
     "(Click Resume on the fmu menu bar item or run 'fmu --resume' to re-enable.)"
 )
 
+_STANDALONE_STOP_CONTROL_RE = re.compile(
+    r"^\s*(?:return\s+)?(?:await\s+)?cua\.(resume|getStatus|get_status|stop)\s*\(\s*\)\s*;?\s*$"
+)
+_ACTION_PAYLOAD_KEYS = ("steps", "parallel", "app", "url")
+
+
+def is_standalone_stop_control_code(code: str, *, allow_stop: bool = False) -> bool:
+    if not isinstance(code, str) or not code.strip():
+        return False
+    m = _STANDALONE_STOP_CONTROL_RE.fullmatch(code)
+    if not m:
+        return False
+    op = m.group(1)
+    if op == "stop" and not allow_stop:
+        return False
+    return True
+
+
+def is_standalone_stop_control_request(req: dict[str, Any]) -> bool:
+    if not isinstance(req, dict):
+        return False
+    if any(req.get(k) for k in _ACTION_PAYLOAD_KEYS):
+        return False
+    code = req.get("code")
+    return isinstance(code, str) and is_standalone_stop_control_code(code)
+
 
 def get_stop_file() -> Path:
     return Path(os.environ.get("FMU_STOP_FILE", DEFAULT_STOP_FILE))

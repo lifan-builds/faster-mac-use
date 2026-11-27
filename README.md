@@ -131,7 +131,25 @@ uv tool install faster-mac-use      # or: pip install faster-mac-use
 # Homebrew:    brew install --Formula ./Formula/faster-mac-use.rb
 ```
 
-Once installed globally, you can run `fmu setup --antigravity --use-installed-bin` or invoke `fmu` directly from the shell:
+Once installed globally, you can run `fmu setup --antigravity --use-installed-bin` or invoke `fmu` directly from the shell.
+
+### Load the bundled Chrome MV3 extension (for logged-in Chrome tabs)
+
+Headless mode (`"headless"`) works out of the box with no extension. To drive your logged-in Chrome tabs (`"chrome"`) without Chrome 144 `DevToolsActivePort` prompts, load the bundled unpacked MV3 extension once:
+
+1. Locate the bundled extension directory:
+   ```bash
+   # From a pip or editable install:
+   python3 -c "import fmu.extension; print(list(fmu.extension.__path__)[0])"
+   # From a `uv tool install faster-mac-use` install:
+   "$(head -n1 "$(command -v fmu)" | sed 's/^#!//')" -c "import fmu.extension; print(list(fmu.extension.__path__)[0])"
+   # From a git checkout: use ./extension directly
+   ```
+2. Open `chrome://extensions` in Chrome and toggle **Developer mode** on (top right).
+3. Click **Load unpacked** and select that `extension` directory (containing `manifest.json` and `background.js`).
+4. (Optional, for local `file://` upload workflows) Click **Details** on *Faster Mac Use — Agent Bridge* and enable **Allow access to file URLs**.
+
+Now you can run logged-in Chrome, headless, and macOS AX commands directly:
 
 ```bash
 # Stateful cua REPL: open a tab, record a reusable WebMCP macro, and close agent-opened tabs when done

@@ -561,9 +561,10 @@ class TestFasterMacUse(unittest.TestCase):
         self.assertEqual(help_proc.returncode, 0)
         self.assertIn("Usage:", help_proc.stdout)
 
+        from fmu import __version__ as fmu_version
         ver_proc = subprocess.run([fmu_bin, "--version"], capture_output=True, text=True, check=False)
         self.assertEqual(ver_proc.returncode, 0)
-        self.assertIn("faster-mac-use 0.5.7", ver_proc.stdout)
+        self.assertIn(f"faster-mac-use {fmu_version}", ver_proc.stdout)
         self.assertIn("Based on Faster Mac Use by lifan-builds (https://github.com/lifan-builds/faster-mac-use)", ver_proc.stdout)
 
         bad_proc = subprocess.run([fmu_bin, "not-valid-json"], capture_output=True, text=True, check=False)
@@ -5746,6 +5747,479 @@ setInterval(() => {{}}, 1000);
             self.assertTrue((fake_home / ".codex" / "skills" / "browser-routing" / "SKILL.md").is_file())
             mcp_cfg = json.loads((plugin_dir / "mcp_config.json").read_text(encoding="utf-8"))
             self.assertEqual(mcp_cfg["mcpServers"]["faster-mac-use"]["command"], "uvx")
+
+    def test_cli_ux_audit_extension_bundling_and_flags(self) -> None:
+        import tomllib
+
+        fmu_bin = str(ROOT / "bin" / "fmu")
+
+        # 1. pyproject.toml bundles extension/ in Python package data & README documents Load unpacked
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        st = pyproject["tool"]["setuptools"]
+        self.assertIn("fmu.extension", st["packages"])
+        self.assertEqual(st["package-dir"]["fmu.extension"], "extension")
+        ext_data = st["package-data"]["fmu.extension"]
+        self.assertIn("manifest.json", ext_data)
+        self.assertIn("background.js", ext_data)
+        self.assertIn("content.js", ext_data)
+        self.assertTrue((ROOT / "extension" / "manifest.json").is_file())
+        self.assertTrue((ROOT / "extension" / "background.js").is_file())
+
+        readme_text = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("chrome://extensions", readme_text)
+        self.assertIn("Load unpacked", readme_text)
+        self.assertIn("fmu.extension", readme_text)
+
+        # 2. Top-level --help synopsis includes --cursor
+        help_proc = subprocess.run([fmu_bin, "--help"], capture_output=True, text=True, check=False)
+        self.assertEqual(help_proc.returncode, 0)
+        self.assertIn("--cursor", help_proc.stdout)
+
+        # 3. --live-view invalid/missing values report clear error (not JSON parse error) with exit 2
+        for bad_args, expected_token in [
+            (["--live-view", "--help"], "--help"),
+            (["--live-view", "maybe"], "maybe"),
+            (["--live-view"], "requires a value"),
+        ]:
+            proc = subprocess.run([fmu_bin, *bad_args], capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 2, f"args={bad_args} stdout={proc.stdout} stderr={proc.stderr}")
+            self.assertNotIn("Invalid JSON", proc.stderr)
+            self.assertIn(expected_token, proc.stderr)
+            self.assertIn("on", proc.stderr)
+            self.assertIn("off", proc.stderr)
+
+        # 4. fmu replay --help / -h shows replay synopsis and exits 0
+        for flag in ("--help", "-h"):
+            rep_help = subprocess.run([fmu_bin, "replay", flag], capture_output=True, text=True, check=False)
+            self.assertEqual(rep_help.returncode, 0, rep_help.stderr)
+            self.assertIn("Usage: fmu replay <trace.jsonl>", rep_help.stdout)
+            self.assertEqual(rep_help.stderr, "")
+
+        # 5. fmu setup --dry-run uses --home path and does not claim plugin is ready
+        with tempfile.TemporaryDirectory() as tmp:
+            dry_proc = subprocess.run(
+                [fmu_bin, "setup", "--antigravity", "--home", tmp, "--dry-run"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(dry_proc.returncode, 0, dry_proc.stderr)
+            self.assertIn("Would install Antigravity plugin", dry_proc.stdout)
+            self.assertIn(str(Path(tmp).resolve()), dry_proc.stdout)
+            self.assertNotIn("plugin ready (~/", dry_proc.stdout)
+
+    def test_stop_gate_blocks_substring_and_mixed_payload_bypasses(self) -> None:
+        from fmu import cli
+        from fmu.mac_engine import USER_STOPPED_ERROR, is_standalone_stop_control_code
+
+        self.assertTrue(is_standalone_stop_control_code("cua.resume()"))
+        self.assertTrue(is_standalone_stop_control_code("return await cua.resume();"))
+        self.assertTrue(is_standalone_stop_control_code("return await cua.getStatus();"))
+        self.assertFalse(is_standalone_stop_control_code("# cua.resume()\n1 + 1"))
+        self.assertFalse(is_standalone_stop_control_code("x = 'cua.getStatus'; 1 + 1"))
+        self.assertFalse(is_standalone_stop_control_code("cua.getStatus(); 1 + 1"))
+        self.assertFalse(is_standalone_stop_control_code("cua.resume(); 1 + 1"))
+        self.assertFalse(is_standalone_stop_control_code("cua.resume(1 + 1)"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stop_file = Path(tmp) / "stop.json"
+            stop_file.write_text('{"stopped": true}', encoding="utf-8")
+            with mock.patch.dict(os.environ, {"FMU_STOP_FILE": str(stop_file)}):
+                bypass_payloads = [
+                    {"code": "# cua.resume()\n1 + 1"},
+                    {"code": "x = 'cua.getStatus'; 1 + 1"},
+                    {"code": "cua.getStatus(); 1 + 1"},
+                    {"code": "cua.resume(); 1 + 1"},
+                    {"code": "cua.resume(cua.getApp('Calculator'))"},
+                    {"resume": True, "code": "1 + 1"},
+                    {"code": "cua.resume()", "steps": [{"op": "wait", "ms": 10}]},
+                    {"statusBar": True, "code": "1 + 1"},
+                ]
+                for payload in bypass_payloads:
+                    out_cli = cli.execute_via_daemon(payload, ROOT / "bin" / "fmu", socket_path=str(Path(tmp) / "missing.sock"))
+                    self.assertEqual(out_cli, USER_STOPPED_ERROR, f"cli bypass succeeded for {payload}: {out_cli}")
+
+                rt = FasterMacUseRuntime()
+                rt._is_mcp_stdio = False
+                try:
+                    for payload in bypass_payloads:
+                        if payload.get("statusBar"):
+                            continue
+                        out_rt = rt.execute(payload)
+                        self.assertEqual(out_rt, USER_STOPPED_ERROR, f"runtime bypass succeeded for {payload}: {out_rt}")
+                    # Standalone control code still succeeds while stopped
+                    self.assertIn("stopped=false", rt.execute({"code": "return await cua.resume();"}))
+                    self.assertFalse(stop_file.exists())
+                finally:
+                    rt.shutdown()
+
+    def test_mv3_iframe_probe_only_text_nav_fence_screencast_serialization_and_tab_cleanup(self) -> None:
+        bg_js = (ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        bg_js_unit = bg_js.replace("connectRelay();", "// connectRelay disabled for unit harness")
+        harness = r"""
+const events = {
+  scriptCalls: [],
+  focusCalls: [],
+  selectCalls: [],
+  keyEvents: [],
+  screencastCmds: [],
+  wsSent: []
+};
+const listeners = { onRemoved: [], onUpdated: [], onDetach: [], onEvent: [], onCreated: [] };
+let deferredAttach = {};
+
+globalThis.WebSocket = { OPEN: 1, CONNECTING: 0 };
+globalThis.chrome = {
+  storage: { local: { get: async () => ({}), set: async () => {} } },
+  tabs: {
+    query: async () => [],
+    get: async (id) => ({ id, windowId: 1, groupId: -1, discarded: false, status: "complete", url: "https://example.com/" }),
+    onCreated: { addListener: (fn) => listeners.onCreated.push(fn) },
+    onUpdated: { addListener: (fn) => listeners.onUpdated.push(fn) },
+    onRemoved: { addListener: (fn) => listeners.onRemoved.push(fn) }
+  },
+  tabGroups: { get: async () => ({}), query: async () => [], update: async () => ({}) },
+  windows: { getAll: async () => [{ id: 1, focused: false }] },
+  debugger: {
+    attach: async ({ tabId }) => {
+      if (deferredAttach[tabId]) {
+        await deferredAttach[tabId].promise;
+      }
+      return {};
+    },
+    detach: async () => ({}),
+    sendCommand: async ({ tabId }, method, params) => {
+      if (method === "Input.dispatchKeyEvent" || method === "Input.insertText") {
+        events.keyEvents.push({ tabId, method, type: params.type || "", key: params.key || params.text || "" });
+        if (globalThis.__navAfterFirstKey && method === "Input.dispatchKeyEvent" && params.type === "keyUp") {
+          globalThis.__navAfterFirstKey = false;
+          for (const fn of listeners.onUpdated) fn(tabId, { status: "loading", url: "https://other.example/next" });
+        }
+        return {};
+      }
+      if (method === "Page.startScreencast" || method === "Page.stopScreencast" || method === "Page.screencastFrameAck") {
+        events.screencastCmds.push({ tabId, method, params });
+        if (method === "Page.startScreencast" && globalThis.__deferStartScreencast && globalThis.__deferStartScreencast[tabId]) {
+          await globalThis.__deferStartScreencast[tabId].promise;
+        }
+        return {};
+      }
+      return {};
+    },
+    onDetach: { addListener: (fn) => listeners.onDetach.push(fn) },
+    onEvent: { addListener: (fn) => listeners.onEvent.push(fn) }
+  },
+  scripting: {
+    executeScript: async ({ target, args, func }) => {
+      const arg = args[0];
+      events.scriptCalls.push({ target, action: arg.action });
+      const frames = globalThis.__mockFrames || [];
+      let selected = frames;
+      if (target && Array.isArray(target.documentIds)) {
+        selected = frames.filter(f => target.documentIds.includes(f.documentId));
+      } else if (target && Array.isArray(target.frameIds)) {
+        selected = frames.filter(f => target.frameIds.includes(f.frameId));
+      }
+      const results = [];
+      for (const f of selected) {
+        const el = {
+          tagName: "INPUT",
+          type: "text",
+          disabled: false,
+          readOnly: false,
+          isConnected: true,
+          value: f.value || "",
+          isContentEditable: false,
+          getAttribute: () => null,
+          getBoundingClientRect: () => ({ width: 120, height: 24 }),
+          focus: () => { events.focusCalls.push({ frameId: f.frameId, documentId: f.documentId, action: arg.action }); docObj.activeElement = el; },
+          select: () => { events.selectCalls.push({ frameId: f.frameId, documentId: f.documentId, action: arg.action }); },
+          dispatchEvent: () => true
+        };
+        const winObj = {
+          location: { href: f.href },
+          name: f.name || "",
+          getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+          HTMLInputElement: { prototype: {} },
+          HTMLTextAreaElement: { prototype: {} }
+        };
+        const topObj = { length: f.nested ? 0 : Math.max(0, (f.frameIndex ?? -1) + 1) };
+        if (!f.nested && f.frameIndex >= 0) topObj[f.frameIndex] = winObj;
+        winObj.top = topObj;
+        winObj.parent = f.nested ? { nestedParent: true } : topObj;
+        const docObj = {
+          activeElement: f.hasFocus ? el : null,
+          hasFocus: () => Boolean(f.hasFocus),
+          querySelectorAll: () => [el]
+        };
+        const prevWin = globalThis.window, prevDoc = globalThis.document, prevLoc = globalThis.location;
+        globalThis.window = winObj; globalThis.document = docObj; globalThis.location = winObj.location;
+        let out = null;
+        try { out = func(arg); } finally { globalThis.window = prevWin; globalThis.document = prevDoc; globalThis.location = prevLoc; }
+        results.push({ frameId: f.frameId, documentId: f.documentId, result: out });
+      }
+      return results;
+    }
+  },
+  alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
+  runtime: { onInstalled: { addListener: () => {} }, onStartup: { addListener: () => {} } }
+};
+"""
+        runner = r"""
+async function runScenario() {
+  const out = {};
+
+  // 1a. probeAndPrepIframeInTab allFrames pass is probe-only, then targets winner documentId only
+  globalThis.__mockFrames = [
+    { frameId: 10, documentId: "doc-10", href: "https://pay.example/card", name: "", frameIndex: 0, hasFocus: true },
+    { frameId: 11, documentId: "doc-11", href: "https://pay.example/card", name: "", frameIndex: 1, hasFocus: false }
+  ];
+  const focusRes = await probeAndPrepIframeInTab(1, {
+    action: "focus_and_select", frameSrc: "https://pay.example/card", frameIndex: 1
+  });
+  out.probe_then_doc_id = {
+    matched: focusRes.matched,
+    documentId: focusRes.documentId,
+    scriptCalls: events.scriptCalls.slice(),
+    focusCalls: events.focusCalls.slice(),
+    selectCalls: events.selectCalls.slice()
+  };
+
+  // 1b. Ambiguous duplicate nested frames: zero focus/select mutations
+  events.scriptCalls.length = 0; events.focusCalls.length = 0; events.selectCalls.length = 0;
+  globalThis.__mockFrames = [
+    { frameId: 20, documentId: "doc-20", href: "https://pay.example/otp", name: "otp", frameIndex: -1, nested: true, hasFocus: false },
+    { frameId: 21, documentId: "doc-21", href: "https://pay.example/otp", name: "otp", frameIndex: -1, nested: true, hasFocus: false }
+  ];
+  const ambigRes = await probeAndPrepIframeInTab(1, {
+    action: "focus_and_select", frameSrc: "https://pay.example/otp", frameName: "otp", frameIndex: -1
+  });
+  out.ambiguous = {
+    res: ambigRes,
+    scriptCalls: events.scriptCalls.slice(),
+    focusCalls: events.focusCalls.slice()
+  };
+
+  // 2. dispatchCdpTextKeys aborts on navigation generation bump after first char
+  events.keyEvents.length = 0;
+  globalThis.__navAfterFirstKey = true;
+  let navErr = null;
+  try {
+    await dispatchCdpTextKeys(42, "secret");
+  } catch (e) {
+    navErr = { message: e.message, code: e.code, sentChars: e.sentChars, totalChars: e.totalChars };
+  }
+  out.nav_text_abort = { err: navErr, keyEvents: events.keyEvents.slice() };
+
+  // 3a. startLiveScreencast reverse-order resolution: winner tab 202 streams, stale tab 201 does not
+  const mkDeferred = () => { let res; const promise = new Promise(r => { res = r; }); return { promise, resolve: res }; };
+  deferredAttach = { 201: mkDeferred(), 202: mkDeferred() };
+  events.screencastCmds.length = 0;
+  const pA = startLiveScreencast(201);
+  const pB = startLiveScreencast(202);
+  deferredAttach[202].resolve();
+  await pB;
+  deferredAttach[201].resolve();
+  await pA;
+  out.screencast_reverse = {
+    activeTab: activeScreencastTabId,
+    cmds: events.screencastCmds.slice()
+  };
+
+  // 3b. Wrong-tab Page.screencastFrame is acked but NOT forwarded to ws
+  ws = { readyState: 1, send: (data) => events.wsSent.push(JSON.parse(data)) };
+  events.screencastCmds.length = 0;
+  events.wsSent.length = 0;
+  lastScreencastPushAt = 0;
+  for (const fn of listeners.onEvent) {
+    fn({ tabId: 201 }, "Page.screencastFrame", { sessionId: 7, data: "WRONG_TAB_JPEG", metadata: { deviceWidth: 100, deviceHeight: 100 } });
+    fn({ tabId: 202 }, "Page.screencastFrame", { sessionId: 8, data: "RIGHT_TAB_JPEG", metadata: { deviceWidth: 100, deviceHeight: 100 } });
+  }
+  out.screencast_filter = {
+    acks: events.screencastCmds.slice(),
+    wsSent: events.wsSent.slice()
+  };
+
+  // 3c. stopLiveScreencast called while Page.startScreencast is in flight stops the cast cleanly
+  deferredAttach = {};
+  globalThis.__deferStartScreencast = { 203: mkDeferred() };
+  events.screencastCmds.length = 0;
+  const pC = startLiveScreencast(203);
+  await new Promise(r => setTimeout(r, 10));
+  const pStop = stopLiveScreencast(203);
+  globalThis.__deferStartScreencast[203].resolve();
+  await Promise.all([pC, pStop]);
+  out.screencast_stop_inflight = {
+    activeTab: activeScreencastTabId,
+    cmds: events.screencastCmds.slice()
+  };
+
+  // 4. tabs.onRemoved purges sessionTabs, pendingNetRequests, and activeScreencastTabId
+  sessionTabs.set("sess-a", 901);
+  sessionTabs.set("sess-b", 902);
+  pendingNetRequests.set("901:r1", { method: "GET", url: "https://a.test", type: "Fetch" });
+  pendingNetRequests.set("902:r1", { method: "GET", url: "https://b.test", type: "Fetch" });
+  activeScreencastTabId = 901;
+  desiredScreencastTabId = 901;
+  for (const fn of listeners.onRemoved) await fn(901);
+  await screencastTransitionChain;
+  out.tab_removed_purge = {
+    hasSessA: sessionTabs.has("sess-a"),
+    hasSessB: sessionTabs.has("sess-b"),
+    hasNet901: pendingNetRequests.has("901:r1"),
+    hasNet902: pendingNetRequests.has("902:r1"),
+    activeScreencastTabId
+  };
+
+  return out;
+}
+runScenario().then(res => {
+  process.stdout.write(JSON.stringify(res));
+  process.exit(0);
+}).catch(err => {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+        proc = subprocess.run(
+            ["node", "-e", harness + "\n" + bg_js_unit + "\n" + runner],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, f"Node harness failed:\nSTDERR:\n{proc.stderr}\nSTDOUT:\n{proc.stdout}")
+        res = json.loads(proc.stdout)
+
+        # 1a assertions: allFrames pass was probe-only; second call targeted doc-11 only; only doc-11 focused/selected
+        p1 = res["probe_then_doc_id"]
+        self.assertTrue(p1["matched"])
+        self.assertEqual(p1["documentId"], "doc-11")
+        self.assertEqual(len(p1["scriptCalls"]), 2)
+        self.assertEqual(p1["scriptCalls"][0]["target"], {"tabId": 1, "allFrames": True})
+        self.assertEqual(p1["scriptCalls"][0]["action"], "probe")
+        self.assertEqual(p1["scriptCalls"][1]["target"], {"tabId": 1, "documentIds": ["doc-11"]})
+        self.assertEqual(p1["scriptCalls"][1]["action"], "focus_and_select")
+        self.assertEqual(p1["focusCalls"], [{"frameId": 11, "documentId": "doc-11", "action": "focus_and_select"}])
+        self.assertEqual(p1["selectCalls"], [{"frameId": 11, "documentId": "doc-11", "action": "focus_and_select"}])
+
+        # 1b assertions: ambiguity makes zero focus calls and runs only probe
+        amb = res["ambiguous"]
+        self.assertFalse(amb["res"]["matched"])
+        self.assertTrue(amb["res"]["ambiguous"])
+        self.assertEqual(amb["focusCalls"], [])
+        self.assertEqual(len(amb["scriptCalls"]), 1)
+        self.assertEqual(amb["scriptCalls"][0]["action"], "probe")
+
+        # 2 assertions: typing aborted after char 1 ('s'), never typed 'e'..'t'
+        nav_ab = res["nav_text_abort"]
+        self.assertIsNotNone(nav_ab["err"])
+        self.assertEqual(nav_ab["err"]["code"], "TARGET_CHANGED")
+        self.assertEqual(nav_ab["err"]["sentChars"], 1)
+        self.assertEqual([e["key"] for e in nav_ab["keyEvents"]], ["s", "s"])
+
+        # 3a assertions: reverse-order screencast resolution starts only winner 202
+        sc_rev = res["screencast_reverse"]
+        self.assertEqual(sc_rev["activeTab"], 202)
+        started_tabs = [c["tabId"] for c in sc_rev["cmds"] if c["method"] == "Page.startScreencast"]
+        self.assertEqual(started_tabs, [202])
+
+        # 3b assertions: wrong-tab frame ACKed but dropped; right-tab frame forwarded
+        sc_f = res["screencast_filter"]
+        self.assertEqual([c["tabId"] for c in sc_f["acks"] if c["method"] == "Page.screencastFrameAck"], [201, 202])
+        self.assertEqual(len(sc_f["wsSent"]), 1)
+        self.assertEqual(sc_f["wsSent"][0]["tabId"], 202)
+        self.assertEqual(sc_f["wsSent"][0]["data"], "RIGHT_TAB_JPEG")
+
+        # 3c assertions: stop during in-flight start cleanly stops cast and clears activeScreencastTabId
+        sc_stop = res["screencast_stop_inflight"]
+        self.assertIsNone(sc_stop["activeTab"])
+        self.assertIn(
+            {"tabId": 203, "method": "Page.stopScreencast", "params": {}},
+            sc_stop["cmds"],
+        )
+
+        # 4 assertions: tabs.onRemoved purges sessionTabs, pendingNetRequests, and screencast ownership
+        purge = res["tab_removed_purge"]
+        self.assertFalse(purge["hasSessA"])
+        self.assertTrue(purge["hasSessB"])
+        self.assertFalse(purge["hasNet901"])
+        self.assertTrue(purge["hasNet902"])
+        self.assertIsNone(purge["activeScreencastTabId"])
+
+    def test_layout_audit_closed_details_and_configured_viewport_width(self) -> None:
+        rt = FasterMacUseRuntime()
+        rt._is_mcp_stdio = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="fmu-layout-reg-") as tmp_dir:
+                details_html = Path(tmp_dir) / "details.html"
+                details_html.write_text(
+                    """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                      body { margin: 0; font-family: sans-serif; padding: 12px; }
+                      .hidden-row { display: flex; }
+                      .hidden-b { margin-left: -40px; }
+                      .hidden-inp { font-size: 12px; }
+                    </style></head><body>
+                      <details id="d1">
+                        <summary>More filters</summary>
+                        <div class="hidden-row">
+                          <button type="button" class="hidden-a">Filter One</button>
+                          <button type="button" class="hidden-b">Filter Two</button>
+                          <input type="text" class="hidden-inp" aria-label="Hidden Filter" />
+                        </div>
+                      </details>
+                    </body></html>""",
+                    encoding="utf-8",
+                )
+                no_vp_html = Path(tmp_dir) / "no_viewport.html"
+                no_vp_html.write_text(
+                    """<!doctype html><html><head><meta charset="utf-8">
+                    <style>
+                      body { margin: 0; font-family: sans-serif; }
+                      .desk { width: 980px; height: 40px; background: #eee; }
+                    </style></head><body>
+                      <div class="desk"><button type="button">Desktop Action</button></div>
+                    </body></html>""",
+                    encoding="utf-8",
+                )
+
+                # 1. Closed <details> non-summary descendants are ignored; opening <details> exposes real issues
+                out_details = rt.execute(
+                    {
+                        "code": (
+                            f'const tab = await cua.createBrowserTab("headless", "{details_html.resolve().as_uri()}");\n'
+                            "const closedAudit = await tab.layoutAudit([375, 1280]);\n"
+                            "const snapClosed = await tab.snapshot({ full: true });\n"
+                            "await tab.eval('document.getElementById(\"d1\").open = true');\n"
+                            "const openAudit = await tab.layoutAudit([375]);\n"
+                            "return JSON.stringify({ closedAudit, hasSummary: snapClosed.includes('More filters'), hasHiddenBtn: snapClosed.includes('Filter One'), openAudit });"
+                        )
+                    }
+                )
+                d_rep = json.loads(out_details.splitlines()[-1])
+                self.assertTrue(d_rep["closedAudit"]["clean"], f"Closed <details> leaked issues: {d_rep['closedAudit']}")
+                self.assertTrue(d_rep["hasSummary"])
+                self.assertFalse(d_rep["hasHiddenBtn"])
+                open_issues = "\n".join(d_rep["openAudit"]["widths"]["375"])
+                self.assertIn("overlap(", open_issues)
+                self.assertIn("ios_input_zoom(", open_issues)
+
+                # 2. Document without viewport meta (layoutW=980 === scrollW === innerWidth on mobile 390) triggers doc_overflow
+                out_novp = rt.execute(
+                    {
+                        "code": (
+                            f'const tab = await cua.createBrowserTab("headless", "{no_vp_html.resolve().as_uri()}");\n'
+                            "const audit = await tab.layoutAudit([390, 1280]);\n"
+                            "return JSON.stringify(audit);"
+                        )
+                    }
+                )
+                nv_rep = json.loads(out_novp.splitlines()[-1])
+                self.assertFalse(nv_rep["clean"], f"Expected doc_overflow for non-viewport page at 390px: {nv_rep}")
+                self.assertIn("doc_overflow(", "\n".join(nv_rep["widths"]["390"]))
+                self.assertEqual(nv_rep["widths"]["1280"], [])
+        finally:
+            rt.shutdown()
 
 
 if __name__ == "__main__":

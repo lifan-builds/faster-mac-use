@@ -69,10 +69,19 @@ def execute_via_daemon(
         engage_user_stop,
         get_menubar_status,
         highlight_target_window,
+        is_standalone_stop_control_code,
+        is_standalone_stop_control_request,
         is_user_stopped,
     )
 
-    is_control = (
+    has_action_payload = bool(
+        req.get("steps")
+        or req.get("parallel")
+        or req.get("app")
+        or req.get("url")
+        or (req.get("code") and not is_standalone_stop_control_code(str(req.get("code"))))
+    )
+    is_control = (not has_action_payload) and (
         "liveView" in req
         or "menuAction" in req
         or "menuOutline" in req
@@ -99,8 +108,7 @@ def execute_via_daemon(
         )
     )
     if not is_control and is_user_stopped():
-        code_str = str(req.get("code") or "")
-        if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
+        if not is_standalone_stop_control_request(req):
             return USER_STOPPED_ERROR
 
     if req.get("clickStatusBar"):
@@ -117,7 +125,15 @@ def execute_via_daemon(
         return MacNativeEngine().execute({"dumpUiSnapshots": str(req["dumpUiSnapshots"])})
     if req.get("stop"):
         return engage_user_stop()
-    if req.get("resume") and not req.get("reset") and not req.get("app") and not req.get("url") and not req.get("code"):
+    if (
+        req.get("resume")
+        and not req.get("reset")
+        and not req.get("app")
+        and not req.get("url")
+        and not req.get("code")
+        and not req.get("steps")
+        and not req.get("parallel")
+    ):
         return clear_user_stop()
     if req.get("statusBar") or req.get("getStatus"):
         return get_menubar_status()
@@ -185,8 +201,7 @@ def execute_via_daemon(
         deadline = time.perf_counter() + timeout_budget_s
         while True:
             if not is_control and is_user_stopped():
-                code_str = str(req.get("code") or "")
-                if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
+                if not is_standalone_stop_control_request(req):
                     return USER_STOPPED_ERROR
             try:
                 buf = s.recv(16384)
@@ -298,7 +313,7 @@ def serve_mcp(bin_path: Path | None = None) -> None:
 USAGE_TEXT = """Usage:
   fmu '<json>'            Execute a web, macOS AX, REPL, or parallel CUA request
   fmu mcp                 Run as an MCP stdio server
-  fmu setup [flags]       Install the bundled browser-routing skill & Antigravity plugin (--antigravity|--claude|--codex|--skill-only|--all)
+  fmu setup [flags]       Install the bundled browser-routing skill & Antigravity plugin (--antigravity|--claude|--codex|--cursor|--skill-only|--all)
   fmu --status            Show macOS menu bar & agent working/stopped status
   fmu --highlight         Flash neon highlight border around active target window on screen
   fmu --stop              Immediately stop active fmu agent work (same as menu bar Stop)
@@ -346,11 +361,20 @@ def main(bin_path: Path | None = None) -> None:
 
         print(clear_user_stop())
         return
-    if len(sys.argv) >= 3 and sys.argv[1] in ("--live-view", "live-view") and sys.argv[2] in ("on", "off"):
-        from fmu.mac_engine import MacNativeEngine
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--live-view", "live-view"):
+        if len(sys.argv) == 3 and sys.argv[2] in ("on", "off"):
+            from fmu.mac_engine import MacNativeEngine
 
-        print(MacNativeEngine().execute({"liveView": sys.argv[2] == "on"}))
-        return
+            print(MacNativeEngine().execute({"liveView": sys.argv[2] == "on"}))
+            return
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --live-view requires a value: expected 'on' or 'off'.\nUsage: fmu --live-view on|off\n")
+        else:
+            bad_val = " ".join(sys.argv[2:])
+            sys.stderr.write(
+                f"Error: Invalid --live-view value {bad_val!r}: expected 'on' or 'off'.\nUsage: fmu --live-view on|off\n"
+            )
+        sys.exit(2)
     if len(sys.argv) >= 2 and sys.argv[1] in ("--clear-logs", "clear-logs"):
         from fmu.telemetry import clear_perf_logs, get_log_dir
 
@@ -372,9 +396,16 @@ def main(bin_path: Path | None = None) -> None:
         sys.stdout.write(build_perf_report(days=days, fmt=fmt) + "\n")
         return
     if len(sys.argv) >= 2 and sys.argv[1] in ("replay", "--replay", "trace-html"):
+        args = sys.argv[2:]
+        if any(a in ("-h", "--help", "help") for a in args):
+            sys.stdout.write(
+                "Usage: fmu replay <trace.jsonl> [-o out.html|out.svg]\n"
+                "  Render an FMU_TRACE=<file> (or perf log) run as an HTML/animated-SVG replay\n"
+                "  with @uid bounds, +/~/- diff counts, and per-step ms HUD.\n"
+            )
+            return
         from fmu.replay import render_trace
 
-        args = sys.argv[2:]
         out_path = None
         if "-o" in args:
             i = args.index("-o")

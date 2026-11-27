@@ -24,6 +24,8 @@ from .mac_engine import (
     engage_user_stop,
     get_menubar_status,
     highlight_target_window,
+    is_standalone_stop_control_code,
+    is_standalone_stop_control_request,
     is_user_stopped,
     notify_menubar_status,
 )
@@ -3485,9 +3487,7 @@ class FasterMacUseRuntime:
 
             try:
                 for kind, item_src, raw_src in exec_items:
-                    stmt_allows_stopped = (
-                        "cua.resume" in item_src or "cua.getStatus" in item_src or "cua.stop" in item_src
-                    )
+                    stmt_allows_stopped = is_standalone_stop_control_code(item_src, allow_stop=True)
                     if not stmt_allows_stopped and is_user_stopped():
                         return USER_STOPPED_ERROR
 
@@ -3745,9 +3745,16 @@ class FasterMacUseRuntime:
             return engage_user_stop(socket_path=self.mac.socket_path)
 
         if req.get("resume"):
-            res_out = clear_user_stop(socket_path=self.mac.socket_path)
-            if not req.get("reset") and not req.get("app") and not req.get("url") and not req.get("code"):
-                return res_out
+            has_action = bool(
+                req.get("app") or req.get("url") or req.get("code") or req.get("steps") or req.get("parallel")
+            )
+            if has_action:
+                if is_user_stopped():
+                    return USER_STOPPED_ERROR
+            else:
+                res_out = clear_user_stop(socket_path=self.mac.socket_path)
+                if not req.get("reset"):
+                    return res_out
 
         if req.get("statusBar") or req.get("getStatus"):
             return get_menubar_status(socket_path=self.mac.socket_path)
@@ -3857,8 +3864,7 @@ class FasterMacUseRuntime:
             return build_perf_report()
 
         if is_user_stopped():
-            code_str = str(req.get("code") or "")
-            if not (code_str and ("cua.resume" in code_str or "cua.getStatus" in code_str)):
+            if not is_standalone_stop_control_request(req):
                 return USER_STOPPED_ERROR
 
         if req.get("getCursors"):

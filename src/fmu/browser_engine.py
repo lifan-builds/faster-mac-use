@@ -1210,9 +1210,30 @@ IN_PAGE_RUNTIME_JS = r"""
     return rect;
   }
 
+  function isInClosedDetails(el) {
+    let cur = el;
+    while (cur && cur !== document.documentElement) {
+      const parent = cur.parentElement;
+      if (!parent) break;
+      if (tagOf(parent) === "details" && !parent.open) {
+        let firstSummary = null;
+        for (let c = parent.firstElementChild; c; c = c.nextElementSibling) {
+          if (tagOf(c) === "summary") {
+            firstSummary = c;
+            break;
+          }
+        }
+        if (cur !== firstSummary) return true;
+      }
+      cur = parent;
+    }
+    return false;
+  }
+
   function isVisible(el) {
     if (!el || !el.isConnected) return false;
     if (el.hasAttribute && el.hasAttribute("data-fmu-cursor")) return false;
+    if (isInClosedDetails(el)) return false;
     const style = window.getComputedStyle(el);
     if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
     const rect = getEffectiveRect(el);
@@ -1691,7 +1712,7 @@ IN_PAGE_RUNTIME_JS = r"""
     return entries;
   }
 
-  function collectSnapshot(query = "", maxItems = 180, foldTables = true, fullPage = false) {
+  function collectSnapshot(query = "", maxItems = 180, foldTables = true, fullPage = false, expectedViewportWidth = null) {
     const q = String(query || "").toLowerCase();
     const effectiveMaxItems = (!foldTables || fullPage) ? Math.max(maxItems, 320) : maxItems;
     const foldFooter = Boolean(foldTables && !fullPage && !q);
@@ -1882,16 +1903,27 @@ IN_PAGE_RUNTIME_JS = r"""
       allFullLines.push(item.fullLine);
     }
     const newCrc = crc32(allFullLines.join("\n"));
-    const layoutIssues = query ? [] : collectLayoutIssues(stagedItems);
+    const layoutIssues = query ? [] : collectLayoutIssues(stagedItems, expectedViewportWidth);
     return { currentMap, lines, canvases, newCrc, totalCount: currentMap.size, layoutIssues };
   }
 
   const UNIVERSAL_ICON_RE = /\b(logo|search|find|close|dismiss|cancel|menu|nav|navigation|hamburger|refresh|reload|sync|back|forward|previous|prev|next|more|options|settings|clear|reset|copy|share|star|favorite|pin|unpin|bookmark|play|pause|stop|mute|unmute|volume|expand|collapse|fullscreen|zoom|theme|dark|light|avatar|profile|account|notifications?|help|info|filter|sort|delete|remove|trash|edit|plus|minus)\b/i;
 
-  function collectLayoutIssues(stagedItems) {
+  function collectLayoutIssues(stagedItems, expectedViewportWidth = null) {
     const issues = [];
-    const vw = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1280;
-    const vh = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 800;
+    const root = document.scrollingElement || document.documentElement;
+    const layoutViewport = document.compatMode === "BackCompat"
+      ? (document.body || document.documentElement)
+      : document.documentElement;
+    const vw = (layoutViewport && layoutViewport.clientWidth) || window.innerWidth || 1280;
+    const vh = (layoutViewport && layoutViewport.clientHeight) || window.innerHeight || 800;
+    const rawExpectedW = Number(
+      expectedViewportWidth !== null && expectedViewportWidth !== undefined
+        ? expectedViewportWidth
+        : (window.__fmuExpectedViewport && window.__fmuExpectedViewport.width)
+    );
+    const hasExpectedW = Number.isFinite(rawExpectedW) && rawExpectedW > 0;
+    const effectiveVw = hasExpectedW ? Math.min(vw, rawExpectedW) : vw;
     let modalRoot = null;
     const modals = document.querySelectorAll("[aria-modal='true'], dialog[open]");
     for (let i = modals.length - 1; i >= 0; i--) {
@@ -1901,14 +1933,23 @@ IN_PAGE_RUNTIME_JS = r"""
       }
     }
 
-    if (!modalRoot && document.documentElement) {
-      const rootOx = window.getComputedStyle(document.documentElement).overflowX;
+    if (!modalRoot && root) {
+      const rootOx = document.documentElement ? window.getComputedStyle(document.documentElement).overflowX : "visible";
       const bodyOx = document.body ? window.getComputedStyle(document.body).overflowX : "visible";
-      if (rootOx !== "hidden" && rootOx !== "clip" && bodyOx !== "hidden" && bodyOx !== "clip") {
-        const docOverflow = Math.round(document.documentElement.scrollWidth - vw);
-        if (docOverflow > 2) {
-          issues.push(`doc_overflow(+${docOverflow}px at ${vw}x${vh})`);
-        }
+      const scrollW = Math.max(
+        Number(root.scrollWidth || 0),
+        Number((document.documentElement && document.documentElement.scrollWidth) || 0)
+      );
+      const scrollOverflow = (rootOx !== "hidden" && rootOx !== "clip" && bodyOx !== "hidden" && bodyOx !== "clip")
+        ? Math.round(scrollW - vw)
+        : 0;
+      const viewportStretch = (window === window.top && hasExpectedW && vw > rawExpectedW + 2)
+        ? Math.round(Math.max(vw, scrollW) - rawExpectedW)
+        : 0;
+      if (viewportStretch > 2) {
+        issues.push(`doc_overflow(+${viewportStretch}px viewport=${vw}px scroll=${scrollW}px at ${Math.round(rawExpectedW)}x${vh})`);
+      } else if (scrollOverflow > 2) {
+        issues.push(`doc_overflow(+${scrollOverflow}px at ${Math.round(hasExpectedW ? rawExpectedW : vw)}x${vh})`);
       }
     }
 
@@ -1926,6 +1967,7 @@ IN_PAGE_RUNTIME_JS = r"""
     for (const item of stagedItems) {
       const el = item.el;
       if (!el || !el.getBoundingClientRect) continue;
+      if (isInClosedDetails(el)) continue;
       const rRole = item.role || "";
       const isAtomic = (
         rRole === "button"
@@ -1963,7 +2005,7 @@ IN_PAGE_RUNTIME_JS = r"""
         cur = cur.parentElement;
       }
 
-      if (vw < 768) {
+      if (effectiveVw < 768) {
         const tag = tagOf(el);
         const inpType = (el.getAttribute && el.getAttribute("type")) || "text";
         if (
@@ -1978,7 +2020,7 @@ IN_PAGE_RUNTIME_JS = r"""
         }
       }
 
-      if (vw < 1024 && (rRole === "button" || rRole === "tab")) {
+      if (effectiveVw < 1024 && (rRole === "button" || rRole === "tab")) {
         const visTxt = String(el.innerText || "").replace(/\s+/g, " ").trim();
         const hasRasterImg = Boolean(el.querySelector && el.querySelector("img[src]"));
         if (!hasRasterImg && visTxt.length === 0 && item.label && item.label.length >= 4 && !UNIVERSAL_ICON_RE.test(item.label)) {
@@ -3278,7 +3320,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const prevCrc = st.lastCrc;
     st.preBatchLinesByUid = prevMap;
     st.preBatchCrc = prevCrc;
-    const snap = collectSnapshot(query, 180, foldTables, fullPage);
+    const snap = collectSnapshot(query, 180, foldTables, fullPage, req.expectedViewportWidth ?? null);
     if (!query) {
       st.lastLinesByUid = snap.currentMap;
       st.lastCrc = snap.newCrc;
@@ -3355,7 +3397,7 @@ IN_PAGE_RUNTIME_JS = r"""
     const useDiff = Boolean(opts && opts.useDiff);
     const prevMap = st.preBatchLinesByUid || st.lastLinesByUid;
     const prevCrc = st.preBatchCrc || st.lastCrc;
-    const snap = collectSnapshot(query, 180, foldTables, fullPage);
+    const snap = collectSnapshot(query, 180, foldTables, fullPage, (opts && opts.expectedViewportWidth) ?? null);
     if (!query) {
       st.lastLinesByUid = snap.currentMap;
       st.lastCrc = snap.newCrc;
@@ -4399,7 +4441,9 @@ class BrowserTabSession:
                 except _BROWSER_OPS_ERRORS:
                     pass
             try:
-                self._raw_page.evaluate("() => { if (window.__fmuStore) window.__fmuStore.mutationSeq++; }")
+                self._raw_page.evaluate(
+                    "() => { window.__fmuExpectedViewport = null; if (window.__fmuStore) window.__fmuStore.mutationSeq++; }"
+                )
             except _BROWSER_OPS_ERRORS:
                 pass
             return self.last_vw, self.last_vh
@@ -4420,7 +4464,9 @@ class BrowserTabSession:
             },
         )
         try:
-            self._raw_page.evaluate("() => { if (window.__fmuStore) window.__fmuStore.mutationSeq++; }")
+            self._raw_page.evaluate(
+                f"() => {{ window.__fmuExpectedViewport = {{ width: {w}, height: {h} }}; if (window.__fmuStore) window.__fmuStore.mutationSeq++; }}"
+            )
         except _BROWSER_OPS_ERRORS:
             pass
         self._custom_viewport = True
@@ -7102,7 +7148,7 @@ class BrowserEngine:
                 for w in target_widths:
                     sess.set_viewport(width=w, height=h, mobile=(w < 768))
                     issues = sess._raw_page.evaluate(
-                        "async () => { window.dispatchEvent(new Event('resize')); await new Promise((r) => setTimeout(r, 24)); return window.__fmu ? (window.__fmu.collectSnapshot('', 180, true, false).layoutIssues || []) : []; }"
+                        f"async () => {{ window.__fmuExpectedViewport = {{ width: {w}, height: {h} }}; window.dispatchEvent(new Event('resize')); await new Promise((r) => setTimeout(r, 24)); return window.__fmu ? (window.__fmu.collectSnapshot('', 180, true, false, {w}).layoutIssues || []) : []; }}"
                     )
                     issue_list = [str(x) for x in (issues or [])]
                     by_width[str(w)] = issue_list
@@ -7927,6 +7973,7 @@ class BrowserEngine:
                     "fullPage": full_page,
                     "settle": req.get("settle", True),
                     "hadPreSteps": had_pre_on_current_page or bool(post_steps),
+                    "expectedViewportWidth": sess.last_vw if sess._custom_viewport else None,
                 },
                 tab_id=tab_id,
             )
@@ -7961,6 +8008,7 @@ class BrowserEngine:
                     "fullTable": req.get("fullTable", False),
                     "fullPage": full_page,
                     "settle": req.get("settle", True),
+                    "expectedViewportWidth": sess.last_vw if sess._custom_viewport else None,
                 },
                 tab_id=tab_id,
             )

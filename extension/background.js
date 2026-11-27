@@ -19,9 +19,34 @@ const pendingNetRequests = new Map();
 let cachedRuntimeJs = "";
 let cachedRuntimeVersion = "";
 let activeScreencastTabId = null;
+let desiredScreencastTabId = null;
+let screencastGeneration = 0;
+let screencastTransitionChain = Promise.resolve();
 let screencastIdleTimer = null;
 let lastScreencastPushAt = 0;
 let pendingPreviewTimer = null;
+let navGenSeq = 0;
+const tabNavGenerations = new Map();
+const removedTabIds = new Set();
+
+function currentTabNavGeneration(tabId) {
+  let gen = tabNavGenerations.get(tabId);
+  if (!gen) {
+    gen = ++navGenSeq;
+    tabNavGenerations.set(tabId, gen);
+  }
+  return gen;
+}
+
+function bumpTabNavGeneration(tabId) {
+  const next = ++navGenSeq;
+  tabNavGenerations.set(tabId, next);
+  return next;
+}
+
+function clearTabNavGeneration(tabId) {
+  tabNavGenerations.delete(tabId);
+}
 
 const AGENT_TAB_CLAIMS_KEY = "fmuAgentTabClaims";
 const AGENT_GROUP_TITLE_RE = /^(?:(?:🤖\s*)?Agent(?:$|\s)|(?:Devin|Codex|Claude|Antigravity|Gemini|Cursor|OpenCode|Goose|Amp)(?:$|\s+\d+$| · ))/;
@@ -125,19 +150,36 @@ async function rememberStrictCspHost(host) {
 }
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  removedTabIds.add(tabId);
+  if (removedTabIds.size > 512) {
+    const oldest = removedTabIds.values().next().value;
+    if (oldest !== undefined) removedTabIds.delete(oldest);
+  }
   debuggerLastUsedAt.delete(tabId);
   verifiedRendererTabs.delete(tabId);
   attachedDebuggers.delete(tabId);
   initializedRuntimeTabs.delete(tabId);
+  clearTabNavGeneration(tabId);
+  for (const [sid, tid] of Array.from(sessionTabs.entries())) {
+    if (tid === tabId) sessionTabs.delete(sid);
+  }
+  const netPrefix = `${tabId}:`;
+  for (const key of Array.from(pendingNetRequests.keys())) {
+    if (key.startsWith(netPrefix)) pendingNetRequests.delete(key);
+  }
+  if (activeScreencastTabId === tabId || desiredScreencastTabId === tabId) {
+    void stopLiveScreencast(tabId);
+  }
   return releaseTabClaims([tabId]);
 });
 
 if (chrome.tabs && chrome.tabs.onCreated && typeof chrome.tabs.onCreated.addListener === "function") {
   chrome.tabs.onCreated.addListener(tab => {
     if (!tab || tab.id === undefined) return;
+    removedTabIds.delete(tab.id);
     void (async () => {
       await loadAgentTabClaims();
-      if (agentTabClaims.has(tab.id)) return;
+      if (removedTabIds.has(tab.id) || agentTabClaims.has(tab.id)) return;
       const openerClaim = tab.openerTabId !== undefined ? agentTabClaims.get(tab.openerTabId) : null;
       let inheritedOwner = "";
       let inheritedAgent = "";
@@ -158,7 +200,9 @@ if (chrome.tabs && chrome.tabs.onCreated && typeof chrome.tabs.onCreated.addList
           }
         } catch (_) {}
       }
-      if (shouldClaim) await claimTab(tab.id, inheritedOwner, true, inheritedAgent);
+      if (shouldClaim && !removedTabIds.has(tab.id)) {
+        await claimTab(tab.id, inheritedOwner, true, inheritedAgent);
+      }
     })();
   });
 }
@@ -373,13 +417,23 @@ async function ensureDebuggerAndFocusEmulation(tabId) {
   } catch (_) {}
 }
 
-async function sendDebuggerCommand(tabId, method, commandParams = {}) {
+async function sendDebuggerCommand(tabId, method, commandParams = {}, expectedNavGen = null) {
+  if (expectedNavGen !== null && tabNavGenerations.get(tabId) !== expectedNavGen) {
+    const e = new Error("target document changed before debugger command");
+    e.code = "TARGET_CHANGED";
+    throw e;
+  }
   await ensureDebuggerAndFocusEmulation(tabId);
+  if (expectedNavGen !== null && tabNavGenerations.get(tabId) !== expectedNavGen) {
+    const e = new Error("target document changed before debugger command");
+    e.code = "TARGET_CHANGED";
+    throw e;
+  }
   try {
     return await chrome.debugger.sendCommand({ tabId }, method, commandParams);
   } catch (err) {
     const msg = String((err && err.message) || err || "").toLowerCase();
-    if (msg.includes("not attached") || msg.includes("detached")) {
+    if (expectedNavGen === null && (msg.includes("not attached") || msg.includes("detached"))) {
       attachedDebuggers.delete(tabId);
       await ensureDebuggerAndFocusEmulation(tabId);
       return await chrome.debugger.sendCommand({ tabId }, method, commandParams);
@@ -395,8 +449,15 @@ if (chrome.debugger && chrome.debugger.onDetach) {
       debuggerLastUsedAt.delete(source.tabId);
       verifiedRendererTabs.delete(source.tabId);
       initializedRuntimeTabs.delete(source.tabId);
-      if (activeScreencastTabId === source.tabId) {
-        activeScreencastTabId = null;
+      bumpTabNavGeneration(source.tabId);
+      if (activeScreencastTabId === source.tabId || desiredScreencastTabId === source.tabId) {
+        screencastGeneration += 1;
+        if (activeScreencastTabId === source.tabId) activeScreencastTabId = null;
+        if (desiredScreencastTabId === source.tabId) desiredScreencastTabId = null;
+        if (screencastIdleTimer) {
+          clearTimeout(screencastIdleTimer);
+          screencastIdleTimer = null;
+        }
       }
     }
   });
@@ -404,8 +465,9 @@ if (chrome.debugger && chrome.debugger.onDetach) {
 
 if (chrome.tabs && chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addListener === "function") {
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (changeInfo && changeInfo.status === "loading") {
+    if (changeInfo && (changeInfo.status === "loading" || changeInfo.url)) {
       initializedRuntimeTabs.delete(tabId);
+      bumpTabNavGeneration(tabId);
     }
   });
 }
@@ -421,10 +483,18 @@ if (chrome.debugger && chrome.debugger.onEvent && typeof chrome.debugger.onEvent
   chrome.debugger.onEvent.addListener((source, method, params) => {
     if (!source || !source.tabId || !params) return;
     const tabId = source.tabId;
+    if (method === "Page.frameNavigated") {
+      if (!params.frame || !params.frame.parentId) {
+        initializedRuntimeTabs.delete(tabId);
+        bumpTabNavGeneration(tabId);
+      }
+      return;
+    }
     if (method === "Page.screencastFrame") {
       if (params.sessionId !== undefined) {
         chrome.debugger.sendCommand({ tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
       }
+      if (tabId !== activeScreencastTabId) return;
       const now = Date.now();
       if (!params.data || now - lastScreencastPushAt < 120) return;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -508,48 +578,101 @@ if (chrome.debugger && chrome.debugger.onEvent && typeof chrome.debugger.onEvent
 }
 
 function stopLiveScreencast(tabId = undefined) {
-  if (screencastIdleTimer) {
-    clearTimeout(screencastIdleTimer);
-    screencastIdleTimer = null;
+  const stopsCurrent = (
+    tabId === undefined
+    || tabId === activeScreencastTabId
+    || tabId === desiredScreencastTabId
+  );
+  let stopGen = screencastGeneration;
+  if (stopsCurrent) {
+    stopGen = ++screencastGeneration;
+    desiredScreencastTabId = null;
+    if (screencastIdleTimer) {
+      clearTimeout(screencastIdleTimer);
+      screencastIdleTimer = null;
+    }
   }
   const targetId = tabId !== undefined ? tabId : activeScreencastTabId;
-  if (targetId && attachedDebuggers.has(targetId)) {
-    chrome.debugger.sendCommand({ tabId: targetId }, "Page.stopScreencast", {}).catch(() => {});
-  }
-  if (tabId === undefined || activeScreencastTabId === tabId) {
-    activeScreencastTabId = null;
-  }
+  screencastTransitionChain = screencastTransitionChain
+    .catch(() => {})
+    .then(async () => {
+      const idToStop = tabId !== undefined ? tabId : (targetId || activeScreencastTabId);
+      if (stopsCurrent && screencastGeneration !== stopGen) {
+        if (idToStop && idToStop !== activeScreencastTabId && attachedDebuggers.has(idToStop)) {
+          await chrome.debugger.sendCommand({ tabId: idToStop }, "Page.stopScreencast", {}).catch(() => {});
+        }
+        return;
+      }
+      if (idToStop && attachedDebuggers.has(idToStop)) {
+        await chrome.debugger.sendCommand({ tabId: idToStop }, "Page.stopScreencast", {}).catch(() => {});
+      }
+      if (stopsCurrent && screencastGeneration === stopGen && (tabId === undefined || activeScreencastTabId === tabId)) {
+        activeScreencastTabId = null;
+      }
+    });
+  return screencastTransitionChain;
 }
 
 async function startLiveScreencast(tabId) {
   if (!tabId) return;
+  const myGen = ++screencastGeneration;
+  desiredScreencastTabId = tabId;
   if (screencastIdleTimer) {
     clearTimeout(screencastIdleTimer);
   }
   screencastIdleTimer = setTimeout(() => {
     screencastIdleTimer = null;
-    stopLiveScreencast();
+    void stopLiveScreencast();
   }, 12000);
-  if (activeScreencastTabId && activeScreencastTabId !== tabId) {
-    if (attachedDebuggers.has(activeScreencastTabId)) {
-      chrome.debugger.sendCommand({ tabId: activeScreencastTabId }, "Page.stopScreencast", {}).catch(() => {});
-    }
-    activeScreencastTabId = null;
+  if (screencastIdleTimer && typeof screencastIdleTimer.unref === "function") {
+    screencastIdleTimer.unref();
   }
-  if (activeScreencastTabId === tabId) return;
   try {
     await ensureDebuggerAndFocusEmulation(tabId);
-    activeScreencastTabId = tabId;
-    await chrome.debugger.sendCommand({ tabId }, "Page.startScreencast", {
-      format: "jpeg",
-      quality: 66,
-      maxWidth: 1440,
-      maxHeight: 900,
-      everyNthFrame: 1
-    });
   } catch (_) {
-    activeScreencastTabId = null;
+    if (myGen === screencastGeneration && desiredScreencastTabId === tabId) {
+      desiredScreencastTabId = null;
+    }
+    return;
   }
+  if (myGen !== screencastGeneration) return;
+  const transition = screencastTransitionChain
+    .catch(() => {})
+    .then(async () => {
+      if (myGen !== screencastGeneration) return;
+      if (activeScreencastTabId && activeScreencastTabId !== tabId) {
+        const prevTabId = activeScreencastTabId;
+        activeScreencastTabId = null;
+        if (attachedDebuggers.has(prevTabId)) {
+          await chrome.debugger.sendCommand({ tabId: prevTabId }, "Page.stopScreencast", {}).catch(() => {});
+        }
+      }
+      if (myGen !== screencastGeneration) return;
+      if (activeScreencastTabId === tabId) return;
+      try {
+        await chrome.debugger.sendCommand({ tabId }, "Page.startScreencast", {
+          format: "jpeg",
+          quality: 66,
+          maxWidth: 1440,
+          maxHeight: 900,
+          everyNthFrame: 1
+        });
+      } catch (_) {
+        if (myGen === screencastGeneration && activeScreencastTabId === tabId) {
+          activeScreencastTabId = null;
+        }
+        return;
+      }
+      if (myGen !== screencastGeneration) {
+        if (attachedDebuggers.has(tabId)) {
+          await chrome.debugger.sendCommand({ tabId }, "Page.stopScreencast", {}).catch(() => {});
+        }
+        return;
+      }
+      activeScreencastTabId = tabId;
+    });
+  screencastTransitionChain = transition;
+  await transition;
 }
 
 async function captureViewportPreview(tabId, maxWidth = 1440) {
@@ -782,7 +905,23 @@ function parseCdpKeySpec(rawKey) {
   return { key: main, code: main, vk: 0, modifiers, text: null, unmodifiedText: null, commands };
 }
 
-async function dispatchCdpKey(tabId, rawKey) {
+function makeTargetChangedError(sentChars, totalChars) {
+  const e = new Error(
+    totalChars > 0
+      ? `partial input aborted: target document changed after ${sentChars}/${totalChars} chars`
+      : "input aborted: target document changed"
+  );
+  e.code = "TARGET_CHANGED";
+  e.sentChars = sentChars;
+  e.totalChars = totalChars;
+  return e;
+}
+
+async function dispatchCdpKey(tabId, rawKey, expectedNavGen = null) {
+  const boundGen = expectedNavGen !== null ? expectedNavGen : currentTabNavGeneration(tabId);
+  if (tabNavGenerations.get(tabId) !== boundGen) {
+    throw makeTargetChangedError(0, 1);
+  }
   const ks = parseCdpKeySpec(rawKey);
   const downParams = {
     type: "keyDown",
@@ -799,7 +938,10 @@ async function dispatchCdpKey(tabId, rawKey) {
   if (ks.commands && ks.commands.length > 0) {
     downParams.commands = ks.commands;
   }
-  await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", downParams);
+  await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", downParams, boundGen);
+  if (tabNavGenerations.get(tabId) !== boundGen) {
+    return;
+  }
   await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", {
     type: "keyUp",
     key: ks.key,
@@ -807,16 +949,20 @@ async function dispatchCdpKey(tabId, rawKey) {
     windowsVirtualKeyCode: ks.vk,
     nativeVirtualKeyCode: ks.vk,
     modifiers: ks.modifiers
-  });
+  }, boundGen);
 }
 
-async function dispatchCdpTextKeys(tabId, text) {
+async function dispatchCdpTextKeys(tabId, text, expectedNavGen = null) {
   const s = String(text || "");
+  const boundGen = expectedNavGen !== null ? expectedNavGen : currentTabNavGeneration(tabId);
   for (let i = 0; i < s.length; i++) {
+    if (tabNavGenerations.get(tabId) !== boundGen) {
+      throw makeTargetChangedError(i, s.length);
+    }
     const ch = s[i];
     const cp = ch.charCodeAt(0);
     if (ch === "\n" || ch === "\r") {
-      await dispatchCdpKey(tabId, "Enter");
+      await dispatchCdpKey(tabId, "Enter", boundGen);
     } else if (cp >= 32 && cp <= 126) {
       const ks = parseCdpKeySpec(ch);
       await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", {
@@ -828,7 +974,11 @@ async function dispatchCdpTextKeys(tabId, text) {
         modifiers: ks.modifiers,
         text: ch,
         unmodifiedText: (ch >= "A" && ch <= "Z") ? ch.toLowerCase() : ch
-      });
+      }, boundGen);
+      if (tabNavGenerations.get(tabId) !== boundGen) {
+        if (i + 1 < s.length) throw makeTargetChangedError(i + 1, s.length);
+        return;
+      }
       await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", {
         type: "keyUp",
         key: ch,
@@ -836,11 +986,16 @@ async function dispatchCdpTextKeys(tabId, text) {
         windowsVirtualKeyCode: ks.vk,
         nativeVirtualKeyCode: ks.vk,
         modifiers: ks.modifiers
-      });
+      }, boundGen);
     } else {
-      await sendDebuggerCommand(tabId, "Input.insertText", { text: ch });
+      await sendDebuggerCommand(tabId, "Input.insertText", { text: ch }, boundGen);
     }
-    await new Promise(r => setTimeout(r, 5));
+    if (i + 1 < s.length) {
+      await new Promise(r => setTimeout(r, 5));
+      if (tabNavGenerations.get(tabId) !== boundGen) {
+        throw makeTargetChangedError(i + 1, s.length);
+      }
+    }
   }
 }
 
@@ -850,14 +1005,17 @@ async function probeAndPrepIframeInTab(tabId, opts) {
   }
   const value = String((opts && opts.value) || "");
   const expNorm = normalizeFieldValueForCheck(value);
+  const explicitDocumentId = (opts && typeof opts.documentId === "string" && opts.documentId.trim())
+    ? opts.documentId.trim()
+    : null;
   const explicitFrameId = (opts && opts.frameId !== undefined && opts.frameId !== null)
     ? Number(opts.frameId)
     : null;
   const wantFrameIndex = (opts && typeof opts.frameIndex === "number")
     ? opts.frameIndex
     : null;
-  const probeArg = {
-    action: String((opts && opts.action) || "verify"),
+  const requestedAction = String((opts && opts.action) || "verify");
+  const baseArg = {
     frameSrc: String((opts && opts.frameSrc) || "").trim(),
     frameName: String((opts && opts.frameName) || "").trim(),
     frameIndex: wantFrameIndex,
@@ -866,212 +1024,313 @@ async function probeAndPrepIframeInTab(tabId, opts) {
     expectedNormHash: fnv1a32(expNorm),
     expectedNormLen: expNorm.length
   };
-  const target = (explicitFrameId !== null && !Number.isNaN(explicitFrameId))
-    ? { tabId, frameIds: [explicitFrameId] }
-    : { tabId, allFrames: true };
-  let frameResults = [];
-  try {
-    frameResults = await chrome.scripting.executeScript({
-      target,
-      args: [probeArg],
-      func: (arg) => {
-        if (window === window.top) return null;
-        const curHref = String(location.href || "");
-        let score = 0;
-        if (arg.frameSrc) {
-          if (curHref === arg.frameSrc) {
-            score = 100 + (arg.frameName && window.name === arg.frameName ? 10 : 0);
-          } else {
-            try {
-              const u1 = new URL(curHref);
-              const u2 = new URL(arg.frameSrc, curHref);
-              const p1 = u1.pathname.replace(/\/+$/, "") || "/";
-              const p2 = u2.pathname.replace(/\/+$/, "") || "/";
-              if (u1.origin === u2.origin && p1 === p2) {
-                score = 80 + (arg.frameName && window.name === arg.frameName ? 10 : 0);
-              } else {
-                return null;
-              }
-            } catch (_) {
-              return null;
-            }
-          }
-          if (arg.frameName && window.name && window.name !== arg.frameName) {
-            score -= 20;
-          }
-        } else {
-          score = (arg.frameName && window.name === arg.frameName) ? 60 : 10;
-        }
-        let frameIndex = -1;
+  const frameFunc = (arg) => {
+    if (window === window.top) return null;
+    const curHref = String(location.href || "");
+    let score = 0;
+    if (arg.frameSrc) {
+      if (curHref === arg.frameSrc) {
+        score = 100 + (arg.frameName && window.name === arg.frameName ? 10 : 0);
+      } else {
         try {
-          if (window.parent === window.top) {
-            for (let k = 0; k < window.top.length; k++) {
-              if (window.top[k] === window) { frameIndex = k; break; }
-            }
-          }
-        } catch (_) {}
-        const isEditable = (el) => {
-          if (!el || el.disabled || el.readOnly) return false;
-          const tag = (el.tagName || "").toLowerCase();
-          if (tag === "textarea") return true;
-          if (tag === "input") {
-            const tp = String(el.type || "text").toLowerCase();
-            return !["hidden", "checkbox", "radio", "button", "submit", "reset", "file", "image"].includes(tp);
-          }
-          const ce = el.getAttribute && el.getAttribute("contenteditable");
-          return Boolean(el.isContentEditable || ce === "true" || ce === "" || ce === "plaintext-only");
-        };
-        const isVisibleEditable = (el) => {
-          if (!isEditable(el)) return false;
-          try {
-            const r = el.getBoundingClientRect();
-            const st = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden";
-          } catch (_) {
-            return true;
-          }
-        };
-        const findFirstEditableDeep = (root) => {
-          const sel = "input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='button']):not([type='submit']):not([type='reset']):not([type='file']):not([type='image']), textarea, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
-          const list = root.querySelectorAll ? Array.from(root.querySelectorAll(sel)) : [];
-          let fallback = null;
-          for (const cand of list) {
-            if (isVisibleEditable(cand)) return cand;
-            if (!fallback && isEditable(cand)) fallback = cand;
-          }
-          const all = root.querySelectorAll ? root.querySelectorAll("*") : [];
-          for (let i = 0; i < all.length; i++) {
-            if (all[i].shadowRoot) {
-              const inner = findFirstEditableDeep(all[i].shadowRoot);
-              if (inner) return inner;
-            }
-          }
-          return fallback;
-        };
-        let a = document.activeElement;
-        while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
-        const hasFocus = Boolean(document.hasFocus && document.hasFocus());
-        const activeIsEditable = isEditable(a);
-        const targetEl = activeIsEditable ? a : findFirstEditableDeep(document);
-        if (!targetEl) {
-          return { supported: true, matched: false, score, frameIndex, hasFocus, activeIsEditable };
-        }
-        const readVal = () => (
-          "value" in targetEl && targetEl.value !== undefined && typeof targetEl.value === "string"
-            ? targetEl.value
-            : String(targetEl.innerText || targetEl.textContent || "")
-        );
-        if (arg.action === "probe") {
-          return {
-            supported: true,
-            matched: true,
-            score,
-            frameIndex,
-            hasFocus,
-            activeIsEditable,
-            curLen: readVal().length
-          };
-        }
-        if (arg.action === "focus_and_select") {
-          try { targetEl.focus({ preventScroll: true }); } catch (_) { try { targetEl.focus(); } catch (_) {} }
-          try {
-            if (typeof targetEl.select === "function") {
-              targetEl.select();
-            } else if (window.getSelection && document.createRange) {
-              const range = document.createRange();
-              range.selectNodeContents(targetEl);
-              const selObj = window.getSelection();
-              if (selObj) { selObj.removeAllRanges(); selObj.addRange(range); }
-            }
-          } catch (_) {}
-          return {
-            supported: true,
-            matched: true,
-            score,
-            frameIndex,
-            hasFocus: Boolean(document.hasFocus && document.hasFocus()),
-            activeIsEditable: isEditable(targetEl),
-            curLen: readVal().length
-          };
-        }
-        if (arg.action === "force_clear") {
-          try { targetEl.focus({ preventScroll: true }); } catch (_) {}
-          const tag = (targetEl.tagName || "").toLowerCase();
-          if (tag === "input" || tag === "textarea") {
-            const proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-            const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
-            try {
-              if (desc && desc.set) desc.set.call(targetEl, "");
-              else targetEl.value = "";
-            } catch (_) { targetEl.value = ""; }
+          const u1 = new URL(curHref);
+          const u2 = new URL(arg.frameSrc, curHref);
+          const p1 = u1.pathname.replace(/\/+$/, "") || "/";
+          const p2 = u2.pathname.replace(/\/+$/, "") || "/";
+          if (u1.origin === u2.origin && p1 === p2) {
+            score = 80 + (arg.frameName && window.name === arg.frameName ? 10 : 0);
           } else {
-            targetEl.textContent = "";
+            return null;
           }
-          targetEl.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
-          targetEl.dispatchEvent(new Event("change", { bubbles: true }));
-          return {
-            supported: true,
-            matched: true,
-            score,
-            frameIndex,
-            hasFocus: Boolean(document.hasFocus && document.hasFocus()),
-            activeIsEditable: isEditable(targetEl),
-            curLen: readVal().length
-          };
+        } catch (_) {
+          return null;
         }
-        const actual = readVal();
-        const normActual = actual.replace(/[\s\-/]+/g, "");
-        const fnv = (s) => {
-          let h = 0x811c9dc5;
-          for (let i = 0; i < s.length; i++) {
-            h ^= s.charCodeAt(i);
-            h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      if (arg.frameName && window.name && window.name !== arg.frameName) {
+        score -= 20;
+      }
+    } else {
+      score = (arg.frameName && window.name === arg.frameName) ? 60 : 10;
+    }
+    let frameIndex = -1;
+    try {
+      if (window.parent === window.top) {
+        for (let k = 0; k < window.top.length; k++) {
+          if (window.top[k] === window) { frameIndex = k; break; }
+        }
+      }
+    } catch (_) {}
+    const isEditable = (el) => {
+      if (!el || el.disabled || el.readOnly) return false;
+      const tag = (el.tagName || "").toLowerCase();
+      if (tag === "textarea") return true;
+      if (tag === "input") {
+        const tp = String(el.type || "text").toLowerCase();
+        return !["hidden", "checkbox", "radio", "button", "submit", "reset", "file", "image"].includes(tp);
+      }
+      const ce = el.getAttribute && el.getAttribute("contenteditable");
+      return Boolean(el.isContentEditable || ce === "true" || ce === "" || ce === "plaintext-only");
+    };
+    const isVisibleEditable = (el) => {
+      if (!isEditable(el)) return false;
+      try {
+        const r = el.getBoundingClientRect();
+        const st = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden";
+      } catch (_) {
+        return true;
+      }
+    };
+    const findFirstEditableDeep = (root) => {
+      const sel = "input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='button']):not([type='submit']):not([type='reset']):not([type='file']):not([type='image']), textarea, [contenteditable='true'], [contenteditable=''], [contenteditable='plaintext-only']";
+      const list = root.querySelectorAll ? Array.from(root.querySelectorAll(sel)) : [];
+      let fallback = null;
+      for (const cand of list) {
+        if (isVisibleEditable(cand)) return cand;
+        if (!fallback && isEditable(cand)) fallback = cand;
+      }
+      const all = root.querySelectorAll ? root.querySelectorAll("*") : [];
+      for (let i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) {
+          const inner = findFirstEditableDeep(all[i].shadowRoot);
+          if (inner) {
+            if (isVisibleEditable(inner)) return inner;
+            if (!fallback) fallback = inner;
           }
-          return h.toString(16).padStart(8, "0");
-        };
-        const exactMatch = fnv(actual) === arg.expectedHash && actual.length === arg.expectedLen;
-        const normMatch = fnv(normActual) === arg.expectedNormHash && normActual.length === arg.expectedNormLen;
-        const bulletMasked = normActual.length > 0 && /^[•*]+$/.test(normActual) && arg.expectedNormLen >= 8 && normActual.length === arg.expectedNormLen;
+        }
+      }
+      return fallback;
+    };
+    const getDeepActive = () => {
+      let el = document.activeElement;
+      while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+      return el;
+    };
+    const a = getDeepActive();
+    const hasFocus = Boolean(document.hasFocus && document.hasFocus());
+    const activeIsEditable = isEditable(a);
+    const targetEl = activeIsEditable ? a : findFirstEditableDeep(document);
+    if (!targetEl) {
+      return { supported: true, matched: false, score, frameIndex, hasFocus, activeIsEditable };
+    }
+    const readVal = () => (
+      "value" in targetEl && targetEl.value !== undefined && typeof targetEl.value === "string"
+        ? targetEl.value
+        : String(targetEl.innerText || targetEl.textContent || "")
+    );
+    if (arg.action === "probe") {
+      return {
+        supported: true,
+        matched: true,
+        score,
+        frameIndex,
+        hasFocus,
+        activeIsEditable,
+        curLen: readVal().length
+      };
+    }
+    if (arg.action === "focus_and_select") {
+      try { targetEl.focus({ preventScroll: true }); } catch (_) { try { targetEl.focus(); } catch (_) {} }
+      if (targetEl.isConnected === false) {
         return {
           supported: true,
-          matched: true,
+          matched: false,
+          staleTarget: true,
           score,
           frameIndex,
-          hasFocus,
-          activeIsEditable,
-          curLen: actual.length,
-          actualNormLen: normActual.length,
-          verified: Boolean(exactMatch || normMatch || bulletMasked)
+          hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+          activeIsEditable: false,
+          curLen: 0
         };
       }
-    });
-  } catch (_) {
-    return { supported: false, matched: false };
-  }
+      try {
+        if (typeof targetEl.select === "function") {
+          targetEl.select();
+        } else if (window.getSelection && document.createRange) {
+          const range = document.createRange();
+          range.selectNodeContents(targetEl);
+          const selObj = window.getSelection();
+          if (selObj) { selObj.removeAllRanges(); selObj.addRange(range); }
+        }
+      } catch (_) {}
+      const postActive = getDeepActive();
+      const stillFocused = targetEl.isConnected !== false && (!postActive || postActive === targetEl);
+      return {
+        supported: true,
+        matched: stillFocused,
+        staleTarget: !stillFocused,
+        score,
+        frameIndex,
+        hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+        activeIsEditable: stillFocused && isEditable(targetEl),
+        curLen: readVal().length
+      };
+    }
+    if (arg.action === "force_clear") {
+      try { targetEl.focus({ preventScroll: true }); } catch (_) {}
+      if (targetEl.isConnected === false) {
+        return {
+          supported: true,
+          matched: false,
+          staleTarget: true,
+          score,
+          frameIndex,
+          hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+          activeIsEditable: false,
+          curLen: 0
+        };
+      }
+      const tag = (targetEl.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea") {
+        const proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+        try {
+          if (desc && desc.set) desc.set.call(targetEl, "");
+          else targetEl.value = "";
+        } catch (_) { targetEl.value = ""; }
+      } else {
+        targetEl.textContent = "";
+      }
+      targetEl.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+      targetEl.dispatchEvent(new Event("change", { bubbles: true }));
+      return {
+        supported: true,
+        matched: true,
+        score,
+        frameIndex,
+        hasFocus: Boolean(document.hasFocus && document.hasFocus()),
+        activeIsEditable: isEditable(targetEl),
+        curLen: readVal().length
+      };
+    }
+    const actual = readVal();
+    const normActual = actual.replace(/[\s\-/]+/g, "");
+    const fnv = (s) => {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      return h.toString(16).padStart(8, "0");
+    };
+    const exactMatch = fnv(actual) === arg.expectedHash && actual.length === arg.expectedLen;
+    const normMatch = fnv(normActual) === arg.expectedNormHash && normActual.length === arg.expectedNormLen;
+    const bulletMasked = normActual.length > 0 && /^[•*]+$/.test(normActual) && arg.expectedNormLen >= 8 && normActual.length === arg.expectedNormLen;
+    return {
+      supported: true,
+      matched: true,
+      score,
+      frameIndex,
+      hasFocus,
+      activeIsEditable,
+      curLen: actual.length,
+      actualNormLen: normActual.length,
+      verified: Boolean(exactMatch || normMatch || bulletMasked)
+    };
+  };
+
   const rankOf = (r) => [
     (wantFrameIndex !== null && r.frameIndex === wantFrameIndex) ? 1 : 0,
     Number(r.score || 0),
     (r.hasFocus && r.activeIsEditable) ? 1 : 0,
     r.hasFocus ? 1 : 0
   ];
-  const isBetterRank = (a, b) => {
+  const compareRank = (a, b) => {
     for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) return a[i] > b[i];
+      if (a[i] !== b[i]) return a[i] - b[i];
     }
-    return false;
+    return 0;
   };
-  let best = null;
-  let bestRank = [-1, -1, -1, -1];
-  for (const fr of frameResults || []) {
-    const r = fr && fr.result;
-    if (!r || !r.matched) continue;
-    const candRank = rankOf(r);
-    if (!best || isBetterRank(candRank, bestRank)) {
-      best = { ...r, frameId: fr.frameId };
-      bestRank = candRank;
+  const pickUnambiguous = (results) => {
+    let best = null;
+    let bestRank = [-1, -1, -1, -1];
+    let tieCount = 0;
+    for (const fr of results || []) {
+      const r = fr && fr.result;
+      if (!r || !r.matched) continue;
+      const candRank = rankOf(r);
+      const cmp = best ? compareRank(candRank, bestRank) : 1;
+      if (cmp > 0) {
+        best = {
+          ...r,
+          frameId: fr.frameId,
+          ...(typeof fr.documentId === "string" && fr.documentId ? { documentId: fr.documentId } : {})
+        };
+        bestRank = candRank;
+        tieCount = 1;
+      } else if (cmp === 0) {
+        tieCount += 1;
+      }
     }
+    if (tieCount > 1) {
+      return { supported: true, matched: false, ambiguous: true, candidates: tieCount };
+    }
+    return best || { supported: true, matched: false };
+  };
+
+  const hasExplicitTarget = Boolean(
+    explicitDocumentId || (explicitFrameId !== null && !Number.isNaN(explicitFrameId))
+  );
+  if (hasExplicitTarget) {
+    const directTarget = explicitDocumentId
+      ? { tabId, documentIds: [explicitDocumentId] }
+      : { tabId, frameIds: [explicitFrameId] };
+    let directResults = [];
+    try {
+      directResults = await chrome.scripting.executeScript({
+        target: directTarget,
+        args: [{ ...baseArg, action: requestedAction }],
+        func: frameFunc
+      });
+    } catch (_) {
+      return { supported: true, matched: false, staleDocument: Boolean(explicitDocumentId) };
+    }
+    const picked = pickUnambiguous(directResults);
+    if (!picked.matched && explicitDocumentId && !picked.staleTarget) {
+      return { ...picked, staleDocument: true };
+    }
+    return picked;
   }
-  return best || { supported: true, matched: false };
+
+  // Always run the allFrames pass as probe-only so multiple candidate frames are never mutated/focused.
+  let probeResults = [];
+  try {
+    probeResults = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [{ ...baseArg, action: "probe" }],
+      func: frameFunc
+    });
+  } catch (_) {
+    return { supported: false, matched: false };
+  }
+  const probeBest = pickUnambiguous(probeResults);
+  if (!probeBest.matched || requestedAction === "probe") {
+    return probeBest;
+  }
+
+  const singleTarget = probeBest.documentId
+    ? { tabId, documentIds: [probeBest.documentId] }
+    : (probeBest.frameId !== undefined && probeBest.frameId !== null
+        ? { tabId, frameIds: [probeBest.frameId] }
+        : null);
+  if (!singleTarget) {
+    return { supported: true, matched: false };
+  }
+  let actionResults = [];
+  try {
+    actionResults = await chrome.scripting.executeScript({
+      target: singleTarget,
+      args: [{ ...baseArg, action: requestedAction }],
+      func: frameFunc
+    });
+  } catch (_) {
+    return { supported: true, matched: false, staleDocument: true };
+  }
+  const actionRes = pickUnambiguous(actionResults);
+  if (!actionRes.matched && !actionRes.staleTarget) {
+    return { ...actionRes, staleDocument: true };
+  }
+  return actionRes;
 }
 
 async function prepCdpIframeInTab(tabId, spec) {
@@ -1132,12 +1391,13 @@ async function clearCdpFocusedInput(tabId, spec) {
 
 async function dispatchCdpInput(tabId, spec) {
   const kind = String((spec && spec.kind) || "fill");
+  const startGen = currentTabNavGeneration(tabId);
   if (kind === "key") {
-    await dispatchCdpKey(tabId, String((spec && spec.key) || "Enter"));
+    await dispatchCdpKey(tabId, String((spec && spec.key) || "Enter"), startGen);
     return;
   }
   if (kind === "type") {
-    await dispatchCdpTextKeys(tabId, String((spec && spec.value) || ""));
+    await dispatchCdpTextKeys(tabId, String((spec && spec.value) || ""), startGen);
     return;
   }
   const preppedSpec = await prepCdpIframeInTab(tabId, spec);
@@ -1146,20 +1406,26 @@ async function dispatchCdpInput(tabId, spec) {
   const value = String(preppedSpec.value || "");
   const clear = preppedSpec.clear !== false;
   const uid = String(preppedSpec.uid || preppedSpec.label || "iframe");
-  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
-  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
-  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" }, startGen);
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 }, startGen);
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 }, startGen);
   await new Promise(r => setTimeout(r, 30));
   const probeRes = await probeAndPrepIframeInTab(tabId, { ...preppedSpec, action: "probe", value: "" });
-  const pinnedSpec = (probeRes && probeRes.matched && probeRes.frameId !== undefined && probeRes.frameId !== null)
-    ? { ...preppedSpec, frameId: probeRes.frameId }
+  const pinnedSpec = (probeRes && probeRes.matched)
+    ? {
+        ...preppedSpec,
+        ...(probeRes.documentId ? { documentId: probeRes.documentId } : {}),
+        ...(probeRes.frameId !== undefined && probeRes.frameId !== null ? { frameId: probeRes.frameId } : {})
+      }
     : preppedSpec;
-  await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "focus_and_select", value: "" });
+  if (!probeRes || !probeRes.ambiguous) {
+    await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "focus_and_select", value: "" });
+  }
   if (clear) {
     await clearCdpFocusedInput(tabId, pinnedSpec);
   }
   if (value) {
-    await sendDebuggerCommand(tabId, "Input.insertText", { text: value });
+    await sendDebuggerCommand(tabId, "Input.insertText", { text: value }, startGen);
     await new Promise(r => setTimeout(r, 25));
   }
   let verifyRes = await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "verify", value });
@@ -1167,7 +1433,7 @@ async function dispatchCdpInput(tabId, spec) {
     await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "focus_and_select", value: "" });
     await clearCdpFocusedInput(tabId, pinnedSpec);
     if (value) {
-      await dispatchCdpTextKeys(tabId, value);
+      await dispatchCdpTextKeys(tabId, value, startGen);
       await new Promise(r => setTimeout(r, 25));
     }
     verifyRes = await probeAndPrepIframeInTab(tabId, { ...pinnedSpec, action: "verify", value });
@@ -1985,6 +2251,7 @@ async function handleRpc(msg) {
       const { tabId, url, timeoutMs = 10000, skipPreview = false } = params;
       const navUrl = normalizeNavUrl(url);
       initializedRuntimeTabs.delete(tabId);
+      bumpTabNavGeneration(tabId);
       if (!skipPreview) {
         startLiveScreencast(tabId);
       }

@@ -29,8 +29,12 @@ Documentation = "https://github.com/lifan-builds/faster-mac-use/blob/main/docs/a
 [project.scripts]
 fmu = "fmu.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = ["fmu", "fmu.extension"]
+
+[tool.setuptools.package-dir]
+fmu = "src/fmu"
+"fmu.extension" = "extension"
 
 [tool.setuptools.package-data]
 fmu = [
@@ -39,4 +43,9 @@ fmu = [
   "bundle/antigravity/*",
   "bundle/antigravity/rules/*",
   "bundle/antigravity/assets/*",
+]
+"fmu.extension" = [
+  "manifest.json",
+  "background.js",
+  "content.js",
 ]

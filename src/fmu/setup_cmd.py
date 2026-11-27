@@ -92,9 +92,13 @@ def run_setup(argv: list[str]) -> int:
         written.extend(
             install_antigravity_plugin(home, dry_run=args.dry_run, use_installed_bin=args.use_installed_bin)
         )
-        notes.append(
-            "Antigravity plugin ready (~/.gemini/config/plugins/faster-mac-use/): loads automatically on the next turn without editing config.json."
-        )
+        plugin_dir = home / ".gemini" / "config" / "plugins" / "faster-mac-use"
+        if args.dry_run:
+            notes.append(f"Would install Antigravity plugin to {plugin_dir}/.")
+        else:
+            notes.append(
+                f"Antigravity plugin ready ({plugin_dir}/): loads automatically on the next turn without editing config.json."
+            )
     if do_claude:
         written.append(install_skill(home / ".claude" / "skills", dry_run=args.dry_run))
         notes.append("Claude Code MCP: claude mcp add faster-mac-use -- uvx --from faster-mac-use fmu mcp")

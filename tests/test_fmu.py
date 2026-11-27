@@ -5708,6 +5708,45 @@ setInterval(() => {{}}, 1000);
             srv.shutdown()
             srv.server_close()
 
+    def test_bundled_browser_routing_skill_and_antigravity_setup(self) -> None:
+        from fmu.setup_cmd import ANTIGRAVITY_SOURCE, SKILL_SOURCE, run_setup
+
+        repo_skill = ROOT / ".agents" / "skills" / "browser-routing" / "SKILL.md"
+        self.assertTrue(repo_skill.is_file())
+        self.assertTrue(SKILL_SOURCE.is_file())
+        self.assertEqual(repo_skill.read_text(encoding="utf-8"), SKILL_SOURCE.read_text(encoding="utf-8"))
+        skill_text = SKILL_SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("/Users/", skill_text)
+        self.assertNotIn("gpt-delegate", skill_text)
+        self.assertIn("name: browser-routing", skill_text)
+
+        plugin_meta = json.loads((ANTIGRAVITY_SOURCE / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(plugin_meta["name"], "faster-mac-use")
+        self.assertEqual(plugin_meta["logo"], "assets/logo.svg")
+        self.assertEqual(len(plugin_meta["suggestedPrompts"]), 3)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            # Dry-run should not write any files
+            rc = run_setup(["--antigravity", "--dry-run", "--home", str(fake_home)])
+            self.assertEqual(rc, 0)
+            self.assertFalse((fake_home / ".gemini").exists())
+
+            # Real install writes complete Antigravity plugin without touching config.json
+            rc = run_setup(["--antigravity", "--claude", "--codex", "--home", str(fake_home)])
+            self.assertEqual(rc, 0)
+            plugin_dir = fake_home / ".gemini" / "config" / "plugins" / "faster-mac-use"
+            self.assertTrue((plugin_dir / "plugin.json").is_file())
+            self.assertTrue((plugin_dir / "mcp_config.json").is_file())
+            self.assertTrue((plugin_dir / "rules" / "AGENTS.md").is_file())
+            self.assertTrue((plugin_dir / "assets" / "logo.svg").is_file())
+            self.assertTrue((plugin_dir / "skills" / "browser-routing" / "SKILL.md").is_file())
+            self.assertFalse((fake_home / ".gemini" / "config" / "config.json").exists())
+            self.assertTrue((fake_home / ".claude" / "skills" / "browser-routing" / "SKILL.md").is_file())
+            self.assertTrue((fake_home / ".codex" / "skills" / "browser-routing" / "SKILL.md").is_file())
+            mcp_cfg = json.loads((plugin_dir / "mcp_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(mcp_cfg["mcpServers"]["faster-mac-use"]["command"], "uvx")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

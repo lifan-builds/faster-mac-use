@@ -1,0 +1,18 @@
+{
+  "name": "faster-mac-use",
+  "displayName": "Faster Mac Use + Browser Routing",
+  "version": "0.5.8",
+  "description": "Background-first Chrome and native macOS computer-use engine bundled with the browser-routing skill. Replaces slow built-in browser subagents with 49-145ms background execution, 0px cursor drift, and 5-lane tool routing.",
+  "author": {
+    "name": "lifan-builds",
+    "url": "https://github.com/lifan-builds"
+  },
+  "homepage": "https://clifan.com/faster-mac-use/",
+  "repository": "https://github.com/lifan-builds/faster-mac-use",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Audit my local dev page at http://localhost:3000 on desktop and mobile with layoutAudit and errors",
+    "Open two logged-in Chrome tabs in a background Agent group without stealing window focus",
+    "Run 7 x 6 in macOS Calculator in the background and show the AXObserver diff latency"
+  ]
+}

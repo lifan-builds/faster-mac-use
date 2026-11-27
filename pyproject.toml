@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faster-mac-use"
-version = "0.5.7"
+version = "0.5.8"
 description = "Background-first, multi-cursor browser and native macOS computer-use engine for AI agents"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -33,4 +33,10 @@ fmu = "fmu.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-fmu = ["native/*.swift"]
+fmu = [
+  "native/*.swift",
+  "bundle/skills/browser-routing/*.md",
+  "bundle/antigravity/*",
+  "bundle/antigravity/rules/*",
+  "bundle/antigravity/assets/*",
+]

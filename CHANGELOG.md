@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.8 (2026-11-26)
+
+### Added
+- **Bundled `browser-routing` skill & native Antigravity plugin (`fmu setup`)**: Shipped the sanitized, public `browser-routing` skill in `.agents/skills/browser-routing/SKILL.md` and inside the PyPI wheel (`src/fmu/bundle/`), paired with a native Antigravity plugin (`plugin.json`, `mcp_config.json`, `rules/AGENTS.md`, `skills/browser-routing/SKILL.md`, `assets/logo.svg`). Run `uvx --from faster-mac-use fmu setup --antigravity` (or `--claude`, `--codex`, `--cursor`, `--skill-only`, `--all`) to install both `faster-mac-use` and `browser-routing` in one step so agents route straight to fast CLIs/APIs and background `fmu` tabs instead of slow built-in browser subagents.
+- **Chinese README (`README_ZH.md`) & routing architecture diagram**: Added `README_ZH.md` linked from the top of `README.md` alongside `docs/assets/browser-routing-bundle.svg` and 7-day field telemetry (`8,460` live calls, `576` avg tokens, `49–145 ms` p50).
+- **Playwright selector aliases in `resolveEl`**: Supported Playwright `:visible`, `:has-text(...)`, and `text=` selectors plus `css`/`id`/`label`/`locator` target aliases.
+
 ## 0.5.7 (2026-11-25)
 
 ### Added

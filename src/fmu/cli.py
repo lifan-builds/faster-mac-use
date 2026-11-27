@@ -298,6 +298,7 @@ def serve_mcp(bin_path: Path | None = None) -> None:
 USAGE_TEXT = """Usage:
   fmu '<json>'            Execute a web, macOS AX, REPL, or parallel CUA request
   fmu mcp                 Run as an MCP stdio server
+  fmu setup [flags]       Install the bundled browser-routing skill & Antigravity plugin (--antigravity|--claude|--codex|--skill-only|--all)
   fmu --status            Show macOS menu bar & agent working/stopped status
   fmu --highlight         Flash neon highlight border around active target window on screen
   fmu --stop              Immediately stop active fmu agent work (same as menu bar Stop)
@@ -389,6 +390,10 @@ def main(bin_path: Path | None = None) -> None:
             sys.exit(1)
         sys.stdout.write(f'# fmu-replay out="{dest}"\n')
         return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("setup", "install-skill", "--install-skill"):
+        from fmu.setup_cmd import run_setup
+
+        sys.exit(run_setup(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] in ("mcp", "--mcp"):
         serve_mcp(bin_path)
         return

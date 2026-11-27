@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "faster-mac-use": {
+      "command": "uvx",
+      "args": ["--from", "faster-mac-use", "fmu", "mcp"]
+    }
+  }
+}

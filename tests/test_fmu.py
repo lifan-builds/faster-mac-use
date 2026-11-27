@@ -4782,6 +4782,22 @@ class TestTraceReplay(unittest.TestCase):
         self.assertEqual(svg.count('<animate attributeName="visibility"'), 3)
         self.assertIn('stroke-dasharray="4 3"', svg)
 
+    def test_replay_rejects_output_pointing_to_input_trace(self) -> None:
+        from fmu.replay import render_trace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = self._write_trace(tmp)
+            original = trace.read_bytes()
+            symlink = Path(tmp) / "symlink.html"
+            symlink.symlink_to(trace)
+            hardlink = Path(tmp) / "hardlink.svg"
+            os.link(trace, hardlink)
+            for dest in (trace, symlink, hardlink):
+                with self.subTest(dest=dest):
+                    with self.assertRaisesRegex(ValueError, "overwrite the input trace"):
+                        render_trace(trace, dest)
+                    self.assertEqual(trace.read_bytes(), original)
+
     def test_cli_replay_and_fmu_trace_recording(self) -> None:
         from fmu import cli
 
@@ -5708,6 +5724,22 @@ setInterval(() => {{}}, 1000);
             rt.shutdown()
             srv.shutdown()
             srv.server_close()
+
+    def test_setup_skill_only_excludes_all_agent_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            for dirname in (".gemini", ".claude", ".codex", ".cursor"):
+                (home / dirname).mkdir()
+            cmd = [sys.executable, str(ROOT / "bin" / "fmu"), "setup", "--home", tmp, "--skill-only"]
+            for flag in ("--all", "--antigravity", "--claude", "--codex", "--cursor"):
+                with self.subTest(flag=flag):
+                    res = subprocess.run([*cmd, flag], capture_output=True, text=True)
+                    self.assertEqual(res.returncode, 2)
+                    self.assertIn("--skill-only cannot be combined", res.stderr)
+                    self.assertFalse(any(path.is_file() for path in home.rglob("*")))
+            subprocess.run(cmd, check=True, capture_output=True)
+            self.assertEqual([path for path in home.rglob("*") if path.is_file()],
+                             [home / ".agents" / "skills" / "browser-routing" / "SKILL.md"])
 
     def test_bundled_browser_routing_skill_and_antigravity_setup(self) -> None:
         from fmu.setup_cmd import ANTIGRAVITY_SOURCE, SKILL_SOURCE, run_setup

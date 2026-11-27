@@ -75,7 +75,10 @@ def run_setup(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     home = (args.home or Path.home()).expanduser().resolve()
-    explicit = any((args.antigravity, args.claude, args.codex, args.cursor, args.skill_only, args.all))
+    targets_selected = any((args.antigravity, args.claude, args.codex, args.cursor, args.all))
+    if args.skill_only and targets_selected:
+        parser.error("--skill-only cannot be combined with --all or an agent target")
+    explicit = args.skill_only or targets_selected
 
     do_antigravity = args.antigravity or (args.all and (home / ".gemini").exists()) or (not explicit and (home / ".gemini").exists())
     do_claude = args.claude or ((args.all or not explicit) and (home / ".claude").exists())

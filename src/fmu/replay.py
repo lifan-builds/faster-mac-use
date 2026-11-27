@@ -372,6 +372,8 @@ def render_trace(trace_path: str | Path, out_path: str | Path | None = None) -> 
     if not frames:
         raise ValueError(f"No replayable records in {src}")
     dest = Path(out_path).expanduser() if out_path else src.with_suffix(".html")
+    if dest.exists() and dest.samefile(src):
+        raise ValueError(f"Replay output would overwrite the input trace: {src}")
     body = render_svg(frames) if dest.suffix.lower() == ".svg" else render_html(frames, title=f"fmu replay · {src.name}")
     dest.write_text(body, encoding="utf-8")
     return dest

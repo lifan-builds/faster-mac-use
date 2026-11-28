@@ -43,7 +43,33 @@ Or drop it into any MCP client config (and copy [`.agents/skills/browser-routing
 }
 ```
 
-### 3. Try it right now in 5 seconds (zero install, zero focus change)
+### 3. DeepSeek Harness (dsh) desktop users
+
+Install the bundled `browser-routing` skill into the shared directory dsh reads (`~/.agents/skills`):
+
+```bash
+uvx --from faster-mac-use fmu setup --skill-only
+```
+
+Register the MCP server by appending one entry to `~/.dsh/profiles/desktop/cordis.patch.yml` (hot-reloaded on save, no restart; new sessions get the `mcp__faster-mac-use__cua` tool):
+
+```bash
+grep -q "mcp-faster-mac-use" ~/.dsh/profiles/desktop/cordis.patch.yml 2>/dev/null || cat >> ~/.dsh/profiles/desktop/cordis.patch.yml <<'EOF'
+- insert:
+    - id: mcp-faster-mac-use
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: "faster-mac-use"
+        transport: "stdio"
+        command: "uvx"
+        args: [ "--from", "faster-mac-use", "fmu", "mcp" ]
+        startupTimeoutMs: 120000
+EOF
+```
+
+To drive logged-in Chrome background tab groups, also load the bundled unpacked MV3 extension once (see [Load the bundled Chrome MV3 extension](#load-the-bundled-chrome-mv3-extension-for-logged-in-chrome-tabs) below).
+
+### 4. Try it right now in 5 seconds (zero install, zero focus change)
 
 Run `7 × 6 =` in macOS Calculator in the background with [`uv`](https://docs.astral.sh/uv/):
 

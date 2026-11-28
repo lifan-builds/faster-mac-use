@@ -31,7 +31,33 @@ claude mcp add faster-mac-use -- uvx --from faster-mac-use fmu mcp
 codex mcp add faster-mac-use -- uvx --from faster-mac-use fmu mcp
 ```
 
-### 3. 五秒体验（不抢焦点、零安装）
+### 3. DeepSeek Harness（dsh）桌面版用户
+
+安装 browser-routing 技能到共享目录（dsh 自动读取 `~/.agents/skills`）：
+
+```bash
+uvx --from faster-mac-use fmu setup --skill-only
+```
+
+注册 MCP 服务（追加到 `~/.dsh/profiles/desktop/cordis.patch.yml`，保存即热加载、无需重启；新会话中出现 `mcp__faster-mac-use__cua` 工具）：
+
+```bash
+grep -q "mcp-faster-mac-use" ~/.dsh/profiles/desktop/cordis.patch.yml 2>/dev/null || cat >> ~/.dsh/profiles/desktop/cordis.patch.yml <<'EOF'
+- insert:
+    - id: mcp-faster-mac-use
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: "faster-mac-use"
+        transport: "stdio"
+        command: "uvx"
+        args: [ "--from", "faster-mac-use", "fmu", "mcp" ]
+        startupTimeoutMs: 120000
+EOF
+```
+
+操控已登录 Chrome 后台标签页还需一次性加载仓库内附带的本地未打包 MV3 扩展（`extension/`）：打开 `chrome://extensions` → 开启开发者模式 → 加载已解压的扩展程序 → 选择该 `extension` 目录。
+
+### 4. 五秒体验（不抢焦点、零安装）
 
 直接在后台用 macOS 计算器算 `7 × 6 =`：
 
